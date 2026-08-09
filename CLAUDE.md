@@ -115,11 +115,101 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 
 | Interface | Path | State |
 |---|---|---|
-| I²C | `/dev/i2c-1` | enabled, bus scanned clean `0x03–0x77`, nothing wired yet |
+| I²C | `/dev/i2c-1` | enabled; see device inventory below |
 | I²C (HDMI DDC) | `/dev/i2c-13`, `/dev/i2c-14` | ignore |
 | 1-Wire | `/sys/bus/w1/devices/w1_bus_master1` | live; DS18B20 probes appear as `28-*` |
 | SPI | — | disabled (`dtoverlay=nospi10`) |
 | Watchdog | `/dev/watchdog0` | enabled by default; systemd `RuntimeWatchdogUSec=1min` |
+
+### Attached device inventory (verified 2026-08-09, real reads)
+
+| Device | Address | Verified |
+|---|---|---|
+| DS18B20 temp probe | 1-Wire ROM `28-000000bfe244` | 25.187 °C, `crc=YES`, 3/3 stable samples |
+| PCA9685 16-ch PWM | I²C `0x40` (+ all-call `0x70`) | MODE1 `0x11`, PRE_SCALE `0x1e` |
+
+`0x70` on a bus scan is **not a second board** — it is the PCA9685's ALLCALLADR
+(`0x05` reads `0xE0`; `0xE0 >> 1 = 0x70`). Expect both addresses from one chip.
+
+**Measured DS18B20 read cost: 831 ms** on this hardware, above the ~750 ms
+datasheet conversion time. This is the empirical basis for the driver-interface
+timing rule — the cost is real, it is per-probe, and the bus is serialized.
+
+**PCA9685 power-on state:** MODE1 `0x11` = SLEEP set, oscillator off, no PWM
+being generated — safe idle. PRE_SCALE `0x1e` (30) is the default ≈196 Hz.
+MODE2 `0x04` = **OUTDRV set, i.e. totem-pole output**. PRD R10a calls for
+**open-drain** for parallel Mean Well XLG-AB-class drivers, so the driver must
+clear MODE2 bit 2 during init. Do not assume the default is what we want.
+
+Three things follow from that MODE2 note. Session 4's driver work inherits all
+of them; none may be assumed.
+
+**1. Open-drain can invert the duty, and that is a safety inversion.**
+In open-drain the pin only *sinks* — the idle level is set by an external
+pull-up, so the register's "on" period pulls the dimming input LOW. In
+totem-pole with `INVRT=0` the same "on" period drives it HIGH. Flipping OUTDRV
+without re-examining `INVRT` (MODE2 bit 4) therefore inverts what the load sees.
+
+The consequence is not cosmetic. Our contract declares `PwmLevel(duty=0.0)` as
+the safe state, meaning dark. If the output is inverted at the hardware, **duty
+0.0 drives the channel to full brightness** — the declared safe state becomes
+the most dangerous one, and every fail-safe drill would pass in software while
+lighting the tank at 100%.
+
+Rule: the PCA9685 driver must **prove on the bench that duty 0.0 measures dark**
+before it is trusted, and that check belongs in the bring-up procedure, not in a
+comment. `INVRT` is the knob that corrects it. Verify with a meter or a lamp,
+not by reasoning about the datasheet.
+
+**2. PWM frequency is pinned at 500 Hz, from bench findings.**
+
+| | |
+|---|---|
+| XLG-AB dimming window (Mean Well spec) | 100 Hz – 3 kHz |
+| Documented quirk | above 2 kHz, spurious triggering at 10–15% duty |
+| **Usable window we treat as valid** | **100 Hz – 2 kHz** |
+| **Pinned frequency** | **500 Hz → `PRE_SCALE = 11`, ≈508 Hz actual** |
+
+`25 MHz / (4096 × (11+1)) ≈ 508.6 Hz` on the internal oscillator.
+
+The chip default `PRE_SCALE = 0x1e` (30) is ≈196.9 Hz. That is *inside* the
+window but only about 2× above its floor — low margin, and it was never a chosen
+value, just what the chip powers up with. 500 Hz sits comfortably mid-window,
+clear of both the flicker floor and the 2 kHz spurious-triggering region.
+
+**Frequency lives in device config, never as a chip default.** A driver that
+inherits whatever the silicon powered up with has not made a decision.
+
+**3. The XLG output is undefined between 0% and 8% duty.**
+This is a hardware property of the driver, not something software can smooth
+over. A command for 3% produces undefined behaviour — which for an LED driver
+can mean flicker, nothing, or full output.
+
+It matters more than it first looks, because **a diurnal ramp crosses that band
+twice every single day.** Dawn and dusk are exactly where a lighting schedule
+spends time at low duty, so this is not an edge case; it is the daily path.
+
+The PCA9685 driver must map duty explicitly, and the mapping is a decision to
+make and test, not to discover:
+
+- `duty == 0.0` → hard off. Unambiguous, outside the undefined band, and this is
+  the declared safe state, so it must never land in it.
+- `0.0 < duty < 0.08` → **either** clamp up to 0.08 **or** snap down to 0.
+  Pick one, write it down, and cover it with a test. Silently passing the value
+  through is the one option that is wrong.
+
+Whichever is chosen changes what a ramp looks like at the extremes, so it is a
+product decision as much as a driver one.
+
+**4.** Items 1–3 plus the open-drain/`INVRT` note above are session-4 driver
+requirements. None may be assumed; each needs bench verification.
+
+**3. PRE_SCALE is only writable while SLEEP is set.**
+The PCA9685 latches the prescaler from the sleeping oscillator. Changing PWM
+frequency means: set SLEEP, write PRE_SCALE, clear SLEEP, then wait ≥500 µs for
+the oscillator before setting the RESTART bit. A driver that writes PRE_SCALE on
+a running chip silently does nothing, which presents as "the frequency setting
+is ignored".
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
 the only kernel interface the `w1-therm` driver exposes — there is no character
