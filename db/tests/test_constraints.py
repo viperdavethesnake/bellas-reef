@@ -127,10 +127,12 @@ class TestAuditLogIsAppendOnly:
                 result = await conn.execute(
                     text(
                         "INSERT INTO audit_log (occurred_at, category, actor, event) "
-                        "VALUES (:at, 'safety', 'test', CAST('{\"k\":1}' AS JSONB)) "
+                        "VALUES (:at, 'safety', 'test', CAST(:event AS JSONB)) "
                         "RETURNING id"
                     ),
-                    {"at": datetime.now(UTC)},
+                    # Bound, not inlined: a ':1' inside a SQL string literal is
+                    # parsed by SQLAlchemy as a bind parameter.
+                    {"at": datetime.now(UTC), "event": '{"k": 1}'},
                 )
                 return int(result.scalar_one())
         finally:

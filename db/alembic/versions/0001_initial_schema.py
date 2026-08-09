@@ -69,9 +69,11 @@ def upgrade() -> None:
             name="sensor_declares_type_and_cadence",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_devices"),
-        sa.UniqueConstraint("device_id", name="uq_devices_device_id"),
     )
-    op.create_index("ix_devices_device_id", "devices", ["device_id"])
+    # unique=True AND index=True on the model renders as ONE unique index,
+    # not an index plus a separate UNIQUE constraint. Creating both is the
+    # drift the migration-drift test caught on its first run.
+    op.create_index("ix_devices_device_id", "devices", ["device_id"], unique=True)
 
     op.create_table(
         "calibration_records",
