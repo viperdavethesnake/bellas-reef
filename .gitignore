@@ -1,0 +1,24 @@
+# Reference clones — read-only source material, never part of our build.
+reference/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime state — never commit live tank data or secrets
+*.db
+*.sqlite3
+.env
+config.local.*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
