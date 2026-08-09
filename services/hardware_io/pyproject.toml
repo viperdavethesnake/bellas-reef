@@ -5,6 +5,7 @@ description = "Sole owner of the Pi's hardware. Enforces actuator interlocks loc
 requires-python = ">=3.13"
 dependencies = [
     "bellasreef-contracts",
+    "prometheus-client>=0.21",
 ]
 
 [build-system]

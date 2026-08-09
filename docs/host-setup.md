@@ -188,7 +188,74 @@ GPIO pin map, or `config.txt`.
 A failure here is a wiring defect. Do not attempt to compensate for it in
 software — there is no software running at the moment this drill tests.
 
-## 7. Not configured yet
+## 7. hardware-io under systemd, and the restart drill
+
+`deploy/systemd/bellasreef-hardware-io.service` exists for two reasons: it is
+how the service runs when not containerised, and it is the only way to
+demonstrate the `sd_notify` watchdog path.
+
+```bash
+sudo cp deploy/systemd/bellasreef-hardware-io.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bellasreef-hardware-io
+```
+
+The unit is ordered `After=time-sync.target` / `Wants=time-sync.target`. On a
+board with no RTC battery that ordering is the difference between a scheduler
+starting against a real clock and one starting against whatever `fake-hwclock`
+restored. It only means anything because `chrony-wait` is enabled (§3) — without
+it, `time-sync.target` is reached as soon as the NTP daemon starts, which is not
+the same claim.
+
+### Two runtimes, two liveness mechanisms
+
+CLAUDE.md locks Docker Compose as the runtime, and **Docker does not restart a
+container that is merely unhealthy** — `restart: unless-stopped` acts on process
+*exit*. A healthcheck alone therefore cannot recover a hung event loop in a
+container; something has to make the process die.
+
+So the service carries both:
+
+| Runtime | Mechanism | Recovery |
+|---|---|---|
+| systemd | `sd_notify WATCHDOG=1` from inside the supervisor loop | systemd SIGABRTs and restarts on `WatchdogSec` |
+| Docker | `LivenessGuard` thread calling `os._exit` | process exits, `restart: unless-stopped` brings it back |
+
+The guard runs on a **thread**, not an asyncio task, because a frozen event loop
+cannot run the task that would have rescued it.
+
+### Running the drill
+
+```bash
+./scripts/drill-restart.sh reef        # from the dev machine
+```
+
+It needs the freeze trigger armed, which is deliberately opt-in — an always-armed
+"hang yourself" signal in production is a liability:
+
+```bash
+sudo mkdir -p /etc/systemd/system/bellasreef-hardware-io.service.d
+printf '[Service]\nWatchdogSec=10\nEnvironment=BELLASREEF_ENABLE_FREEZE_DRILL=1\n' \
+  | sudo tee /etc/systemd/system/bellasreef-hardware-io.service.d/drill.conf
+sudo systemctl daemon-reload && sudo systemctl restart bellasreef-hardware-io
+```
+
+The drill asserts three things, and the second is the one that matters:
+
+1. systemd attributed the kill to **`Watchdog timeout`**, not something incidental.
+2. the restarted process **re-ran the startup safe-state assertion** — the drill
+   actuator deliberately comes up *energised*, so a restart that skipped the
+   assertion would be visible rather than silently passing.
+3. the health endpoint is green again.
+
+Verified 2026-08-09: freeze at 23:50:14.797, watchdog timeout at 10 s, SIGABRT,
+restart, safe state re-asserted at 23:50:25.628 — about 10.8 s from hung loop to
+hardware safe.
+
+**Remove the drop-in when finished.** Leaving the freeze trigger armed on a
+tank controller means one stray signal hangs it until the watchdog fires.
+
+## 8. Not configured yet
 
 - **Firewall.** Nothing listens yet. Must be revisited before the API is
   exposed. Note Docker writes its own nftables rules and will conflict with a

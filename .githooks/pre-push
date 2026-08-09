@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Blocks a push whose working tree does not pass the gate.
+#
+# This exists because reading the gate's output and *acting* on it are two
+# different things, and I have now shipped a red build twice by running the
+# checks and then pushing anyway as a separate command. Attention is not a
+# control; an exit code is.
+#
+# Enable with:  ./scripts/install-hooks.sh
+# Bypass with:  git push --no-verify   (deliberate, and it will show up in CI)
+
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+gate="${repo_root}/scripts/check.sh"
+
+if [[ ! -x "$gate" ]]; then
+    echo "pre-push: ${gate} missing or not executable — refusing to push blind." >&2
+    exit 1
+fi
+
+echo "pre-push: running the full gate before pushing…"
+if "$gate"; then
+    echo "pre-push: gate passed, pushing."
+    exit 0
+fi
+
+cat >&2 <<'MSG'
+
+pre-push: BLOCKED — the gate failed.
+
+Fix the failures above, or use `git push --no-verify` if you genuinely intend
+to push a red build (CI will still fail it).
+MSG
+exit 1

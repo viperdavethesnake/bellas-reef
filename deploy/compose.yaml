@@ -69,22 +69,39 @@ services:
       - "127.0.0.1:8428:8428"
     restart: unless-stopped
 
-  # --------------------------------------------------- application (session 2)
-  #
-  # hardware-io:
-  #   build: { context: .., dockerfile: deploy/Dockerfile.hardware-io }
-  #   depends_on: { nats: { condition: service_healthy } }
-  #   # SOLE owner of hardware. Specific device nodes only — never privileged.
-  #   devices:
-  #     - /dev/i2c-1:/dev/i2c-1
-  #     - /dev/gpiochip0:/dev/gpiochip0
-  #   volumes:
-  #     # DS18B20 read path is sysfs; w1-therm exposes no character device.
-  #     - /sys/bus/w1:/sys/bus/w1:ro
-  #     - /sys/devices/w1_bus_master1:/sys/devices/w1_bus_master1:ro
-  #   group_add: ["${I2C_GID:?}", "${GPIO_GID:?}"]
-  #   user: "1000:1000"
-  #   restart: unless-stopped
+  # --------------------------------------------------------------- application
+  hardware-io:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.hardware-io
+    # SOLE owner of hardware. Specific device nodes only — never privileged.
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+      - /dev/gpiochip0:/dev/gpiochip0
+    volumes:
+      # DS18B20 read path is sysfs; w1-therm exposes no character device.
+      # The kernel object lives under /sys/devices, and /sys/bus/w1 is symlinks
+      # into it, so both are needed for the link targets to resolve.
+      - /sys/bus/w1:/sys/bus/w1:ro
+      - /sys/devices/w1_bus_master1:/sys/devices/w1_bus_master1:ro
+    group_add: ["${I2C_GID:?}", "${GPIO_GID:?}"]
+    user: "1000:1000"
+    environment:
+      # No timedatectl inside the container. Clock trust is guaranteed by the
+      # host: the compose stack is started by a systemd unit ordered
+      # After=time-sync.target. Making that an explicit opt-in rather than a
+      # silent default is the point — see docs/host-setup.md.
+      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
+      BELLASREEF_LIVENESS_TIMEOUT_S: "15"
+    ports:
+      - "127.0.0.1:9101:9101"   # health + metrics, loopback only
+    # NOTE: Docker does NOT restart a merely *unhealthy* container — this acts
+    # on process exit. That is why the service carries its own LivenessGuard,
+    # which terminates the process when the supervisor loop stalls. The
+    # healthcheck reports; the guard is what actually recovers.
+    restart: unless-stopped
+
+  # control-engine and api land with the NATS wiring pass.
   #
   # control-engine:
   #   build: { context: .., dockerfile: deploy/Dockerfile.control-engine }
