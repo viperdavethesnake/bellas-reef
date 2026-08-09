@@ -18,14 +18,9 @@ from bellasreef_contracts.driver import CalibrationPoint, OneWireDevice
 from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
 
 # A real capture from the attached probe, 2026-08-09.
-GOOD = (
-    "93 01 7f 80 7f ff 0d 10 bd : crc=bd YES\n"
-    "93 01 7f 80 7f ff 0d 10 bd t=25187\n"
-)
+GOOD = "93 01 7f 80 7f ff 0d 10 bd : crc=bd YES\n93 01 7f 80 7f ff 0d 10 bd t=25187\n"
 BAD_CRC = GOOD.replace("YES", "NO")
-POWER_ON_RESET = (
-    "50 05 4b 46 7f ff 0c 10 1c : crc=1c YES\n50 05 4b 46 7f ff 0c 10 1c t=85000\n"
-)
+POWER_ON_RESET = "50 05 4b 46 7f ff 0c 10 1c : crc=1c YES\n50 05 4b 46 7f ff 0c 10 1c t=85000\n"
 
 ROM = "28-000000bfe244"
 
@@ -79,8 +74,7 @@ class TestParsing:
 
     def test_negative_temperature_parses(self, w1_root: Path) -> None:
         (w1_root / ROM / "w1_slave").write_text(
-            "ff ff 7f 80 7f ff 0c 10 21 : crc=21 YES\n"
-            "ff ff 7f 80 7f ff 0c 10 21 t=-1250\n"
+            "ff ff 7f 80 7f ff 0c 10 21 : crc=21 YES\nff ff 7f 80 7f ff 0c 10 21 t=-1250\n"
         )
         sample = run(_driver(w1_root).read)
         assert sample.quality == "ok"
@@ -191,6 +185,7 @@ class TestBusSerialisation:
 
 
 # ------------------------------------------------------------ real hardware
+
 
 @pytest.mark.hardware
 class TestAgainstRealProbe:

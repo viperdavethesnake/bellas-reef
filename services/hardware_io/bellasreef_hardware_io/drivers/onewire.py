@@ -68,9 +68,7 @@ def discover_probes(root: Path = W1_ROOT) -> tuple[OneWireDevice, ...]:
     if not root.is_dir():
         return ()
     return tuple(
-        OneWireDevice(device_id=p.name)
-        for p in sorted(root.iterdir())
-        if p.name.startswith("28-")
+        OneWireDevice(device_id=p.name) for p in sorted(root.iterdir()) if p.name.startswith("28-")
     )
 
 
