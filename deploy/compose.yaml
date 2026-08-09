@@ -1,0 +1,111 @@
+# Bella's Reef — deployment topology.
+#
+# Image tags below are minor-pinned. Digest pinning happens before first deploy;
+# see §"Pinning" at the bottom. The VictoriaMetrics tag has NOT been verified
+# against the registry from a dev machine — confirm it before deploying rather
+# than trusting it here.
+#
+# Application services (hardware-io, control-engine, api) are declared but
+# commented out: their code lands in session 2 and a build context with no
+# Dockerfile would make this file un-buildable. Their device passthrough is
+# recorded now so it is reviewed as part of the contract, not improvised later.
+
+name: bellasreef
+
+services:
+  # ------------------------------------------------------------- spine
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    volumes:
+      - nats-data:/data
+    ports:
+      - "127.0.0.1:4222:4222"   # loopback only; clients reach the API, not NATS
+      - "127.0.0.1:8222:8222"   # monitoring
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- state
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      # Deterministic collation; avoids index corruption across libc upgrades.
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und-x-icu"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:stable
+    command:
+      - "--storageDataPath=/storage"
+      - "--retentionPeriod=${VM_RETENTION:-24}"
+      - "--httpListenAddr=:8428"
+    volumes:
+      - vm-data:/storage
+    ports:
+      - "127.0.0.1:8428:8428"
+    restart: unless-stopped
+
+  # --------------------------------------------------- application (session 2)
+  #
+  # hardware-io:
+  #   build: { context: .., dockerfile: deploy/Dockerfile.hardware-io }
+  #   depends_on: { nats: { condition: service_healthy } }
+  #   # SOLE owner of hardware. Specific device nodes only — never privileged.
+  #   devices:
+  #     - /dev/i2c-1:/dev/i2c-1
+  #     - /dev/gpiochip0:/dev/gpiochip0
+  #   volumes:
+  #     # DS18B20 read path is sysfs; w1-therm exposes no character device.
+  #     - /sys/bus/w1:/sys/bus/w1:ro
+  #     - /sys/devices/w1_bus_master1:/sys/devices/w1_bus_master1:ro
+  #   group_add: ["${I2C_GID:?}", "${GPIO_GID:?}"]
+  #   user: "1000:1000"
+  #   restart: unless-stopped
+  #
+  # control-engine:
+  #   build: { context: .., dockerfile: deploy/Dockerfile.control-engine }
+  #   depends_on:
+  #     nats: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
+  #   # No device access. Ever. It reaches hardware only through NATS.
+  #   restart: unless-stopped
+  #
+  # api:
+  #   build: { context: .., dockerfile: deploy/Dockerfile.api }
+  #   depends_on:
+  #     nats: { condition: service_healthy }
+  #     postgres: { condition: service_healthy }
+  #   ports: ["0.0.0.0:8000:8000"]   # bind all interfaces: the WiFi IP changes
+  #   restart: unless-stopped
+
+volumes:
+  nats-data:
+  postgres-data:
+  vm-data:
+
+# Pinning
+# -------
+# Before first deploy, resolve each tag to a digest and commit the result:
+#
+#   docker buildx imagetools inspect nats:2.10-alpine --format '{{.Manifest.Digest}}'
+#
+# then rewrite as `image: nats:2.10-alpine@sha256:...`. Tag-only pinning is not
+# pinning — upstream can move a tag, and "upgrades are atomic, rollback is a tag
+# change" (PRD R-ops) is only true if the tag cannot drift underneath us.

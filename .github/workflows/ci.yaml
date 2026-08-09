@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.8.19"
+
+jobs:
+  checks:
+    name: lint · types · tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync workspace
+        run: uv sync --frozen
+
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (format)
+        run: uv run ruff format --check .
+
+      - name: Mypy (strict)
+        run: uv run mypy contracts/python db
+
+      - name: Pytest
+        run: uv run pytest
+
+      # Renders migration 0001 to SQL without standing up Postgres. Proves the
+      # revision is valid and that models and migration agree enough to compile.
+      - name: Alembic offline render
+        working-directory: db
+        env:
+          BELLASREEF_DATABASE_URL: postgresql+asyncpg://offline/offline
+        run: uv run alembic upgrade head --sql > /dev/null
+
+  build:
+    name: multi-arch build (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # type=cacheonly builds for both architectures and pushes nothing. The
+      # point is to catch an arm64-incompatible dependency now rather than on
+      # the Pi during a deploy.
+      - name: Build base image for amd64 + arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.base
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=cacheonly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          docker compose --env-file .env config --quiet
+          echo "compose config valid"

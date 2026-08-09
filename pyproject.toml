@@ -1,0 +1,77 @@
+[project]
+name = "bellas-reef"
+version = "0.0.0"
+description = "Bella's Reef — reef aquarium automation platform (workspace root)"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+# services/* join this list as they land; session 1 is contracts + schema only.
+members = ["contracts/python", "db"]
+
+[tool.uv.sources]
+bellasreef-contracts = { workspace = true }
+bellasreef-db = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # Workspace members, installed editable so tests and mypy see them.
+    "bellasreef-contracts",
+    "bellasreef-db",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["reference", "db/alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "A",        # builtins shadowing
+    "C4",       # comprehensions
+    "DTZ",      # naive datetime use — safety-relevant here
+    "RUF",
+]
+
+ignore = [
+    # Docstrings here are prose and use real typography (en dashes, arrows).
+    # Flagging them as "ambiguous unicode" would mean degrading the writing.
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/*" = ["S101"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+exclude = ["reference/", "db/alembic/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["contracts/python/tests", "db/tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "hardware: requires real I2C/GPIO/1-wire on the Pi (never runs in CI)",
+]
