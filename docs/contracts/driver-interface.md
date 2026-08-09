@@ -28,8 +28,8 @@ upgrade, silently driving the wrong pin.
 `GpioLine` therefore has no index field at all:
 
 ```python
-GpioLine(chip_label="pinctrl-rp1", offset=4)   # valid
-GpioLine(chip="0", offset=4)                   # ValidationError — no such field
+GpioLine(chip_label="pinctrl-rp1", offset=4)  # valid
+GpioLine(chip="0", offset=4)  # ValidationError — no such field
 ```
 
 Resolution is by label at open time, via libgpiod v2. `sysfs` GPIO

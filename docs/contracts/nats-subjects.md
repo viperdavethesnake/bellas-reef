@@ -66,7 +66,7 @@ current `nats.jetstream` API, not the older `nats.js` one.
 StreamConfig(
     name="BR_CMD",
     subjects=["bellasreef.cmd.>"],
-    retention="workqueue",       # consumed once by hardware-io, then gone
+    retention="workqueue",  # consumed once by hardware-io, then gone
     storage="file",
     discard="old",
     max_age=timedelta(hours=1),  # backstop only; see §4
@@ -99,7 +99,7 @@ StreamConfig(
     subjects=["bellasreef.state.>"],
     retention="limits",
     storage="file",
-    max_msgs_per_subject=1,      # exactly the current state, nothing older
+    max_msgs_per_subject=1,  # exactly the current state, nothing older
 )
 ```
 
@@ -147,8 +147,8 @@ re-checks it against its own clock immediately before actuating:
 
 ```python
 if command.is_expired(datetime.now(UTC)):
-    await audit(...)      # dropped, with reason
-    await msg.ack()       # ack so it is not redelivered
+    await audit(...)  # dropped, with reason
+    await msg.ack()  # ack so it is not redelivered
     return
 ```
 
