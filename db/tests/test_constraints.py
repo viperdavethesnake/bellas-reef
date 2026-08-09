@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 from helpers import engine, requires_postgres, run
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 pytestmark = requires_postgres
 
@@ -155,7 +155,7 @@ class TestAuditLogIsAppendOnly:
             finally:
                 await eng.dispose()
 
-        with pytest.raises((IntegrityError, ProgrammingError), match="append-only"):
+        with pytest.raises(DBAPIError, match="append-only"):
             run(lambda: attempt())
 
     def test_delete_raises(self) -> None:
@@ -169,7 +169,7 @@ class TestAuditLogIsAppendOnly:
             finally:
                 await eng.dispose()
 
-        with pytest.raises((IntegrityError, ProgrammingError), match="append-only"):
+        with pytest.raises(DBAPIError, match="append-only"):
             run(lambda: attempt())
 
 
