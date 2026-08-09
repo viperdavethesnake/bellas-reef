@@ -132,7 +132,63 @@ profile:
 sudo nmcli con modify "<ssid>" 802-11-wireless.powersave 2
 ```
 
-## 6. Not configured yet
+## 6. Power-pull drill — bench procedure
+
+PRD G2 requires that pulling power mid-cycle leaves every actuator in its safe
+state. **No software can assert this**, which is why it is a documented
+procedure rather than a test: it is a property of the *wiring*, and the
+controller is not running at the moment that matters.
+
+The automated drills (`services/hardware_io/tests/test_drills.py`) cover process
+kill, container kill and spine outage. This covers the one they cannot.
+
+### Prerequisite, and the whole point
+
+**Every relay must be wired normally-open**, so the de-energised state is the
+safe state. If a relay is wired normally-closed, this drill fails no matter what
+the software does — loss of power *energises* the load. Verify this with a meter
+before the first drill, not by reading the wiring diagram.
+
+The same applies to any equipment with its own latching behaviour: a heater
+controller that remembers "on" across a power cycle defeats the drill
+regardless of the relay.
+
+### Procedure
+
+Run on the bench with dummy loads (indicator lamps are ideal — you can see the
+result), never on a stocked tank.
+
+1. Bring the stack up and confirm `hardware-io` is healthy.
+2. Drive every actuator to its **non-safe** state, deliberately. A drill that
+   starts with everything already off proves nothing.
+3. Confirm each load is energised — visually, not from the UI. The UI reports
+   what was commanded; the lamp reports what happened.
+4. **Cut mains power at the wall**, not by shutting down the Pi. A graceful
+   shutdown exercises the software path, which is already covered.
+5. Observe every load within one second. All must be de-energised.
+6. Restore power. Observe through the full boot: no load may energise at any
+   point during boot, including before `hardware-io` starts. A relay board that
+   glitches on during GPIO initialisation is a real failure and this is the only
+   way it is ever seen.
+7. Confirm the stack comes back and every actuator reports its safe state.
+
+### Pass criteria
+
+- All loads de-energised within 1 s of power loss.
+- No load energises at any point during the subsequent boot.
+- After boot, every actuator reports safe state and none is latched from the
+  power event.
+
+### Recording
+
+Log each run in the audit trail with date, firmware/image tags, and the
+actuators covered. Re-run after any change to relay wiring, the relay board, the
+GPIO pin map, or `config.txt`.
+
+A failure here is a wiring defect. Do not attempt to compensate for it in
+software — there is no software running at the moment this drill tests.
+
+## 7. Not configured yet
 
 - **Firewall.** Nothing listens yet. Must be revisited before the API is
   exposed. Note Docker writes its own nftables rules and will conflict with a

@@ -1,9 +1,16 @@
 # Bella's Reef — deployment topology.
 #
-# Image tags below are minor-pinned. Digest pinning happens before first deploy;
-# see §"Pinning" at the bottom. The VictoriaMetrics tag has NOT been verified
-# against the registry from a dev machine — confirm it before deploying rather
-# than trusting it here.
+# Every image is digest-pinned. Digests resolved from the registry on
+# 2026-08-09 and verified present; a tag can be moved upstream, a digest cannot.
+# To re-resolve after a deliberate version bump:
+#
+#   docker buildx imagetools inspect <image>:<tag> --format '{{.Manifest.Digest}}'
+#
+# Note on VictoriaMetrics: the 1.136 LTS line is published on Docker Hub as
+# ENTERPRISE-ONLY — v1.136.11, v1.136.15 and their -lts spellings all return
+# 404, while v1.136.11-enterprise returns 200. v1.149.0 is the current OSS
+# mainline. If an OSS LTS line is wanted, that question is unresolved and does
+# not have a Docker Hub answer today.
 #
 # Application services (hardware-io, control-engine, api) are declared but
 # commented out: their code lands in session 2 and a build context with no
@@ -15,7 +22,7 @@ name: bellasreef
 services:
   # ------------------------------------------------------------- spine
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     command:
       - "--jetstream"
       - "--store_dir=/data"
@@ -34,7 +41,7 @@ services:
 
   # ------------------------------------------------------------- state
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
@@ -51,7 +58,7 @@ services:
     restart: unless-stopped
 
   victoria-metrics:
-    image: victoriametrics/victoria-metrics:stable
+    image: victoriametrics/victoria-metrics:v1.149.0@sha256:13b8951e35bb3589626816538483127785a9d8b53f9f5123769db0fcab1d961f
     command:
       - "--storageDataPath=/storage"
       - "--retentionPeriod=${VM_RETENTION:-24}"
@@ -99,13 +106,3 @@ volumes:
   nats-data:
   postgres-data:
   vm-data:
-
-# Pinning
-# -------
-# Before first deploy, resolve each tag to a digest and commit the result:
-#
-#   docker buildx imagetools inspect nats:2.10-alpine --format '{{.Manifest.Digest}}'
-#
-# then rewrite as `image: nats:2.10-alpine@sha256:...`. Tag-only pinning is not
-# pinning — upstream can move a tag, and "upgrades are atomic, rollback is a tag
-# change" (PRD R-ops) is only true if the tag cannot drift underneath us.

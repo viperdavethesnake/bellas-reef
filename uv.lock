@@ -11,6 +11,7 @@ members = [
     "bellas-reef",
     "bellasreef-contracts",
     "bellasreef-db",
+    "bellasreef-hardware-io",
 ]
 
 [[package]]
@@ -141,6 +142,7 @@ source = { virtual = "." }
 dev = [
     { name = "bellasreef-contracts" },
     { name = "bellasreef-db" },
+    { name = "bellasreef-hardware-io" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -152,6 +154,7 @@ dev = [
 dev = [
     { name = "bellasreef-contracts", editable = "contracts/python" },
     { name = "bellasreef-db", editable = "db" },
+    { name = "bellasreef-hardware-io", editable = "services/hardware_io" },
     { name = "mypy", specifier = ">=1.14" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.9" },
@@ -184,6 +187,17 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
 ]
+
+[[package]]
+name = "bellasreef-hardware-io"
+version = "0.1.0"
+source = { editable = "services/hardware_io" }
+dependencies = [
+    { name = "bellasreef-contracts" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "bellasreef-contracts", editable = "contracts/python" }]
 
 [[package]]
 name = "colorama"

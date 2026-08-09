@@ -105,8 +105,17 @@ class Device(Base):
             """,
             name="actuator_declares_failure_behaviour",
         ),
+        # The IS NOT NULL is load-bearing, not redundant. With poll_interval_s
+        # NULL, `poll_interval_s > 0` is NULL, `TRUE AND NULL` is NULL, and a
+        # CHECK that evaluates to NULL PASSES in Postgres. Without this, a
+        # sensor could be stored with no declared cadence at all.
         CheckConstraint(
-            "kind <> 'sensor' OR (sensor_type IS NOT NULL AND poll_interval_s > 0)",
+            """
+            kind <> 'sensor' OR (
+                sensor_type     IS NOT NULL
+            AND poll_interval_s IS NOT NULL AND poll_interval_s > 0
+            )
+            """,
             name="sensor_declares_type_and_cadence",
         ),
     )

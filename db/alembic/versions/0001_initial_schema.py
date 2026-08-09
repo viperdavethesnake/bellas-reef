@@ -60,8 +60,12 @@ def upgrade() -> None:
             " AND heartbeat_timeout_s IS NOT NULL AND heartbeat_timeout_s > 0)",
             name="actuator_declares_failure_behaviour",
         ),
+        # IS NOT NULL is load-bearing: a CHECK evaluating to NULL passes in
+        # Postgres, so `poll_interval_s > 0` alone lets a NULL cadence through.
         sa.CheckConstraint(
-            "kind <> 'sensor' OR (sensor_type IS NOT NULL AND poll_interval_s > 0)",
+            "kind <> 'sensor' OR ("
+            " sensor_type IS NOT NULL"
+            " AND poll_interval_s IS NOT NULL AND poll_interval_s > 0)",
             name="sensor_declares_type_and_cadence",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_devices"),

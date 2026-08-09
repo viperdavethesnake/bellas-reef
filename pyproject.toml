@@ -10,17 +10,19 @@ package = false
 
 [tool.uv.workspace]
 # services/* join this list as they land; session 1 is contracts + schema only.
-members = ["contracts/python", "db"]
+members = ["contracts/python", "db", "services/hardware_io"]
 
 [tool.uv.sources]
 bellasreef-contracts = { workspace = true }
 bellasreef-db = { workspace = true }
+bellasreef-hardware-io = { workspace = true }
 
 [dependency-groups]
 dev = [
     # Workspace members, installed editable so tests and mypy see them.
     "bellasreef-contracts",
     "bellasreef-db",
+    "bellasreef-hardware-io",
     "mypy>=1.14",
     "pytest>=8.3",
     "ruff>=0.9",
@@ -70,7 +72,7 @@ ignore_missing_imports = true
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
-testpaths = ["contracts/python/tests", "db/tests"]
+testpaths = ["contracts/python/tests", "db/tests", "services/hardware_io/tests"]
 addopts = "-q --strict-markers"
 markers = [
     "hardware: requires real I2C/GPIO/1-wire on the Pi (never runs in CI)",
