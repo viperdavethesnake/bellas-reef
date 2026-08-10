@@ -60,6 +60,13 @@ SERVICE: Final = "api"
 API_VERSION: Final = "v1"
 CONTRACTS_VERSION: Final = "2.0.0"
 
+#: Every authenticated route can return 401 via the current_client
+#: dependency. Declared and shared so a client can MODEL "your credential
+#: stopped working" rather than pattern-matching an undocumented status.
+AUTH_401: Final[dict[str, str]] = {
+    "description": "Missing, invalid, expired, or revoked credential."
+}
+
 #: Every auth event goes here, per auth.md §3 and the existing audit contract.
 AuditSink = Callable[[str, dict[str, Any]], Awaitable[None]]
 
@@ -357,6 +364,10 @@ def build_app(
         "/api/v1/pair/{request_id}/approve",
         tags=["pairing"],
         operation_id="approvePairing",
+        responses={
+            401: AUTH_401,
+            409: {"description": "The pairing request is not pending."},
+        },
     )
     async def approve(
         request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
@@ -377,7 +388,15 @@ def build_app(
         )
         return {"status": "approved"}
 
-    @app.post("/api/v1/pair/{request_id}/deny", tags=["pairing"], operation_id="denyPairing")
+    @app.post(
+        "/api/v1/pair/{request_id}/deny",
+        tags=["pairing"],
+        operation_id="denyPairing",
+        responses={
+            401: AUTH_401,
+            409: {"description": "The pairing request is not pending."},
+        },
+    )
     async def deny(
         request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
@@ -416,6 +435,7 @@ def build_app(
         response_model=list[Client],
         tags=["clients"],
         operation_id="listClients",
+        responses={401: AUTH_401},
     )
     async def list_clients(_: Annotated[UUID, Depends(current_client)]) -> list[Client]:
         return [
@@ -429,7 +449,15 @@ def build_app(
             for row in await store.list_clients()
         ]
 
-    @app.delete("/api/v1/clients/{client_id}", tags=["clients"], operation_id="revokeClient")
+    @app.delete(
+        "/api/v1/clients/{client_id}",
+        tags=["clients"],
+        operation_id="revokeClient",
+        responses={
+            401: AUTH_401,
+            404: {"description": "Unknown or already revoked."},
+        },
+    )
     async def revoke_client(
         client_id: UUID, actor: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
@@ -446,12 +474,22 @@ def build_app(
 
     # ----------------------------------------------------------- hardware
 
-    @app.get("/api/v1/devices", tags=["hardware"], operation_id="listDevices")
+    @app.get(
+        "/api/v1/devices",
+        tags=["hardware"],
+        operation_id="listDevices",
+        responses={401: AUTH_401},
+    )
     async def devices(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         """Registered hardware. *Devices* are the tank's; clients are people's."""
         return await store.list_devices()
 
-    @app.get("/api/v1/sensors", tags=["hardware"], operation_id="listSensors")
+    @app.get(
+        "/api/v1/sensors",
+        tags=["hardware"],
+        operation_id="listSensors",
+        responses={401: AUTH_401},
+    )
     async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         return await store.list_devices(kind="sensor")
 
@@ -462,6 +500,7 @@ def build_app(
         response_model=list[OverrideView],
         tags=["overrides"],
         operation_id="listOverrides",
+        responses={401: AUTH_401},
     )
     async def list_overrides(
         _: Annotated[UUID, Depends(current_client)],
@@ -483,7 +522,10 @@ def build_app(
         response_model=OverrideView,
         tags=["overrides"],
         operation_id="createOverride",
-        responses={503: {"description": "Clock not synchronised; deadline would be wrong."}},
+        responses={
+            401: AUTH_401,
+            503: {"description": "Clock not synchronised; deadline would be wrong."},
+        },
     )
     async def create_override(
         body: OverrideRequest, actor: Annotated[UUID, Depends(current_client)]
@@ -524,7 +566,10 @@ def build_app(
         "/api/v1/overrides/{override_id}",
         tags=["overrides"],
         operation_id="releaseOverride",
-        responses={404: {"description": "Unknown or already released."}},
+        responses={
+            401: AUTH_401,
+            404: {"description": "Unknown or already released."},
+        },
     )
     async def release_override(
         override_id: UUID, actor: Annotated[UUID, Depends(current_client)]

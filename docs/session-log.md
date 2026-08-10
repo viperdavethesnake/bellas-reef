@@ -41,4 +41,6 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 20:55 | S8.2 migration 0005 pairing_windows + `bellasreef pair` recovery CLI; auth.md updated to as-built | `270e0ed` | green |
 | 2026-08-09 20:55 | S8.3 api: GET devices/sensors, override endpoints, WS /api/v1/stream with override context on state frames | `270e0ed` | green |
 | 2026-08-09 21:44 | S9.0 openapi.json exported from the app and published as a CI artifact | `4720cc7` | green |
-| 2026-08-09 21:52 | S9.1 stream frame Pydantic models + JSON Schema export; bridge emits validated frames; PRD v1.3 G3 footnote | pending | green |
+| 2026-08-09 21:52 | S9.1 stream frame Pydantic models + JSON Schema export; bridge emits validated frames; PRD v1.3 G3 footnote | `61dd0f2` | green |
+| 2026-08-09 22:52 | S9.2 explicit operation ids; all non-200 responses declared (401/403/404/409/410/503) so clients model them | pending | green |
+| 2026-08-09 22:52 | S9.3 iOS repo created private and pushed: viperdavethesnake/bellasreef-ios | `d7a1b2c` | n/a |
