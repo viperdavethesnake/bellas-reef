@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """hardware-io — sole owner of the Pi's hardware.
 
 Session 2 scope: the safety framework and fake drivers. Real drivers (PCA9685,

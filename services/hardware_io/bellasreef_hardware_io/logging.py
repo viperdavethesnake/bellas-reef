@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Structured JSON logging.
 
 One JSON object per line on stdout. Both deployment paths this service has —

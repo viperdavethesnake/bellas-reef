@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Hardware driver interface.
 
 This is the contract that cannot be retrofitted. Once drivers accumulate against

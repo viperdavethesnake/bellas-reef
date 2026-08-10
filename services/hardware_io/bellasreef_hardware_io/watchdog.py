@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Process liveness.
 
 The kernel watchdog on this board (`/dev/watchdog0`, systemd

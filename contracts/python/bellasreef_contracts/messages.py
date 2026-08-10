@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Wire payload models.
 
 Every message on the spine is one of these. All models are frozen and reject

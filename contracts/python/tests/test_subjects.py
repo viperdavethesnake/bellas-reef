@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Subject taxonomy.
 
 These strings are the phase-2 integration surface. A typo here is a breaking

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """NATS subject taxonomy.
 
 The subject strings themselves are part of the versioned contract — a phase-2

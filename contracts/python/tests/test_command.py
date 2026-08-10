@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Command expiry and idempotency.
 
 R4 in the PRD: every actuator command is durable, idempotent, and carries an

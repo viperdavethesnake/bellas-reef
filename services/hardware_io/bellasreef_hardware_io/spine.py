@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """NATS spine.
 
 Stream and consumer provisioning plus the command path, against the real

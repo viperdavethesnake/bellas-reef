@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """PostgreSQL schema v1.
 
 Four tables, no speculation. Two things are worth reading closely:

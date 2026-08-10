@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Fail-safe drills.
 
 PRD G2: kill the hub process, kill the container runtime, drop the spine — every

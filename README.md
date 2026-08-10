@@ -1,0 +1,63 @@
+# Bella's Reef
+
+Production-grade, open reef aquarium automation. Published by Bella's Reef LLC.
+
+Runs on a Raspberry Pi 5. Safety is architecture, not a feature: every actuator
+declares a safe state, a maximum continuous runtime, and a heartbeat timeout, or
+it cannot be registered at all.
+
+See [`docs/prd.md`](docs/prd.md) for what this is and why, and
+[`CLAUDE.md`](CLAUDE.md) for the locked stack and the verified host facts.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `contracts/` | Versioned wire contracts — NATS subjects, payload models, driver interface |
+| `services/` | `hardware-io`, `control-engine`, `api` |
+| `db/` | PostgreSQL schema and Alembic migrations |
+| `deploy/` | Compose stack, Dockerfiles, systemd units |
+| `docs/` | PRD, contract specs, host setup, session log |
+| `clients/` | Web SPA, and a pointer to the iOS app |
+
+## Licensing
+
+This repository is **dual-licensed by component**. The split is deliberate: the
+platform is copyleft so improvements come back, while the contracts stay
+permissive so nobody needs permission to talk to it.
+
+| Component | Licence |
+|---|---|
+| Backend — `services/`, `db/`, `deploy/`, everything not listed below | **AGPL-3.0-only** ([`LICENSE`](LICENSE)) |
+| Contracts package and OpenAPI spec — `contracts/` | **Apache-2.0** ([`contracts/LICENSE`](contracts/LICENSE)) |
+| iOS app | Closed source, paid. Separate private repository — see [`clients/ios/README.md`](clients/ios/README.md) |
+
+**Why AGPL for the backend.** A reef controller is a networked service. Under
+plain GPL, someone could run a modified Bella's Reef as a hosted product and
+never publish their changes. AGPL §13 closes that: if you offer modified
+Bella's Reef to users over a network, those users get the source.
+
+**Why Apache-2.0 for `contracts/`.** The subject schema, payload models and
+OpenAPI spec are the integration surface. A third party writing a client, an
+ESP32 spoke, or a Home Assistant bridge should not inherit copyleft obligations
+for speaking our protocol. That is the whole point of publishing a contract.
+
+**Commercial licensing.** Bella's Reef LLC offers commercial licences that
+release bundlers and OEMs from the AGPL's disclosure obligations. Contact the
+LLC. Commercial licence text is pending IP-attorney review before first sale.
+
+Source files carry [SPDX](https://spdx.dev/) identifiers, so the applicable
+licence is determinable per file rather than by inference from directory.
+
+## Contributing
+
+**A signed CLA is required, or contributions cannot be accepted.** This is not
+bureaucracy for its own sake: the LLC must retain relicensing rights to offer
+the commercial licence above, and it cannot do that for code it does not have
+rights to. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Status
+
+Pre-release. No tagged version yet. Safety framework, contracts, schema v1, the
+DS18B20 driver and the NATS spine are implemented and CI-verified; control
+modules and clients are not.

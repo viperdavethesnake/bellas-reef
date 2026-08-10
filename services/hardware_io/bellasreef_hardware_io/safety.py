@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Local interlock enforcement.
 
 This module is the reason `hardware-io` exists as a separate service. Everything

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Service skeleton: logging, liveness, health, metrics."""
 
 from __future__ import annotations

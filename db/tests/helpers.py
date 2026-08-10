@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Postgres-backed test helpers.
 
 These need a real database: the constraints under test are Postgres semantics,

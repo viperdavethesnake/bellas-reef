@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Storage-layer safety constraints, asserted against real Postgres.
 
 The bug that motivated the first of these: a CHECK constraint that evaluates to

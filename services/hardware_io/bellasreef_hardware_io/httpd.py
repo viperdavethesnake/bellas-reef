@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Health and metrics endpoints.
 
 A hand-rolled asyncio HTTP server rather than a web framework. This service's

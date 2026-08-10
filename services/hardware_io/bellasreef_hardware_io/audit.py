@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Audit persistence.
 
 `BR_AUDIT` is a delivery buffer; Postgres `audit_log` is the system of record.

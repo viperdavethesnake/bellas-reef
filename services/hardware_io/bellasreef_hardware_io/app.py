@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """hardware-io service entry point.
 
 Session 3 scope: the process skeleton — logging, health, metrics, liveness and

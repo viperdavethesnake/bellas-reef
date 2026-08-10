@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Audit persistence under real consumer load.
 
 Needs both a NATS with JetStream and a migrated Postgres. Skipped otherwise.

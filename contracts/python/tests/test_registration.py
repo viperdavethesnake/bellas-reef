@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """The safety framework, expressed as tests.
 
 Principle 3 in CLAUDE.md says an actuator that does not declare how it fails

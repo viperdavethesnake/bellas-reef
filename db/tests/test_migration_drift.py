@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Migration/model drift.
 
 Migration 0001 is hand-written. Hand-written migrations drift from the models

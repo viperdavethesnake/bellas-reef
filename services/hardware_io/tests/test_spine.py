@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Spine integration tests. Require a real NATS with JetStream.
 
 Skipped unless ``BELLASREEF_TEST_NATS_URL`` is set. CI sets it against a

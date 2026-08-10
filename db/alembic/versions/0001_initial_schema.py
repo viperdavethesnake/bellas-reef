@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """schema v1: devices, calibration_records, dosing_journal, audit_log
 
 Revision ID: 0001

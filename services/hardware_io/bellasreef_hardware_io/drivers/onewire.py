@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """DS18B20 temperature driver.
 
 The first real driver, and the one the driver-interface timing rule was written

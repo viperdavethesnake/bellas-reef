@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Bella's Reef versioned wire contracts.
 
 The package version is the contract version. See
