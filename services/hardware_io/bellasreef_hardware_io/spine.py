@@ -11,6 +11,7 @@ Layout follows docs/contracts/nats-subjects.md.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Final
@@ -37,7 +38,7 @@ from nats.js.api import (
     StorageType,
     StreamConfig,
 )
-from nats.js.errors import BadRequestError
+from nats.js.errors import BadRequestError, NotFoundError, ServiceUnavailableError
 from pydantic import ValidationError
 
 from bellasreef_hardware_io.safety import CommandOutcome, InterlockSupervisor
@@ -205,6 +206,19 @@ class Spine:
         )
 
 
+class ConsumerLostError(RuntimeError):
+    """The command consumer could not be recovered within its retry budget.
+
+    Raised rather than calling ``os._exit`` so the service's own shutdown runs:
+    the point of giving up is to reach the restart path, and that path begins
+    with driving every actuator to its safe state.
+    """
+
+    def __init__(self, durable: str) -> None:
+        super().__init__(f"command consumer {durable!r} could not be re-established")
+        self.durable = durable
+
+
 class CommandConsumer:
     """Applies commands from BR_CMD to the supervisor.
 
@@ -238,6 +252,20 @@ class CommandConsumer:
         self._ack_wait_s = ack_wait_s
         self._max_deliver = max_deliver
         self._sub: JetStreamContext.PullSubscription | None = None
+        self._heal_attempts = 0
+
+    #: How many consecutive re-subscribe attempts before giving up and letting
+    #: the process die.
+    #:
+    #: Bounded on purpose. Retrying forever means a hub whose stream has been
+    #: deleted sits "running" and consumes nothing — the failure this codebase
+    #: keeps meeting, wearing a different hat. Exiting hands the problem to the
+    #: restart path, which is the one recovery mechanism that has been drilled:
+    #: the supervisor asserts every actuator into its safe state on startup.
+    MAX_HEAL_ATTEMPTS = 5
+    #: Seconds between attempts; the last is roughly 8s, so the whole budget is
+    #: about 15 seconds before the process gives up.
+    HEAL_BACKOFF_S = 0.5
 
     async def subscribe(self) -> None:
         self._sub = await self._spine.js.pull_subscribe(
@@ -258,6 +286,13 @@ class CommandConsumer:
         try:
             msgs = await self._sub.fetch(batch, timeout=timeout)
         except (TimeoutError, nats.errors.TimeoutError):
+            return []
+        except (NotFoundError, ServiceUnavailableError) as exc:
+            # The consumer is gone from under us — deleted by an operator, or
+            # lost with the stream. Previously this escaped and killed the
+            # process, which is a real way to lose command handling for the
+            # length of a restart because somebody ran a cleanup script.
+            await self._heal(exc)
             return []
 
         outcomes: list[CommandOutcome] = []
@@ -298,6 +333,55 @@ class CommandConsumer:
             await msg.term()
 
         return outcomes
+
+    async def _heal(self, cause: Exception) -> None:
+        """Re-provision and re-subscribe, or die trying.
+
+        CRITICAL, not warning: losing the command consumer means commands are
+        being published and nothing is applying them, which is indistinguishable
+        from a healthy hub right up until an actuator does not move.
+
+        Re-provisioning before re-subscribing is deliberate. If the stream went
+        with the consumer, subscribing alone would fail the same way forever;
+        ``provision`` is idempotent, so paying for it costs nothing in the
+        common case where only the consumer vanished.
+        """
+        self._heal_attempts += 1
+        self._sub = None
+        log.critical(
+            "command consumer lost; commands are not being applied",
+            extra={
+                "durable": self._durable,
+                "attempt": self._heal_attempts,
+                "limit": self.MAX_HEAL_ATTEMPTS,
+                "cause": type(cause).__name__,
+            },
+        )
+
+        if self._heal_attempts > self.MAX_HEAL_ATTEMPTS:
+            log.critical(
+                "could not recover the command consumer; exiting for restart",
+                extra={"durable": self._durable, "attempts": self._heal_attempts},
+            )
+            # The restart path is the drilled one: on startup the supervisor
+            # asserts every actuator into its declared safe state before doing
+            # anything else. Staying up without a consumer has no such
+            # guarantee — it just looks healthy.
+            raise ConsumerLostError(self._durable)
+
+        await asyncio.sleep(self.HEAL_BACKOFF_S * (2 ** (self._heal_attempts - 1)))
+        try:
+            await self._spine.provision()
+            await self.subscribe()
+        except Exception:
+            log.exception("re-subscribe failed", extra={"durable": self._durable})
+            return
+
+        log.warning(
+            "command consumer recovered",
+            extra={"durable": self._durable, "attempts": self._heal_attempts},
+        )
+        self._heal_attempts = 0
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
         await self._spine.publish_audit("command", {"event": event_type, **detail})

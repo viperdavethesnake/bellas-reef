@@ -31,7 +31,7 @@ from bellasreef_contracts import (
     subjects,
 )
 from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent
-from bellasreef_hardware_io.spine import CommandConsumer, Spine
+from bellasreef_hardware_io.spine import CommandConsumer, ConsumerLostError, Spine
 
 _ENV = "BELLASREEF_TEST_NATS_URL"
 
@@ -406,3 +406,81 @@ def test_a_faulted_reading_is_published_too() -> None:
         assert reading.value is None
 
     run(scenario)
+
+
+@requires_nats
+def test_a_deleted_consumer_is_re_established_in_place() -> None:
+    """Self-heal, not exit.
+
+    A consumer can vanish under a running service — an operator clearing stale
+    durables, a stream rebuilt. Before this, the next `fetch` raised and killed
+    hardware-io, so a cleanup script cost the length of a restart. It happened
+    on the bench.
+    """
+
+    async def scenario() -> tuple[int, str]:
+        spine = Spine(nats_url())
+        await spine.connect()
+        await spine.provision()
+        supervisor = InterlockSupervisor(on_event=Recorder())
+        consumer = CommandConsumer(spine, supervisor, durable=f"heal-{uuid.uuid4().hex[:8]}")
+        await consumer.subscribe()
+        assert await consumer.drain_once(timeout=0.2) == []
+
+        # Pull it out from under the running consumer.
+        await spine.js.delete_consumer("BR_CMD", consumer._durable)
+
+        # First drain notices and heals; it returns nothing because the fetch
+        # that discovered the loss carried no messages.
+        await consumer.drain_once(timeout=0.2)
+        healed = consumer._sub is not None
+        attempts = consumer._heal_attempts
+
+        # And it keeps working afterwards.
+        assert await consumer.drain_once(timeout=0.2) == []
+        await spine.js.delete_consumer("BR_CMD", consumer._durable)
+        await spine.close()
+        return attempts, "recovered" if healed else "still lost"
+
+    attempts, outcome = run(scenario)
+    assert outcome == "recovered"
+    assert attempts == 0, "a successful heal resets the budget"
+
+
+@requires_nats
+def test_the_heal_budget_is_bounded_and_then_it_gives_up() -> None:
+    """Bounded, so a hub cannot sit up forever applying nothing.
+
+    Retrying without limit is the failure this project keeps finding in other
+    costumes: a process that reports healthy while its wire is dead. Raising
+    hands the tank to the restart path, which begins by driving every actuator
+    to its declared safe state.
+    """
+
+    async def scenario() -> str:
+        spine = Spine(nats_url())
+        await spine.connect()
+        await spine.provision()
+        supervisor = InterlockSupervisor(on_event=Recorder())
+        consumer = CommandConsumer(spine, supervisor, durable=f"doomed-{uuid.uuid4().hex[:8]}")
+        await consumer.subscribe()
+
+        # Make re-subscribing impossible, so every attempt fails.
+        async def always_fails() -> None:
+            raise RuntimeError("broker refuses to re-establish the consumer")
+
+        consumer.subscribe = always_fails  # type: ignore[method-assign]
+        consumer.HEAL_BACKOFF_S = 0.01
+
+        for _ in range(consumer.MAX_HEAL_ATTEMPTS):
+            await consumer._heal(RuntimeError("gone"))
+
+        try:
+            await consumer._heal(RuntimeError("gone"))
+        except ConsumerLostError:
+            await spine.close()
+            return "gave up"
+        await spine.close()
+        return "kept retrying past the budget"
+
+    assert run(scenario) == "gave up"
