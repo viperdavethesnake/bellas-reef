@@ -95,13 +95,20 @@ AnyFrame = Annotated[ReadyFrame | StateFrame | SensorFrame, Field(discriminator=
 _ADAPTER: TypeAdapter[ReadyFrame | StateFrame | SensorFrame] = TypeAdapter(AnyFrame)
 
 
-def frame_json_schema() -> dict[str, object]:
+def frame_json_schema(ref_template: str = "#/$defs/{model}") -> dict[str, object]:
     """JSON Schema for every frame a client can receive.
 
     Exported next to `openapi.json` so client Codable types are generated from
     it rather than typed by hand.
+
+    ``ref_template`` exists because the same definitions are published twice, in
+    two dialects. Standalone, internal references use JSON Schema's ``$defs``.
+    Folded into ``openapi.json`` they must point at ``components/schemas``
+    instead — OpenAPI cannot resolve a ``$defs`` pointer, and the generator
+    fails with "JSONSchema reference points to this document" if it is left
+    alone.
     """
-    schema = _ADAPTER.json_schema(ref_template="#/$defs/{model}")
+    schema = _ADAPTER.json_schema(ref_template=ref_template)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Bella's Reef stream frames",

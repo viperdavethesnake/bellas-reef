@@ -50,9 +50,9 @@ def main() -> int:
     # footnote requires frame types to be GENERATED — so embedding them means
     # one generator and one toolchain rather than adding a second codegen path
     # for a handful of types. The standalone file stays for non-Swift clients.
-    frames = frame_json_schema()
+    embedded = frame_json_schema(ref_template="#/components/schemas/{model}")
     components = spec.setdefault("components", {}).setdefault("schemas", {})
-    for name, definition in frames.get("$defs", {}).items():
+    for name, definition in embedded.get("$defs", {}).items():
         components.setdefault(name, definition)
 
     paths = spec.get("paths", {})
