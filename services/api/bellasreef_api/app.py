@@ -218,11 +218,11 @@ def build_app(
 
     # ---------------------------------------------------------- unauthenticated
 
-    @app.get("/healthz", tags=["ops"])
+    @app.get("/healthz", tags=["ops"], operation_id="health")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/api/v1/info", response_model=Info, tags=["discovery"])
+    @app.get("/api/v1/info", response_model=Info, tags=["discovery"], operation_id="info")
     async def info() -> Info:
         """Renders the connect screen before any commitment.
 
@@ -240,7 +240,12 @@ def build_app(
 
     # ------------------------------------------------------------------ pairing
 
-    @app.post("/api/v1/pair", tags=["pairing"], status_code=status.HTTP_200_OK)
+    @app.post(
+        "/api/v1/pair",
+        tags=["pairing"],
+        status_code=status.HTTP_200_OK,
+        operation_id="pair",
+    )
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
         """Pair a client. Four outcomes, in this order.
 
@@ -301,7 +306,7 @@ def build_app(
         response.status_code = status.HTTP_202_ACCEPTED
         return PairPending(request_id=request_id, poll_after_s=5, expires_in_s=PAIRING_TTL_S)
 
-    @app.get("/api/v1/pair/{request_id}", tags=["pairing"])
+    @app.get("/api/v1/pair/{request_id}", tags=["pairing"], operation_id="pollPairing")
     async def poll_pair(request_id: UUID, response: Response) -> PairGranted | dict[str, str]:
         state, _, _ = await store.pairing_state(request_id)
 
@@ -327,7 +332,11 @@ def build_app(
         await sink("pair.collected", {"client_id": str(client_id)})
         return PairGranted(refresh_token=token, client_id=client_id)
 
-    @app.post("/api/v1/pair/{request_id}/approve", tags=["pairing"])
+    @app.post(
+        "/api/v1/pair/{request_id}/approve",
+        tags=["pairing"],
+        operation_id="approvePairing",
+    )
     async def approve(
         request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
@@ -347,7 +356,7 @@ def build_app(
         )
         return {"status": "approved"}
 
-    @app.post("/api/v1/pair/{request_id}/deny", tags=["pairing"])
+    @app.post("/api/v1/pair/{request_id}/deny", tags=["pairing"], operation_id="denyPairing")
     async def deny(
         request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
@@ -358,7 +367,12 @@ def build_app(
 
     # ------------------------------------------------------------------- tokens
 
-    @app.post("/api/v1/token", response_model=AccessToken, tags=["auth"])
+    @app.post(
+        "/api/v1/token",
+        response_model=AccessToken,
+        tags=["auth"],
+        operation_id="mintToken",
+    )
     async def token(body: TokenRequest) -> AccessToken:
         client_id = await store.client_for_refresh_token(body.refresh_token)
         if client_id is None:
@@ -375,7 +389,12 @@ def build_app(
 
     # ------------------------------------------------------------------ clients
 
-    @app.get("/api/v1/clients", response_model=list[Client], tags=["clients"])
+    @app.get(
+        "/api/v1/clients",
+        response_model=list[Client],
+        tags=["clients"],
+        operation_id="listClients",
+    )
     async def list_clients(_: Annotated[UUID, Depends(current_client)]) -> list[Client]:
         return [
             Client(
@@ -388,7 +407,7 @@ def build_app(
             for row in await store.list_clients()
         ]
 
-    @app.delete("/api/v1/clients/{client_id}", tags=["clients"])
+    @app.delete("/api/v1/clients/{client_id}", tags=["clients"], operation_id="revokeClient")
     async def revoke_client(
         client_id: UUID, actor: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
@@ -405,18 +424,23 @@ def build_app(
 
     # ----------------------------------------------------------- hardware
 
-    @app.get("/api/v1/devices", tags=["hardware"])
+    @app.get("/api/v1/devices", tags=["hardware"], operation_id="listDevices")
     async def devices(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         """Registered hardware. *Devices* are the tank's; clients are people's."""
         return await store.list_devices()
 
-    @app.get("/api/v1/sensors", tags=["hardware"])
+    @app.get("/api/v1/sensors", tags=["hardware"], operation_id="listSensors")
     async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         return await store.list_devices(kind="sensor")
 
     # ---------------------------------------------------------- overrides
 
-    @app.get("/api/v1/overrides", response_model=list[OverrideView], tags=["overrides"])
+    @app.get(
+        "/api/v1/overrides",
+        response_model=list[OverrideView],
+        tags=["overrides"],
+        operation_id="listOverrides",
+    )
     async def list_overrides(
         _: Annotated[UUID, Depends(current_client)],
     ) -> list[OverrideView]:
@@ -432,7 +456,12 @@ def build_app(
             for o in await overrides.list_active()
         ]
 
-    @app.post("/api/v1/overrides", response_model=OverrideView, tags=["overrides"])
+    @app.post(
+        "/api/v1/overrides",
+        response_model=OverrideView,
+        tags=["overrides"],
+        operation_id="createOverride",
+    )
     async def create_override(
         body: OverrideRequest, actor: Annotated[UUID, Depends(current_client)]
     ) -> OverrideView:
@@ -468,7 +497,11 @@ def build_app(
             expires_in_s=round(body.duration_s, 1),
         )
 
-    @app.delete("/api/v1/overrides/{override_id}", tags=["overrides"])
+    @app.delete(
+        "/api/v1/overrides/{override_id}",
+        tags=["overrides"],
+        operation_id="releaseOverride",
+    )
     async def release_override(
         override_id: UUID, actor: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
