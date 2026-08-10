@@ -85,6 +85,19 @@ jobs:
       - name: Gate
         run: ./scripts/check.sh
 
+      # The spec is a published artefact and the source of truth for every
+      # client (PRD §7.3.2). Generated from the app rather than hand-kept, and
+      # published from CI so clients pin a build rather than someone's laptop.
+      - name: Export OpenAPI spec
+        run: uv run python scripts/export-openapi.py --out openapi.json
+
+      - name: Upload OpenAPI spec
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: openapi.json
+          if-no-files-found: error
+
   build:
     name: multi-arch build (dry run)
     runs-on: ubuntu-latest
