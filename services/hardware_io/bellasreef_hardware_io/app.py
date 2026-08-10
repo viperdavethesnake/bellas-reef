@@ -22,7 +22,8 @@ from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
 
-from bellasreef_contracts import ActuatorRegistration, Heartbeat
+from bellasreef_contracts import ActuatorRegistration, Heartbeat, SensorReading
+from bellasreef_contracts.driver import SensorSample
 from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
@@ -366,6 +367,35 @@ class HardwareIO:
             self.metrics.sensor_reads.labels(driver.driver_id, result.quality).inc()
             if result.quality == "ok" and result.value is not None:
                 self.metrics.sensor_value.labels(driver.driver_id, result.unit).set(result.value)
+
+            # Publish every sample, faults included. A consumer needs to know a
+            # probe went bad as much as it needs the good readings — silence and
+            # "reading fine" must not look the same.
+            await self._publish_reading(driver, result)
+
+    async def _publish_reading(self, driver: DS18B20, sample: SensorSample) -> None:
+        if self.spine is None:
+            return
+        try:
+            await self.spine.publish_sensor(
+                SensorReading(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source=SERVICE,
+                    sensor_id=driver.driver_id,
+                    sensor_type=driver.sensor_type,
+                    value=sample.value,
+                    unit=sample.unit,
+                    quality=sample.quality,
+                    calibration_id=sample.calibration_id,
+                )
+            )
+        except Exception:
+            log.warning(
+                "failed to publish a reading",
+                extra={"driver_id": driver.driver_id},
+                exc_info=True,
+            )
 
     def _refresh_clock_trust(self) -> None:
         self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)

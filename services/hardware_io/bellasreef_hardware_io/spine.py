@@ -22,6 +22,7 @@ from bellasreef_contracts import (
     ActuatorRegistration,
     ActuatorState,
     Heartbeat,
+    SensorReading,
     subjects,
 )
 from bellasreef_service.logging import get_logger
@@ -118,6 +119,21 @@ class Spine:
             subjects.cmd(command.actuator_class, command.actuator_id),
             command.model_dump_json().encode(),
             headers={"Nats-Msg-Id": str(command.idempotency_key)},
+        )
+
+    async def publish_sensor(self, reading: SensorReading) -> None:
+        """Telemetry, on core pub/sub — deliberately not JetStream.
+
+        History belongs in VictoriaMetrics. Buffering readings on the spine
+        would mean a consumer coming back online receives a burst of stale
+        measurements, and a control loop acting on a five-minute-old
+        temperature is worse than one acting on none.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+        await self._nc.publish(
+            subjects.sensor(reading.sensor_type, reading.sensor_id),
+            reading.model_dump_json().encode(),
         )
 
     async def publish_state(self, state: ActuatorState) -> None:

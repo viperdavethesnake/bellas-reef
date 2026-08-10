@@ -21,8 +21,15 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import nats
 import pytest
-from bellasreef_contracts import ActuatorCommand, ActuatorRegistration, BinaryLevel
+from bellasreef_contracts import (
+    ActuatorCommand,
+    ActuatorRegistration,
+    BinaryLevel,
+    SensorReading,
+    subjects,
+)
 from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
 
@@ -305,3 +312,94 @@ def test_state_stream_keeps_only_the_latest_per_subject() -> None:
         return int(info.state.messages)
 
     assert run(scenario) == 1
+
+
+@requires_nats
+def test_sensor_readings_reach_the_spine() -> None:
+    """A reading published by hardware-io is visible on `bellasreef.sensor.>`.
+
+    This exists because the gap it covers actually shipped: the poll loop read
+    the probe and set its Prometheus gauge, and every unit test passed, while
+    nothing was ever published. Metrics are not the telemetry path. A test that
+    asserts on the gauge would have stayed green through the whole outage, so
+    this one subscribes to the wire instead.
+    """
+
+    async def scenario() -> None:
+        spine = Spine(nats_url())
+        await spine.connect()
+        listener = await nats.connect(nats_url())
+        received: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def collect(msg: Any) -> None:
+            await received.put(msg.data)
+
+        await listener.subscribe(subjects.ALL_SENSORS, cb=collect)
+        await listener.flush()
+
+        try:
+            await spine.publish_sensor(
+                SensorReading(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    sensor_id="ds18b20-28-000000bfe244",
+                    sensor_type="temp",
+                    value=25.5,
+                    unit="degC",
+                    quality="ok",
+                    calibration_id=None,
+                )
+            )
+            raw = await asyncio.wait_for(received.get(), timeout=5)
+        finally:
+            await listener.close()
+            await spine.close()
+
+        reading = SensorReading.model_validate_json(raw)
+        assert reading.value == 25.5
+        assert reading.sensor_id == "ds18b20-28-000000bfe244"
+
+    run(scenario)
+
+
+@requires_nats
+def test_a_faulted_reading_is_published_too() -> None:
+    """Silence and "the probe is fine" must not look identical downstream."""
+
+    async def scenario() -> None:
+        spine = Spine(nats_url())
+        await spine.connect()
+        listener = await nats.connect(nats_url())
+        received: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def collect(msg: Any) -> None:
+            await received.put(msg.data)
+
+        await listener.subscribe(subjects.ALL_SENSORS, cb=collect)
+        await listener.flush()
+
+        try:
+            await spine.publish_sensor(
+                SensorReading(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    sensor_id="ds18b20-28-000000bfe244",
+                    sensor_type="temp",
+                    value=None,
+                    unit="degC",
+                    quality="fault",
+                    calibration_id=None,
+                )
+            )
+            raw = await asyncio.wait_for(received.get(), timeout=5)
+        finally:
+            await listener.close()
+            await spine.close()
+
+        reading = SensorReading.model_validate_json(raw)
+        assert reading.quality == "fault"
+        assert reading.value is None
+
+    run(scenario)

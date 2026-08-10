@@ -284,6 +284,19 @@ on `PATH` for non-interactive SSH. `ssh <pi> i2cdetect` reports "not found" even
 though the tool is installed — prepend `/usr/sbin:/sbin` or use absolute paths.
 `uv` is symlinked into `/usr/local/bin` so systemd units can find it.
 
+**`pkill -f` self-match trap:** over SSH, `pkill -f <pattern>` matches the remote
+shell's own command line, so `ssh pi 'pkill -f bellasreef_hardware_io; ...'` kills
+the connection and returns 255 before the rest of the line runs. Bracketing the
+first character (`[b]ellasreef`) only helps if the literal string appears nowhere
+else in the same command — a restart line contains it twice, in the kill and in
+the start. Stop and start in **separate** `ssh` invocations.
+
+**Dev launchers:** `scripts/dev/run-api.sh` and `scripts/dev/run-hwio.sh` carry
+the environment both services need. `BELLASREEF_NATS_URL` is the one that bites:
+hardware-io without it reads the probe, serves metrics and logs a clean startup
+while publishing nothing at all. Metrics are not the telemetry path — check the
+wire, not the gauge.
+
 ## Readiness check
 
 ```bash

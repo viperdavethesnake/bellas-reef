@@ -44,3 +44,7 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 21:52 | S9.1 stream frame Pydantic models + JSON Schema export; bridge emits validated frames; PRD v1.3 G3 footnote | `61dd0f2` | green |
 | 2026-08-09 22:52 | S9.2 explicit operation ids; all non-200 responses declared (401/403/404/409/410/503) so clients model them | pending | green |
 | 2026-08-09 22:52 | S9.3 iOS repo created private and pushed: viperdavethesnake/bellasreef-ios | `d7a1b2c` | n/a |
+| 2026-08-09 23:20 | S10.1 hardware-io publishes SensorReading to `bellasreef.sensor.>` — the poll loop set its Prometheus gauge and published nothing, so the whole telemetry path was dead while every unit test and every metric looked healthy | pending | green |
+| 2026-08-09 23:20 | S10.2 spine tests subscribe to the wire (ok + faulted readings). Metrics are not the telemetry path; a gauge-based assertion stays green through a total publish outage | pending | green |
+| 2026-08-09 23:47 | S10.3 scripts/dev/run-{api,hwio}.sh: hardware-io started without BELLASREEF_NATS_URL logs a clean startup and silently runs spineless | pending | n/a |
+| 2026-08-09 23:47 | Note: `pkill -f` over SSH matches the remote shell's own cmdline — stop and start must be separate ssh calls (recorded in CLAUDE.md) | — | — |
