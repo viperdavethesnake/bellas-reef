@@ -10,7 +10,7 @@ package = false
 
 [tool.uv.workspace]
 # services/* join this list as they land; session 1 is contracts + schema only.
-members = ["contracts/python", "db", "services/shared", "services/hardware_io", "services/control_engine"]
+members = ["contracts/python", "db", "services/shared", "services/hardware_io", "services/control_engine", "services/api"]
 
 [tool.uv.sources]
 bellasreef-contracts = { workspace = true }
@@ -18,6 +18,7 @@ bellasreef-db = { workspace = true }
 bellasreef-hardware-io = { workspace = true }
 bellasreef-service = { workspace = true }
 bellasreef-control-engine = { workspace = true }
+bellasreef-api = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -27,6 +28,8 @@ dev = [
     "bellasreef-hardware-io",
     "bellasreef-service",
     "bellasreef-control-engine",
+    "bellasreef-api",
+    "httpx>=0.28",
     "mypy>=1.14",
     "pytest>=8.3",
     "pytest-timeout>=2.4.0",
@@ -83,6 +86,7 @@ testpaths = [
     "services/shared/tests",
     "services/hardware_io/tests",
     "services/control_engine/tests",
+    "services/api/tests",
 ]
 addopts = "-q --strict-markers"
 markers = [

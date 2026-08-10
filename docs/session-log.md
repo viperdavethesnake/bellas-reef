@@ -31,3 +31,4 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 18:02 | S6.2 PRD v1.2: auth row + no-local-trust wording amended; clients rename | pending | n/a |
 | 2026-08-09 18:02 | S6.3 migration 0003: paired_clients, signing_keys, pairing_requests, devices.role CHECK | pending | green |
 | 2026-08-09 18:02 | S6.4 _bellasreef._tcp registered on host, verified from the Mac | pending | n/a |
+| 2026-08-09 18:14 | S6.5 api service: /info, /pair TOFU + 202-poll-approve, /token, /clients + revoke, /healthz; 14 lifecycle tests | pending | green |

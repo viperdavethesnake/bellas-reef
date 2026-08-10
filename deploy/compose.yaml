@@ -130,8 +130,23 @@ services:
       - "9102"
     restart: unless-stopped
 
-  # api lands with the OpenAPI pass.
-  #
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    depends_on:
+      nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    user: "1000:1000"
+    environment:
+      BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
+      BELLASREEF_NATS_URL: nats://nats:4222
+    # The ONE service published to the LAN: clients have to reach it. Bound to
+    # all interfaces because the WiFi address changes, per the host facts.
+    ports:
+      - "0.0.0.0:8000:8000"
+    restart: unless-stopped
+
   # control-engine:
   #   build: { context: .., dockerfile: deploy/Dockerfile.control-engine }
   #   depends_on:
