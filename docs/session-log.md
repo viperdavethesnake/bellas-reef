@@ -25,3 +25,4 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 17:34 | Note: verification against docs is not verification against the installed package (nats.jetstream did not exist in nats-py 2.15) | — | — |
 | 2026-08-09 17:58 | S5.1 shared service package extracted (logs/health/liveness) so control-engine need not depend on hardware-io | pending | green |
 | 2026-08-09 17:58 | S5.2 control-engine: skeleton, sole command publisher, lighting scheduler R7, clock-trust gate, NATS integration | pending | green |
+| 2026-08-09 18:02 | S5.3 auth.md reviewed against contracts and committed; 5 conflicts flagged for ruling | pending | n/a |
