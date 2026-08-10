@@ -15,9 +15,9 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import pytest
-from bellasreef_control_engine.overrides import ActiveOverride, OverrideStore
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.scheduler import LightingScheduler
+from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -54,7 +54,7 @@ class TestSingleActivePerTarget:
 
         async def scenario() -> tuple[int, list[str]]:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
             await store.create("blue", 0.0, 1800, reason="feed")
             await store.create("blue", 0.0, 1800, reason="feed again")
             active = await store.active_count("blue")
@@ -79,7 +79,7 @@ class TestSingleActivePerTarget:
     def test_different_targets_do_not_collide(self) -> None:
         async def scenario() -> tuple[int, int]:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
             await store.create("blue", 0.0, 600)
             await store.create("white", 0.0, 600)
             counts = (await store.active_count("blue"), await store.active_count("white"))
@@ -100,7 +100,7 @@ class TestLapseOnWake:
 
         async def scenario() -> tuple[list[ActiveOverride], list[str]]:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
 
             # Placed an hour ago for 30 minutes: expired 30 minutes before wake.
             an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
@@ -125,7 +125,7 @@ class TestLapseOnWake:
     def test_an_override_still_owed_survives_a_restart(self) -> None:
         async def scenario() -> list[ActiveOverride]:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
             # Placed a minute ago for an hour: 59 minutes still owed.
             await store.create("blue", 0.0, 3600, now=datetime.now(UTC) - timedelta(minutes=1))
             live = await store.load_active()
@@ -142,7 +142,7 @@ class TestLapseOnWake:
 
         async def scenario() -> tuple[int, int]:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
             await store.create("blue", 0.0, 3600)
             first = len(await store.load_active())
             second = len(await store.load_active())
@@ -220,7 +220,7 @@ class TestValidation:
     def test_invalid_overrides_are_refused(self, duty: float, duration: float) -> None:
         async def scenario() -> None:
             engine = await fresh()
-            store = OverrideStore(engine)
+            store = OverrideStore(engine, clock_trusted=lambda: True)
             try:
                 await store.create("blue", duty, duration)
             finally:
@@ -228,3 +228,72 @@ class TestValidation:
 
         with pytest.raises(ValueError):
             run(scenario)
+
+
+class TestClockGate:
+    """Override creation refuses while the clock is untrusted.
+
+    Same predicate and same shape as command-emission gating: an override IS a
+    deadline, and a deadline computed from a clock chrony is about to step is
+    not the duration the operator asked for.
+    """
+
+    def test_creation_is_refused_while_the_clock_is_untrusted(self) -> None:
+        async def scenario() -> None:
+            engine = await fresh()
+            store = OverrideStore(engine, clock_trusted=lambda: False)
+            try:
+                await store.create("blue", 0.0, 1800, reason="feed")
+            finally:
+                await engine.dispose()
+
+        with pytest.raises(ClockUntrustedError, match="not synchronised"):
+            run(scenario)
+
+    def test_nothing_is_written_when_the_clock_is_refused(self) -> None:
+        """The refusal must not leave a half-placed override behind."""
+
+        async def scenario() -> int:
+            engine = await fresh()
+            store = OverrideStore(engine, clock_trusted=lambda: False)
+            with pytest.raises(ClockUntrustedError):
+                await store.create("blue", 0.0, 1800)
+            count = await store.active_count("blue")
+            await engine.dispose()
+            return count
+
+        assert run(scenario) == 0
+
+    def test_boot_then_chrony_steps_then_the_override_takes(self) -> None:
+        """The real sequence on this board.
+
+        Boot with fake-hwclock's saved time (untrusted), operator presses "off
+        for 30 minutes" and is refused; chrony syncs; the same press succeeds
+        and carries a deadline computed from the corrected clock.
+        """
+
+        async def scenario() -> tuple[bool, float]:
+            engine = await fresh()
+            trusted = {"value": False}
+            store = OverrideStore(engine, clock_trusted=lambda: trusted["value"])
+
+            refused = False
+            try:
+                await store.create("blue", 0.0, 1800)
+            except ClockUntrustedError:
+                refused = True
+
+            # chrony steps the clock and time-sync.target is reached.
+            trusted["value"] = True
+            placed = await store.create("blue", 0.0, 1800)
+
+            # The deadline is measured from the corrected clock, not the wrong one.
+            remaining = (placed.expires_at - datetime.now(UTC)).total_seconds()
+            await engine.dispose()
+            return refused, remaining
+
+        refused, remaining = run(scenario)
+        assert refused, "the pre-sync press must be refused"
+        assert 1700 < remaining <= 1800, (
+            f"deadline should be ~30 minutes from the corrected clock, got {remaining}s"
+        )

@@ -388,3 +388,36 @@ class Override(Base):
             postgresql_where=text("released_at IS NULL"),
         ),
     )
+
+
+class PairingWindow(Base):
+    """A deliberately reopened pairing window (auth.md §1, recovery).
+
+    The fire escape. If every client is lost or revoked there is nobody left to
+    approve a new one, and the TOFU-ever window is shut by design — so the
+    operator SSHes in and runs `bellasreef pair`, which writes a row here.
+
+    A window row rather than clearing client state, deliberately: deleting
+    revoked clients would reopen the TOFU-ever window, which is keyed on rows
+    having existed precisely so that revoking everything cannot reopen open
+    pairing. The recovery path must not undo the thing it is recovering from.
+    """
+
+    __tablename__ = "pairing_windows"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    opened_by: Mapped[str] = mapped_column(String(64))
+
+    #: Consumed on first successful pair. A window is one credential, not a
+    #: standing invitation for its whole five minutes.
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("paired_clients.id", ondelete="RESTRICT"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("expires_at > opened_at", name="expiry_after_opening"),
+        CheckConstraint("(used_at IS NULL) = (used_by IS NULL)", name="used_pair_together"),
+    )

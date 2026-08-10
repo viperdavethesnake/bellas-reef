@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -163,6 +164,94 @@ class Store:
                     "WHERE id = :id AND revoked_at IS NULL"
                 ),
                 {"now": datetime.now(UTC), "id": client_id},
+            )
+            return bool(result.rowcount)
+
+    async def active_client_count(self) -> int:
+        """Clients that can still approve a pairing request.
+
+        Distinct from :meth:`total_clients_ever`, and the distinction is the
+        whole recovery problem: if every client is revoked, the TOFU-ever window
+        is shut and there is nobody to approve a 202 — which is the deadlock the
+        pairing window exists to break.
+        """
+        async with self._engine.connect() as conn:
+            return int(
+                (
+                    await conn.execute(
+                        text("SELECT count(*) FROM paired_clients WHERE revoked_at IS NULL")
+                    )
+                ).scalar_one()
+            )
+
+    # ------------------------------------------------------------- hardware
+
+    async def list_devices(self, kind: str | None = None) -> list[dict[str, Any]]:
+        """Registered hardware — sensors and actuators.
+
+        Note the vocabulary: *devices* are the tank's, *clients* are people's.
+        The split is why the client endpoints moved to /api/v1/clients.
+        """
+        sql = (
+            "SELECT device_id, kind, driver_id, sensor_type, poll_interval_s, "
+            "actuator_class, role, safe_state, max_runtime_s, heartbeat_timeout_s, "
+            "enabled FROM devices"
+        )
+        params: dict[str, object] = {}
+        if kind is not None:
+            sql += " WHERE kind = :kind"
+            params["kind"] = kind
+        sql += " ORDER BY device_id"
+
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(text(sql), params)).mappings().all()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------- recovery window
+
+    async def open_pairing_window(
+        self, opened_by: str, ttl_s: float, *, now: datetime | None = None
+    ) -> tuple[UUID, datetime]:
+        """Reopen pairing for a bounded time. Used only by the recovery CLI."""
+        opened = now or datetime.now(UTC)
+        expires = opened + timedelta(seconds=ttl_s)
+        window_id = uuid4()
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO pairing_windows (id, opened_at, expires_at, opened_by) "
+                    "VALUES (:id, :opened, :expires, :by)"
+                ),
+                {"id": window_id, "opened": opened, "expires": expires, "by": opened_by},
+            )
+        return window_id, expires
+
+    async def open_window(self, *, now: datetime | None = None) -> UUID | None:
+        """An unused, unexpired window, if one exists."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM pairing_windows "
+                        "WHERE used_at IS NULL AND expires_at > :now "
+                        "ORDER BY opened_at DESC LIMIT 1"
+                    ),
+                    {"now": now or datetime.now(UTC)},
+                )
+            ).first()
+        return UUID(str(row[0])) if row else None
+
+    async def consume_window(
+        self, window_id: UUID, client_id: UUID, *, now: datetime | None = None
+    ) -> bool:
+        """Spend a window. One window is one credential, not a standing invite."""
+        async with self._engine.begin() as conn:
+            result = await conn.execute(
+                text(
+                    "UPDATE pairing_windows SET used_at = :now, used_by = :client "
+                    "WHERE id = :id AND used_at IS NULL AND expires_at > :now"
+                ),
+                {"now": now or datetime.now(UTC), "client": client_id, "id": window_id},
             )
             return bool(result.rowcount)
 

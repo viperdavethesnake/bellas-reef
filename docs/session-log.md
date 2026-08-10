@@ -37,3 +37,6 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 18:38 | S7.2 converge-with-slew on restart, from SAFE_DUTY; mid-ramp restart tested | `395c9b8` | green |
 | 2026-08-09 18:38 | S7.3 migration 0004 overrides; monotonic in-run, lapse-on-wake, one active per target | `395c9b8` | green |
 | 2026-08-09 18:38 | S7.4 API audit sink wired to bellasreef.audit.auth; broker outage does not break pairing | `395c9b8` | green |
+| 2026-08-09 20:55 | S8.1 override creation clock-gated; shared clock predicate in bellasreef-service; boot-then-chrony sequence tested | pending | green |
+| 2026-08-09 20:55 | S8.2 migration 0005 pairing_windows + `bellasreef pair` recovery CLI; auth.md updated to as-built | pending | green |
+| 2026-08-09 20:55 | S8.3 api: GET devices/sensors, override endpoints, WS /api/v1/stream with override context on state frames | pending | green |

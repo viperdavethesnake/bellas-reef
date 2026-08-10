@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Manual overrides (docs/contracts/time-and-scheduling.md §4).
 
+Lives in the schema package, not the engine: both the control engine (which
+honours overrides) and the API (which creates and releases them) need it, and
+the API must not import the control engine — a stateless front door has no
+business depending on the control loops.
+
 An override is a *duration*, not a schedule: "off for 30 minutes" means 1800
 elapsed seconds, which makes it immune to DST and timezone by construction.
 
@@ -23,15 +28,22 @@ dark tank hours later because the engine restarted is not that.
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
 
+from bellasreef_service import clock_is_trusted
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-__all__ = ["ActiveOverride", "OverrideStore", "ReleaseReason"]
+__all__ = ["ActiveOverride", "ClockUntrustedError", "OverrideStore", "ReleaseReason"]
+
+
+class ClockUntrustedError(RuntimeError):
+    """Raised when an override is placed against a clock we cannot believe."""
+
 
 ReleaseReason = Literal["expired", "lapsed", "manual", "superseded"]
 
@@ -68,10 +80,28 @@ class ActiveOverride:
 
 
 class OverrideStore:
-    """Persistence for overrides. One active per target, enforced by the index."""
+    """Persistence for overrides. One active per target, enforced by the index.
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    Creation is **clock-gated**, with the same predicate that gates command
+    emission. An override's whole meaning is a deadline, and a deadline
+    computed from a clock that is about to be stepped by chrony is not the
+    duration the operator asked for: place "off for 30 minutes" during the
+    minute after a power cut and a correction of two hours turns it into an
+    override that already expired, or one that outlives the evening.
+
+    Refusing is the honest answer. The window is seconds-to-minutes on a
+    healthy host, and an operator who is told "the clock is still syncing" can
+    press the button again.
+    """
+
+    def __init__(
+        self, engine: AsyncEngine, *, clock_trusted: Callable[[], bool] | None = None
+    ) -> None:
         self._engine = engine
+        # Held as an override rather than resolved now: looking the default
+        # up at call time means the predicate can be swapped for a drill or a
+        # test without rebuilding every store that already exists.
+        self._clock_trusted_override = clock_trusted
 
     async def create(
         self,
@@ -92,6 +122,13 @@ class OverrideStore:
             raise ValueError("duration_s must be > 0")
         if not 0.0 <= duty <= 1.0:
             raise ValueError("duty must be within 0.0-1.0")
+        trusted = self._clock_trusted_override or clock_is_trusted
+        if not trusted():
+            raise ClockUntrustedError(
+                "the host clock is not synchronised; an override placed now would "
+                "carry a deadline that chrony is about to move. Try again once the "
+                "clock has settled."
+            )
 
         issued = now or datetime.now(UTC)
         expires_at = issued + timedelta(seconds=duration_s)
@@ -173,6 +210,47 @@ class OverrideStore:
                 {"now": now or datetime.now(UTC), "reason": reason, "id": override_id},
             )
             return bool(result.rowcount)
+
+    async def active_for(self, target: str) -> ActiveOverride | None:
+        """The live override on one target, if any."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT id, target, level, expires_at FROM overrides "
+                        "WHERE target = :target AND released_at IS NULL"
+                    ),
+                    {"target": target},
+                )
+            ).first()
+        if row is None:
+            return None
+        return ActiveOverride(
+            id=UUID(str(row[0])),
+            target=str(row[1]),
+            duty=float(row[2]["duty"]),
+            expires_at=row[3],
+        )
+
+    async def list_active(self) -> list[ActiveOverride]:
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT id, target, level, expires_at FROM overrides "
+                        "WHERE released_at IS NULL ORDER BY created_at"
+                    )
+                )
+            ).all()
+        return [
+            ActiveOverride(
+                id=UUID(str(r[0])),
+                target=str(r[1]),
+                duty=float(r[2]["duty"]),
+                expires_at=r[3],
+            )
+            for r in rows
+        ]
 
     async def active_count(self, target: str) -> int:
         async with self._engine.connect() as conn:

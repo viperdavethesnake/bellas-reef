@@ -7,6 +7,7 @@ dependencies = [
     "sqlalchemy>=2.0.36",
     "alembic>=1.14",
     "asyncpg>=0.30",
+    "bellasreef-service",
 ]
 
 [build-system]

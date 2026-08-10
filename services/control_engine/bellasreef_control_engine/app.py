@@ -25,17 +25,18 @@ import asyncio
 import json
 import os
 import signal
-import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
+from bellasreef_db.overrides import ActiveOverride, OverrideStore
 from bellasreef_service import (
     Health,
     LivenessGuard,
     MetricsServer,
     SdNotifier,
+    clock_is_trusted,
     configure_logging,
     get_logger,
     watchdog_interval_s,
@@ -43,33 +44,15 @@ from bellasreef_service import (
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from bellasreef_control_engine.overrides import ActiveOverride, OverrideStore
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import Intent, LightingScheduler
 
-__all__ = ["ControlEngine", "clock_is_trusted", "load_profiles", "main"]
+__all__ = ["ControlEngine", "load_profiles", "main"]
 
 log = get_logger(__name__)
 
 SERVICE: Final = "control-engine"
-
-
-def clock_is_trusted() -> bool:
-    """Whether the host clock can be believed. Same rule as hardware-io."""
-    try:
-        out = subprocess.run(
-            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return os.environ.get("BELLASREEF_ASSUME_CLOCK_TRUSTED") == "1"
-    if out.returncode != 0:
-        return os.environ.get("BELLASREEF_ASSUME_CLOCK_TRUSTED") == "1"
-    return out.stdout.strip().lower() == "yes"
 
 
 def load_profiles(path: Path) -> list[ChannelProfile]:

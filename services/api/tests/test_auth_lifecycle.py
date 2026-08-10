@@ -126,7 +126,10 @@ def test_revoking_every_client_does_not_reopen_the_tofu_window() -> None:
 
     pairing_open, retry_code = run(scenario)
     assert pairing_open is False, "window reopened after revoking every client"
-    assert retry_code == 202, "pairing should require approval, not be granted outright"
+    # 403, not 202: with every client revoked there is nobody left to approve,
+    # so the honest answer is "run `bellasreef pair`" rather than a request that
+    # would sit pending forever.
+    assert retry_code == 403, "pairing must not be granted outright after revocation"
 
 
 # ------------------------------------------------------------ approval path
@@ -501,3 +504,150 @@ def test_a_broker_outage_does_not_break_pairing() -> None:
         return r.status_code
 
     assert run(scenario) == 200
+
+
+# ------------------------------------------------------------ recovery window
+
+
+async def _wipe_windows(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE pairing_windows CASCADE"))
+
+
+def test_all_clients_revoked_and_no_window_is_a_403_not_an_endless_poll() -> None:
+    """Nobody can approve, so say so.
+
+    Returning 202 here would leave the app polling a request that no existing
+    client will ever see, which looks like a hang rather than a recoverable
+    state.
+    """
+
+    async def scenario() -> tuple[int, list[str]]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
+
+            blocked = await c.post("/api/v1/pair", json={"client_name": "new phone"})
+        await h.engine.dispose()
+        return blocked.status_code, h.audit.names()
+
+    code, events = run(scenario)
+    assert code == 403
+    assert "pair.no_approver" in events
+
+
+def test_the_recovery_window_lets_exactly_one_client_in() -> None:
+    """The fire escape, end to end — and it is spent by the first user."""
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        out: dict[str, Any] = {}
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
+
+            out["locked_out"] = (
+                await c.post("/api/v1/pair", json={"client_name": "phone"})
+            ).status_code
+
+            # SSH to the hub and run `bellasreef pair`.
+            from bellasreef_api.store import Store
+
+            await Store(h.engine).open_pairing_window("david@hub", 300)
+
+            recovered = await c.post("/api/v1/pair", json={"client_name": "phone"})
+            out["recovered"] = recovered.status_code
+            out["got_token"] = bool(recovered.json().get("refresh_token"))
+
+            # The window is spent. A second client must NOT get an immediate
+            # grant; it falls through to the normal approval path, which is now
+            # available again because recovery produced a live approver.
+            out["second"] = (
+                await c.post("/api/v1/pair", json={"client_name": "gatecrasher"})
+            ).status_code
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+    assert out["locked_out"] == 403
+    assert out["recovered"] == 200
+    assert out["got_token"] is True
+    assert out["second"] == 202, (
+        "a window is one credential: the next client must go through approval, "
+        "not ride the spent window in"
+    )
+    assert "pair.window_used" in out["events"]
+
+
+def test_an_expired_window_does_not_let_anyone_in() -> None:
+    async def scenario() -> int:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
+
+            from bellasreef_api.store import Store
+
+            store = Store(h.engine)
+            await store.open_pairing_window(
+                "david@hub", 300, now=datetime.now(UTC) - timedelta(hours=1)
+            )
+
+            r = await c.post("/api/v1/pair", json={"client_name": "late"})
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 403
+
+
+def test_recovery_does_not_reopen_the_tofu_window() -> None:
+    """The property the window design exists to preserve.
+
+    After recovery, `pairing_open` must still be False: the TOFU-ever window is
+    keyed on client rows having existed, and the recovery path adds a client
+    rather than deleting history.
+    """
+
+    async def scenario() -> tuple[bool, int]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
+
+            from bellasreef_api.store import Store
+
+            await Store(h.engine).open_pairing_window("david@hub", 300)
+            await c.post("/api/v1/pair", json={"client_name": "recovered"})
+
+            info = (await c.get("/api/v1/info")).json()
+        await h.engine.dispose()
+        return info["pairing_open"], info["paired_client_count"]
+
+    pairing_open, count = run(scenario)
+    assert pairing_open is False, "recovery must not reopen open pairing"
+    assert count >= 2
+
+
+def test_a_window_is_not_needed_while_someone_can_still_approve() -> None:
+    """Normal operation is unchanged: 202 and an approval, not a window."""
+
+    async def scenario() -> int:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        async with h.client() as c:
+            await c.post("/api/v1/pair", json={"client_name": "first"})
+            r = await c.post("/api/v1/pair", json={"client_name": "second"})
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 202

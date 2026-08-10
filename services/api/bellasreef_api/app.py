@@ -18,15 +18,27 @@ land next.
 # namespace, where `current_client` does not exist — and OpenAPI generation
 # fails with "is not fully defined".
 
+import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 from uuid import UUID
 
+from bellasreef_db import ClockUntrustedError, OverrideStore
 from bellasreef_service import configure_logging, get_logger
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -38,6 +50,7 @@ from bellasreef_api.security import (
     verify_access_token,
 )
 from bellasreef_api.store import PAIRING_TTL_S, Store
+from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 
 __all__ = ["AuditSink", "build_app"]
 
@@ -106,6 +119,23 @@ class Client(BaseModel):
     revoked_at: datetime | None
 
 
+class OverrideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target: str = Field(min_length=1, max_length=64)
+    duty: float = Field(ge=0.0, le=1.0)
+    duration_s: float = Field(gt=0.0, le=86400.0)
+    reason: str | None = Field(default=None, max_length=256)
+
+
+class OverrideView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: UUID
+    target: str
+    duty: float
+    expires_at: datetime
+    expires_in_s: float
+
+
 @dataclass
 class _PendingTokens:
     """Approved-but-uncollected refresh tokens, held in memory only.
@@ -137,8 +167,12 @@ def build_app(
     *,
     audit: AuditSink | None = None,
     access_ttl_s: int = ACCESS_TOKEN_TTL_S,
+    nats_url: str | None = None,
+    clock_trusted: Callable[[], bool] | None = None,
 ) -> FastAPI:
     store = Store(engine)
+    overrides = OverrideStore(engine, clock_trusted=clock_trusted)
+    bridge = StreamBridge(nats_url, overrides) if nats_url else None
     sink: AuditSink = audit or _noop_audit
     pending = _PendingTokens(tokens={})
 
@@ -208,6 +242,16 @@ def build_app(
 
     @app.post("/api/v1/pair", tags=["pairing"], status_code=status.HTTP_200_OK)
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
+        """Pair a client. Four outcomes, in this order.
+
+        1. No client has ever paired -> TOFU grant, and the window shuts.
+        2. A recovery window is open -> grant and spend it.
+        3. Someone is alive to approve -> 202, poll for a decision.
+        4. Clients exist but every one is revoked -> 403. There is nobody to
+           approve, so the honest answer is to tell the operator to run
+           `bellasreef pair` on the hub rather than leave them polling a
+           request no one will ever see.
+        """
         total = await store.total_clients_ever()
 
         if total == 0:
@@ -221,6 +265,33 @@ def build_app(
                 extra={"client_id": str(client_id), "event": "pair_tofu"},
             )
             return PairGranted(refresh_token=token, client_id=client_id)
+
+        window_id = await store.open_window()
+        if window_id is not None:
+            client_id, token = await store.create_client(body.client_name)
+            await store.consume_window(window_id, client_id)
+            await sink(
+                "pair.window_used",
+                {
+                    "window_id": str(window_id),
+                    "client_id": str(client_id),
+                    "client_name": body.client_name,
+                },
+            )
+            log.warning(
+                "recovery pairing window used and now spent",
+                extra={"window_id": str(window_id), "client_id": str(client_id)},
+            )
+            return PairGranted(refresh_token=token, client_id=client_id)
+
+        if await store.active_client_count() == 0:
+            await sink("pair.no_approver", {"client_name": body.client_name})
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "every paired client has been revoked, so there is nobody to "
+                "approve this request. Run `bellasreef pair` on the hub to open a "
+                "recovery window.",
+            )
 
         request_id = await store.open_pairing_request(body.client_name)
         await sink(
@@ -332,6 +403,128 @@ def build_app(
         await sink("client.revoked", {"client_id": str(client_id), "revoked_by": str(actor)})
         return {"status": "revoked"}
 
+    # ----------------------------------------------------------- hardware
+
+    @app.get("/api/v1/devices", tags=["hardware"])
+    async def devices(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
+        """Registered hardware. *Devices* are the tank's; clients are people's."""
+        return await store.list_devices()
+
+    @app.get("/api/v1/sensors", tags=["hardware"])
+    async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
+        return await store.list_devices(kind="sensor")
+
+    # ---------------------------------------------------------- overrides
+
+    @app.get("/api/v1/overrides", response_model=list[OverrideView], tags=["overrides"])
+    async def list_overrides(
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> list[OverrideView]:
+        now = datetime.now(UTC)
+        return [
+            OverrideView(
+                id=o.id,
+                target=o.target,
+                duty=o.duty,
+                expires_at=o.expires_at,
+                expires_in_s=max(0.0, round((o.expires_at - now).total_seconds(), 1)),
+            )
+            for o in await overrides.list_active()
+        ]
+
+    @app.post("/api/v1/overrides", response_model=OverrideView, tags=["overrides"])
+    async def create_override(
+        body: OverrideRequest, actor: Annotated[UUID, Depends(current_client)]
+    ) -> OverrideView:
+        """Hold a target at a level for a duration.
+
+        Clock-gated: an override IS a deadline, and one computed from a clock
+        chrony is about to step is not the duration the operator asked for.
+        """
+        try:
+            placed = await overrides.create(
+                body.target, body.duty, body.duration_s, reason=body.reason
+            )
+        except ClockUntrustedError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+        await sink(
+            "override.created",
+            {
+                "override_id": str(placed.id),
+                "target": placed.target,
+                "duty": placed.duty,
+                "expires_at": placed.expires_at.isoformat(),
+                "actor": str(actor),
+            },
+        )
+        return OverrideView(
+            id=placed.id,
+            target=placed.target,
+            duty=placed.duty,
+            expires_at=placed.expires_at,
+            expires_in_s=round(body.duration_s, 1),
+        )
+
+    @app.delete("/api/v1/overrides/{override_id}", tags=["overrides"])
+    async def release_override(
+        override_id: UUID, actor: Annotated[UUID, Depends(current_client)]
+    ) -> dict[str, str]:
+        if not await overrides.release(override_id, "manual"):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or already released")
+        await sink(
+            "override.released",
+            {"override_id": str(override_id), "actor": str(actor)},
+        )
+        return {"status": "released"}
+
+    # ------------------------------------------------------------- stream
+
+    @app.websocket("/api/v1/stream")
+    async def stream(websocket: WebSocket) -> None:
+        """Live state and sensor fan-out.
+
+        Authenticated by the FIRST MESSAGE, not a header or query parameter:
+        browsers cannot set headers on a WebSocket handshake, and a token in a
+        URL ends up in access logs and proxy history.
+        """
+        await websocket.accept()
+
+        if bridge is None:
+            await websocket.close(code=1011, reason="stream unavailable: no spine")
+            return
+
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT_S)
+        except (TimeoutError, WebSocketDisconnect):
+            await websocket.close(code=1008, reason="authentication timed out")
+            return
+
+        token = parse_auth_frame(raw)
+        if token is None:
+            await websocket.close(code=1008, reason='first message must be {"token": ...}')
+            return
+        try:
+            client_id = verify_access_token(token, await signing_secret())
+        except TokenError:
+            await websocket.close(code=1008, reason="invalid token")
+            return
+        if not await store.is_active(client_id):
+            await websocket.close(code=1008, reason="client revoked")
+            return
+
+        await websocket.send_text(json.dumps({"kind": "ready", "client_id": str(client_id)}))
+        queue = await bridge.subscribe()
+        try:
+            while True:
+                await websocket.send_text(await queue.get())
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            bridge.unsubscribe(queue)
+
     return app
 
 
@@ -350,4 +543,4 @@ def create_app() -> FastAPI:
         )
         sink = None
 
-    return build_app(create_async_engine(dsn, future=True), audit=sink)
+    return build_app(create_async_engine(dsn, future=True), audit=sink, nats_url=nats_url)

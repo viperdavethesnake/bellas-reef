@@ -18,9 +18,17 @@ One page. If a change makes this longer, the change is probably wrong.
 - Every later device is approved from an **already-paired** device
   ("Allow 'David's iPad'? → Approve"). The operator's existing device is the
   trust anchor; physical presence is the approve tap.
-- **Recovery (fire escape, not front door):** all devices lost → SSH to the hub,
-  `bellasreef pair` reopens the zero-device window for 5 minutes. This CLI is
-  the only terminal interaction in the system and exists only for recovery.
+- **Recovery (fire escape, not front door):** all clients lost or revoked →
+  SSH to the hub, `bellasreef pair` opens a bounded **pairing window**
+  (default 5 min). This CLI is the only terminal interaction in the system
+  and exists only for recovery.
+
+  **As built:** the CLI writes a `pairing_windows` row; it does **not** clear
+  client state. That distinction matters — the TOFU-ever window is keyed on
+  client rows having existed, precisely so that revoking every client cannot
+  reopen open pairing. Deleting revoked clients to "reset" would undo the
+  protection the recovery is recovering from. A window is spent by the first
+  client that uses it, or expires on its own.
 
 No usernames, no passwords, no scopes, no roles, no OAuth2 authorization flows.
 A paired device has full operator rights. Revocation is the only privilege
@@ -48,7 +56,10 @@ operation, and any paired device can do it.
                            shows Approve/Deny. Approve → poller gets 200+token.
                            Poll, not push: push infra does not exist yet (Q1)
                            and a 30 s wait during a once-ever pairing is fine.
-              → no paired devices and window closed : 403
+              → recovery window open : 200 + token, window spent
+              → clients exist but ALL revoked, no window : 403
+                           nobody can approve, so say so rather than leave
+                           the app polling a request no one will ever see.
                            app shows: "run `bellasreef pair` on the hub"
 
 4. TOKEN      POST /api/v1/token { refresh_token }
@@ -77,8 +88,14 @@ token refresh and straight to the dashboard.
 - Revoking a device deletes its refresh-token hash; outstanding JWTs die at
   `exp` (≤15 min exposure). No token introspection endpoint, no denylist —
   that machinery buys nothing at this scale.
-- All auth events (pair open/close, pair success/deny, token mint, revocation)
-  publish to `bellasreef.audit.auth` per the existing audit contract.
+- All auth events publish to `bellasreef.audit.auth` per the existing audit
+  contract. **As built:** `pair.tofu_granted`, `pair.requested`,
+  `pair.approved`, `pair.denied`, `pair.collected`, `pair.no_approver`,
+  `pair.window_opened`, `pair.window_used`, `token.minted`,
+  `token.rejected`, `client.revoked`.
+- Publishing failure is logged at CRITICAL but does **not** fail the request.
+  An auth event missing the trail is bad; being locked out of your own tank
+  by a logging problem is worse.
 
 > **Naming:** paired phones and tablets are *clients*. `devices` is already
 > taken by sensors and actuators — the Postgres table, the NATS subjects and
