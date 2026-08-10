@@ -45,6 +45,16 @@ def main() -> int:
     app = build_app(create_async_engine(UNUSED_DSN))
     spec = app.openapi()
 
+    # Frame schemas are folded into components/schemas as well as published
+    # standalone. swift-openapi-generator only consumes OpenAPI, and PRD G3's
+    # footnote requires frame types to be GENERATED — so embedding them means
+    # one generator and one toolchain rather than adding a second codegen path
+    # for a handful of types. The standalone file stays for non-Swift clients.
+    frames = frame_json_schema()
+    components = spec.setdefault("components", {}).setdefault("schemas", {})
+    for name, definition in frames.get("$defs", {}).items():
+        components.setdefault(name, definition)
+
     paths = spec.get("paths", {})
     if not paths:
         print("refusing to write an empty spec", file=sys.stderr)
