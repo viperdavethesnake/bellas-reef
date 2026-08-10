@@ -26,15 +26,17 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any
 from uuid import UUID
 
 import nats
-from bellasreef_contracts import subjects
+from bellasreef_contracts import ActuatorState, SensorReading, subjects
 from bellasreef_db import OverrideStore
 from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
+from pydantic import ValidationError
+
+from bellasreef_api.frames import OverrideContext, SensorFrame, StateFrame
 
 __all__ = ["AUTH_TIMEOUT_S", "StreamBridge"]
 
@@ -68,24 +70,40 @@ class StreamBridge:
             log.info("stream bridge subscribed", extra={"url": self._url})
 
     async def _on_message(self, msg: Msg) -> None:
+        """Translate a spine message into a validated frame.
+
+        Frames are built through the Pydantic models rather than assembled as
+        dicts, so the JSON Schema clients generate from is a description of what
+        is actually sent. A hand-assembled dict would drift from the schema the
+        first time a field was added.
+        """
+        received_at = datetime.now(UTC)
         try:
-            payload: dict[str, Any] = json.loads(msg.data)
-        except json.JSONDecodeError:
-            log.warning("undecodable frame dropped", extra={"subject": msg.subject})
+            if msg.subject.startswith(f"{subjects.ROOT}.state."):
+                state = ActuatorState.model_validate_json(msg.data)
+                frame: StateFrame | SensorFrame = StateFrame(
+                    received_at=received_at,
+                    subject=msg.subject,
+                    payload=state,
+                    override=await self._override_for(state.actuator_id),
+                )
+            else:
+                frame = SensorFrame(
+                    received_at=received_at,
+                    subject=msg.subject,
+                    payload=SensorReading.model_validate_json(msg.data),
+                )
+        except ValidationError:
+            # A payload that does not satisfy the contract is a producer bug.
+            # Forwarding it would push the failure into every client at once.
+            log.warning(
+                "spine payload failed contract validation; frame dropped",
+                extra={"subject": msg.subject},
+                exc_info=True,
+            )
             return
 
-        kind = "state" if msg.subject.startswith(f"{subjects.ROOT}.state.") else "sensor"
-        frame: dict[str, Any] = {
-            "kind": kind,
-            "subject": msg.subject,
-            "received_at": datetime.now(UTC).isoformat(),
-            "payload": payload,
-        }
-
-        if kind == "state":
-            frame["override"] = await self._override_for(payload.get("actuator_id"))
-
-        encoded = json.dumps(frame)
+        encoded = frame.model_dump_json()
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(encoded)
@@ -94,7 +112,7 @@ class StreamBridge:
                 # back-pressure the bridge onto every other client.
                 log.warning("dropping a frame for a slow subscriber")
 
-    async def _override_for(self, actuator_id: str | None) -> dict[str, Any] | None:
+    async def _override_for(self, actuator_id: str | None) -> OverrideContext | None:
         """Active override on this actuator, if any.
 
         This is the "loudly visible" requirement: a client showing a channel at
@@ -106,14 +124,14 @@ class StreamBridge:
         active = await self._overrides.active_for(actuator_id)
         if active is None:
             return None
-        return {
-            "id": str(active.id),
-            "duty": active.duty,
-            "expires_at": active.expires_at.isoformat(),
-            "expires_in_s": max(
+        return OverrideContext(
+            id=active.id,
+            duty=active.duty,
+            expires_at=active.expires_at,
+            expires_in_s=max(
                 0.0, round((active.expires_at - datetime.now(UTC)).total_seconds(), 1)
             ),
-        }
+        )
 
     async def subscribe(self) -> asyncio.Queue[str]:
         await self._ensure_connected()

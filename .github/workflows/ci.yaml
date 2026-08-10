@@ -88,14 +88,18 @@ jobs:
       # The spec is a published artefact and the source of truth for every
       # client (PRD §7.3.2). Generated from the app rather than hand-kept, and
       # published from CI so clients pin a build rather than someone's laptop.
-      - name: Export OpenAPI spec
-        run: uv run python scripts/export-openapi.py --out openapi.json
+      - name: Export client contracts
+        run: uv run python scripts/export-openapi.py
 
-      - name: Upload OpenAPI spec
+      # One artifact, both files: a client that pins the REST spec without the
+      # matching frame schema can compile and still misread the stream.
+      - name: Upload client contracts
         uses: actions/upload-artifact@v4
         with:
-          name: openapi
-          path: openapi.json
+          name: client-contracts
+          path: |
+            openapi.json
+            stream-frames.schema.json
           if-no-files-found: error
 
   build:

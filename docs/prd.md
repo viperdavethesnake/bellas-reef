@@ -1,11 +1,12 @@
 # Bella's Reef — Product Requirements Document
 
-**Version:** 1.2
+**Version:** 1.3
 **Owner:** David / Bella's Reef LLC
 **Date:** 2026-08-09
 **Status:** Active
 
 **Changelog:**
+- **1.3 (2026-08-09):** G3 footnoted for the WebSocket. The REST client stays 100% generated. The stream's *transport* (connect, first-message auth, reconnect/backoff) is hand-written as a documented exception, because WebSockets are not expressible in OpenAPI 3.1 — but frame **decoding** must use types generated from the published frame JSON Schema. Hand-written frame structs are forbidden. Drift in frame shape stays a compile error, which is the property G3 exists to protect; the transport carries no contract knowledge.
 - **1.2 (2026-08-09):** Auth row restated as device-bound refresh + short-lived JWT, and "no local-trust mode" restated as "no unauthenticated operation" with the TOFU bootstrap window per `docs/contracts/auth.md`. The original wording forbade the pairing bootstrap the auth design requires; the intent — nothing operates unauthenticated — is unchanged. Client-device endpoints renamed `/api/v1/clients` to stop "devices" meaning both sensors/actuators and paired phones.
 - **1.1 (2026-08-09):** Q3 resolved — AGPL-3.0 backend with dual commercial licensing, Apache-2.0 contracts/OpenAPI, closed-source paid iOS app in private repo, CLA-or-no-contributions policy. Q4 partially resolved earlier — Day-1 driver slice (R10a: PCA9685 + DS18B20).
 - **1.0 (2026-08-09):** Initial draft.
@@ -35,7 +36,7 @@ Bella's Reef is a production-grade, open reef automation platform published by B
 |---|------|---------|
 | G1 | A complete tank (temp, ATO, lighting, equipment scheduling, dosing) runs on one Pi 5 with no external services | Full control of reference tank; 30 consecutive days without manual intervention |
 | G2 | Provable fail-safety | Kill the hub process, kill the container runtime, pull power to the Pi mid-cycle: all actuators reach declared safe state within their timeout in every test |
-| G3 | Generated, drift-free iOS client | Swift client is 100% generated from the OpenAPI spec; contract changes surface as compile errors, zero hand-written API bindings |
+| G3 | Generated, drift-free iOS client | REST client 100% generated from the OpenAPI spec. Stream frames decoded via types generated from the published frame JSON Schema. Contract changes surface as compile errors. Only the WebSocket *transport* is hand-written — see the v1.3 footnote |
 | G4 | Phase 2 requires no contract changes | An ESP32 spoke joins the running system by publishing on the existing NATS subject schema, with zero changes to control engine, API, or clients |
 | G5 | Installable by a stranger | Fresh Pi 5 + NVMe to fully running system via documented steps + `docker compose up` in under 30 minutes |
 

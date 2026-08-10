@@ -19,7 +19,6 @@ land next.
 # fails with "is not fully defined".
 
 import asyncio
-import json
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -43,6 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from bellasreef_api.audit import NatsAuditSink
+from bellasreef_api.frames import ReadyFrame
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -515,7 +515,9 @@ def build_app(
             await websocket.close(code=1008, reason="client revoked")
             return
 
-        await websocket.send_text(json.dumps({"kind": "ready", "client_id": str(client_id)}))
+        await websocket.send_text(
+            ReadyFrame(received_at=datetime.now(UTC), client_id=client_id).model_dump_json()
+        )
         queue = await bridge.subscribe()
         try:
             while True:
