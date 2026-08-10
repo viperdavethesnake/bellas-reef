@@ -17,6 +17,6 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 17:05 | S3.6 pre-push hook (core.hooksPath + install script), verified blocking | `71e2ae3` | green |
 | 2026-08-09 17:05 | S3.4 service skeleton: JSON logs, /healthz, /metrics, systemd unit, Dockerfile, compose | `71e2ae3` | green |
 | 2026-08-09 17:05 | S3.5 sd_notify WATCHDOG=1 + LivenessGuard; restart drill passed on Pi (10.8 s freeze→safe) | `71e2ae3` | green |
-| 2026-08-09 17:26 | S4.A spine: streams/consumers, registration + heartbeat publishing, command consumption; redelivered-expired command dropped+audited | pending | green |
-| 2026-08-09 17:26 | S4.B audit writer into audit_log; append-only trigger + idempotency_key under concurrent load | pending | green |
-| 2026-08-09 17:26 | S4.C CI: NATS+JetStream via docker run (services: cannot pass --jetstream) | pending | green |
+| 2026-08-09 17:26 | S4.A spine: streams/consumers, registration + heartbeat publishing, command consumption; redelivered-expired command dropped+audited | `c1ba1bf` | green |
+| 2026-08-09 17:26 | S4.B audit writer into audit_log; append-only trigger + idempotency_key under concurrent load | `c1ba1bf` | green |
+| 2026-08-09 17:26 | S4.C CI: NATS+JetStream via docker run (services: cannot pass --jetstream) | `c1ba1bf` | green |
