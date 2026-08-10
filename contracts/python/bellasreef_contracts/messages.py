@@ -37,6 +37,7 @@ __all__ = [
     "AlertBound",
     "AlertState",
     "BinaryLevel",
+    "ControlAuthority",
     "DeviceId",
     "Heartbeat",
     "PwmLevel",
@@ -44,6 +45,7 @@ __all__ = [
     "SensorReading",
     "SensorRegistration",
     "StateReason",
+    "Transport",
 ]
 
 #: Wire schema version. Bumping this is a MAJOR contract change — see the semver
@@ -75,6 +77,24 @@ ActuatorClass = Literal["binary", "pwm"]
 #: doser R9, outlet R8. Only ``light`` is implemented; the rest are reserved
 #: so adding them later is not another breaking change.
 ActuatorRole = Literal["light", "heater", "pump", "doser", "outlet"]
+
+#: Whether we can actually make the device obey. See docs/device-classes.md §2.
+#:
+#: Orthogonal to ``actuator_class`` (what the device is electrically) and
+#: ``role`` (what it does in the tank). Neither of those says anything about
+#: whether a command is a guarantee or a hope, and the safety framework depends
+#: entirely on the difference.
+#:
+#: ``authoritative`` — we own it. Synchronous, deterministic, verifiable at the
+#: electrical layer. The full R1 safety triple applies and is enforced.
+#: ``advisory`` — we send intent. A dropped command is an expected outcome, not
+#: an incident. A safe state cannot be declared because it could not be honoured.
+#: ``observe_only`` — registered for coordination, never written to. The command
+#: path is closed at registration.
+ControlAuthority = Literal["authoritative", "advisory", "observe_only"]
+
+#: How the device is reached. Local buses are deterministic; a network is not.
+Transport = Literal["local", "network"]
 
 StateReason = Literal[
     "commanded",
@@ -310,14 +330,65 @@ class ActuatorRegistration(_Message):
     role: ActuatorRole
     driver_id: DeviceId
 
-    safe_state: ActuatorLevel
-    max_runtime_s: float = Field(gt=0.0)
-    heartbeat_timeout_s: float = Field(gt=0.0)
+    #: Required, no default. A default here would mean an unstated authority
+    #: silently reads as the strongest one — which is the exact failure this
+    #: field exists to prevent.
+    control_authority: ControlAuthority
+    failsafe_capable: bool
+    transport: Transport
+
+    #: The R1 safety triple. Optional on the *model* and mandatory in the
+    #: *validator* for authoritative devices, because an advisory device must be
+    #: unable to declare a safe state at all — see `_authority_governs_safety`.
+    safe_state: ActuatorLevel | None = None
+    max_runtime_s: float | None = Field(default=None, gt=0.0)
+    heartbeat_timeout_s: float | None = Field(default=None, gt=0.0)
 
     description: str | None = Field(default=None, max_length=512)
 
     @model_validator(mode="after")
+    def _authority_governs_safety(self) -> Self:
+        """Enforce docs/device-classes.md §2.1 and §2.2.
+
+        The asymmetry is the point. An authoritative registration without the
+        triple is rejected because it claims a guarantee it has not specified.
+        An advisory registration *with* a safe state is rejected because it
+        specifies a guarantee it cannot keep — and accepting-and-ignoring it
+        would leave a value in the schema that reads exactly like an enforced
+        one.
+        """
+        if self.control_authority == "authoritative":
+            if not self.failsafe_capable:
+                raise ValueError("authoritative devices must be failsafe_capable")
+            if self.transport != "local":
+                raise ValueError("authoritative devices must be transport='local'")
+            missing = [
+                name
+                for name, value in (
+                    ("safe_state", self.safe_state),
+                    ("max_runtime_s", self.max_runtime_s),
+                    ("heartbeat_timeout_s", self.heartbeat_timeout_s),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "authoritative devices must declare the full safety triple; "
+                    f"missing: {', '.join(missing)}"
+                )
+        elif self.control_authority == "advisory" and self.safe_state is not None:
+            raise ValueError(
+                "advisory devices must not declare a safe_state: it could not be "
+                "enforced, and a value here is indistinguishable from one that is"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _safe_state_matches_class(self) -> Self:
+        # Only meaningful when a safe state exists at all — advisory and
+        # observe_only devices carry none.
+        if self.safe_state is None:
+            return self
         if self.safe_state.kind != self.actuator_class:
             raise ValueError(
                 f"safe_state.kind={self.safe_state.kind!r} does not match "

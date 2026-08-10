@@ -194,7 +194,8 @@ class Store:
         """
         sql = (
             "SELECT device_id, display_name, kind, driver_id, sensor_type, "
-            "poll_interval_s, actuator_class, role, safe_state, max_runtime_s, "
+            "poll_interval_s, actuator_class, role, control_authority, "
+            "failsafe_capable, transport, safe_state, max_runtime_s, "
             "heartbeat_timeout_s, enabled, alert_min, alert_max, alert_clear_margin "
             "FROM devices"
         )
@@ -207,6 +208,21 @@ class Store:
         async with self._engine.connect() as conn:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
+
+    async def control_authority_of(self, device_id: str) -> str | None:
+        """The declared authority of a device, or ``None`` if unknown here.
+
+        ``None`` means the hub has no row for it — which is not the same as
+        "no authority", and callers must not treat the two alike.
+        """
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT control_authority FROM devices WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            ).first()
+        return None if row is None else row[0]
 
     async def upsert_sensor(
         self,

@@ -53,10 +53,13 @@ async def fresh_engine() -> AsyncEngine:
         )
         await conn.execute(
             text(
+                # Authoritative: a PCA9685 channel is one we actually drive
+                # (docs/device-classes.md §2.1).
                 "INSERT INTO devices (id, device_id, kind, driver_id, actuator_class, "
-                "role, safe_state, max_runtime_s, heartbeat_timeout_s) VALUES "
+                "role, control_authority, failsafe_capable, transport, safe_state, "
+                "max_runtime_s, heartbeat_timeout_s) VALUES "
                 "(:id, 'led-blue', 'actuator', 'pca9685', 'pwm', 'light', "
-                "CAST(:safe AS JSONB), 3600, 15)"
+                "'authoritative', true, 'local', CAST(:safe AS JSONB), 3600, 15)"
             ),
             {"id": uuid.uuid4(), "safe": '{"kind": "pwm", "duty": 0.0}'},
         )

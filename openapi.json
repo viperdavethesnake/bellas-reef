@@ -450,6 +450,13 @@
               "null"
             ]
           },
+          "control_authority": {
+            "title": "Control Authority",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "device_id": {
             "title": "Device Id",
             "type": "string"
@@ -468,6 +475,13 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "failsafe_capable": {
+            "title": "Failsafe Capable",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "heartbeat_timeout_s": {
             "title": "Heartbeat Timeout S",
@@ -511,6 +525,13 @@
           },
           "sensor_type": {
             "title": "Sensor Type",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transport": {
+            "title": "Transport",
             "type": [
               "string",
               "null"
@@ -1110,7 +1131,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "2.1.0"
+    "version": "3.0.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -1674,7 +1695,7 @@
         ]
       },
       "post": {
-        "description": "Hold a target at a level for a duration.\n\nClock-gated: an override IS a deadline, and one computed from a clock\nchrony is about to step is not the duration the operator asked for.",
+        "description": "Hold a target at a level for a duration.\n\nClock-gated: an override IS a deadline, and one computed from a clock\nchrony is about to step is not the duration the operator asked for.\n\nAuthority-gated: an ``observe_only`` device is refused here, at the\nboundary where a command enters the system (device-classes.md \u00a72.3).\nFiltering it further down would mean the command existed, was journaled,\nand was dropped by a component that happened to know better \u2014 and the\noperator would be told it had been placed.",
         "operationId": "createOverride",
         "parameters": [
           {
@@ -1713,6 +1734,9 @@
           },
           "401": {
             "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "409": {
+            "description": "The target does not accept commands."
           },
           "422": {
             "content": {

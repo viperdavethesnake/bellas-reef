@@ -201,6 +201,13 @@ class HardwareIO:
                 actuator_class="binary",
                 role="outlet",
                 driver_id="fake-actuator",
+                # hardware-io handles authoritative devices only
+                # (device-classes.md §3). Anything advisory or observe_only
+                # belongs to a separate service that is allowed to fail without
+                # touching the tank.
+                control_authority="authoritative",
+                failsafe_capable=True,
+                transport="local",
                 safe_state=off,
                 max_runtime_s=3600.0,
                 heartbeat_timeout_s=30.0,

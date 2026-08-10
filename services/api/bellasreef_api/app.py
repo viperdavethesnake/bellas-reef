@@ -60,7 +60,7 @@ log = get_logger(__name__)
 
 SERVICE: Final = "api"
 API_VERSION: Final = "v1"
-CONTRACTS_VERSION: Final = "2.1.0"
+CONTRACTS_VERSION: Final = "3.0.0"
 
 #: Every authenticated route can return 401 via the current_client
 #: dependency. Declared and shared so a client can MODEL "your credential
@@ -122,6 +122,12 @@ class DeviceView(BaseModel):
     poll_interval_s: float | None = None
     actuator_class: str | None = None
     role: str | None = None
+    #: Whether a command to this device is a guarantee or a hope
+    #: (docs/device-classes.md §2). Clients must not render an advisory value
+    #: with the same weight as a measured one — §5.
+    control_authority: str | None = None
+    failsafe_capable: bool | None = None
+    transport: str | None = None
     #: The safety contract, surfaced rather than hidden. A client showing an
     #: actuator should be able to say what it does when everything fails.
     safe_state: dict[str, Any] | None = None
@@ -875,6 +881,7 @@ def build_app(
         operation_id="createOverride",
         responses={
             401: AUTH_401,
+            409: {"description": "The target does not accept commands."},
             503: {"description": "Clock not synchronised; deadline would be wrong."},
         },
     )
@@ -885,7 +892,20 @@ def build_app(
 
         Clock-gated: an override IS a deadline, and one computed from a clock
         chrony is about to step is not the duration the operator asked for.
+
+        Authority-gated: an ``observe_only`` device is refused here, at the
+        boundary where a command enters the system (device-classes.md §2.3).
+        Filtering it further down would mean the command existed, was journaled,
+        and was dropped by a component that happened to know better — and the
+        operator would be told it had been placed.
         """
+        authority = await store.control_authority_of(body.target)
+        if authority == "observe_only":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{body.target!r} is registered observe_only and accepts no commands",
+            )
+
         try:
             placed = await overrides.create(
                 body.target, body.duty, body.duration_s, reason=body.reason

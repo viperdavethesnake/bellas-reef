@@ -198,6 +198,13 @@ That strictness is chosen, not accidental. In a system where a firmware typo on 
 spoke could silently mean a dose is misread, loud rejection beats quiet
 tolerance. The cost is that field additions need a migration.
 
+**contracts 3.0.0 adds the required control-authority axis** — `control_authority`,
+`failsafe_capable`, `transport` — to `ActuatorRegistration`, and makes the R1
+safety triple conditional on it (docs/device-classes.md §2). Same pre-release
+exception as below, and for a stronger reason: the alternative is that every
+registration written before the change silently changed meaning, with no way to
+tell from the data which guarantee a historical record was asserting.
+
 ### Pre-release exception (expires at the first tagged release)
 
 **contracts 2.0.0 added the required `role` on `ActuatorRegistration` without

@@ -17,6 +17,7 @@ from bellasreef_contracts.messages import (
     AlertBound,
     AlertState,
     BinaryLevel,
+    ControlAuthority,
     DeviceId,
     Heartbeat,
     PwmLevel,
@@ -24,6 +25,7 @@ from bellasreef_contracts.messages import (
     SensorReading,
     SensorRegistration,
     StateReason,
+    Transport,
 )
 
 __all__ = [
@@ -37,6 +39,7 @@ __all__ = [
     "AlertBound",
     "AlertState",
     "BinaryLevel",
+    "ControlAuthority",
     "DeviceId",
     "Heartbeat",
     "PwmLevel",
@@ -44,4 +47,5 @@ __all__ = [
     "SensorReading",
     "SensorRegistration",
     "StateReason",
+    "Transport",
 ]

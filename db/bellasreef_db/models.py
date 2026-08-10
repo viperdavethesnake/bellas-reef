@@ -77,6 +77,11 @@ class Device(Base):
 
     # Actuator-only. Non-null for actuators, enforced by check constraint below.
     actuator_class: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: Whether we can actually make the device obey — docs/device-classes.md §2.
+    #: Actuator-only; NULL on sensors.
+    control_authority: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    failsafe_capable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    transport: Mapped[str | None] = mapped_column(String(8), nullable=True)
     #: What the actuator is for, as opposed to how it is driven. Required for
     #: actuators, meaningless for sensors (sensor_type already carries it).
     role: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -118,18 +123,53 @@ class Device(Base):
             "actuator_class IS NULL OR actuator_class IN ('binary', 'pwm')",
             name="actuator_class_valid",
         ),
-        # The safety framework, at rest. An actuator without a declared safe
-        # state, runtime cap and heartbeat timeout cannot be stored at all.
+        # Every actuator declares its authority, and sensors carry none.
         CheckConstraint(
             """
             kind <> 'actuator' OR (
-                actuator_class      IS NOT NULL
+                actuator_class    IS NOT NULL
+            AND control_authority IS NOT NULL
+            AND control_authority IN ('authoritative', 'advisory', 'observe_only')
+            AND failsafe_capable  IS NOT NULL
+            AND transport         IS NOT NULL
+            AND transport         IN ('local', 'network')
+            )
+            """,
+            name="actuator_declares_authority",
+        ),
+        CheckConstraint(
+            """
+            kind <> 'sensor' OR (
+                control_authority IS NULL
+            AND failsafe_capable  IS NULL
+            AND transport         IS NULL
+            )
+            """,
+            name="sensors_carry_no_authority",
+        ),
+        # The safety framework, at rest — now scoped to the authority that can
+        # actually honour it (device-classes.md §2.1). This replaces the old
+        # blanket rule over every actuator. `IS DISTINCT FROM` rather than `<>`
+        # because `NULL <> 'authoritative'` is NULL, and a CHECK that evaluates
+        # to NULL passes.
+        CheckConstraint(
+            """
+            control_authority IS DISTINCT FROM 'authoritative' OR (
+                failsafe_capable    IS TRUE
+            AND transport           = 'local'
             AND safe_state          IS NOT NULL
             AND max_runtime_s       IS NOT NULL AND max_runtime_s > 0
             AND heartbeat_timeout_s IS NOT NULL AND heartbeat_timeout_s > 0
             )
             """,
-            name="actuator_declares_failure_behaviour",
+            name="authoritative_declares_failure_behaviour",
+        ),
+        # §2.2: an advisory device must be unable to declare a safe state, not
+        # merely have one ignored. A stored value is indistinguishable from an
+        # enforced one to everything downstream.
+        CheckConstraint(
+            "control_authority IS DISTINCT FROM 'advisory' OR safe_state IS NULL",
+            name="advisory_declares_no_safe_state",
         ),
         # The IS NOT NULL is load-bearing, not redundant. With poll_interval_s
         # NULL, `poll_interval_s > 0` is NULL, `TRUE AND NULL` is NULL, and a

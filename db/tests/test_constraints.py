@@ -33,7 +33,8 @@ async def _insert(sql: str, **params: object) -> None:
 
 _DEVICE_COLS = (
     "id, device_id, kind, driver_id, sensor_type, poll_interval_s, "
-    "actuator_class, role, safe_state, max_runtime_s, heartbeat_timeout_s"
+    "actuator_class, role, control_authority, failsafe_capable, transport, "
+    "safe_state, max_runtime_s, heartbeat_timeout_s"
 )
 
 
@@ -41,8 +42,8 @@ def _device_sql() -> str:
     return (
         f"INSERT INTO devices ({_DEVICE_COLS}) VALUES "
         "(:id, :device_id, :kind, :driver_id, :sensor_type, :poll_interval_s, "
-        ":actuator_class, :role, CAST(:safe_state AS JSONB), :max_runtime_s, "
-        ":heartbeat_timeout_s)"
+        ":actuator_class, :role, :control_authority, :failsafe_capable, :transport, "
+        "CAST(:safe_state AS JSONB), :max_runtime_s, :heartbeat_timeout_s)"
     )
 
 
@@ -56,6 +57,9 @@ def _sensor(**over: object) -> dict[str, object]:
         "poll_interval_s": 1.0,
         "actuator_class": None,
         "role": None,
+        "control_authority": None,
+        "failsafe_capable": None,
+        "transport": None,
         "safe_state": None,
         "max_runtime_s": None,
         "heartbeat_timeout_s": None,
@@ -74,6 +78,9 @@ def _actuator(**over: object) -> dict[str, object]:
         "poll_interval_s": None,
         "actuator_class": "binary",
         "role": "outlet",
+        "control_authority": "authoritative",
+        "failsafe_capable": True,
+        "transport": "local",
         "safe_state": '{"kind": "binary", "on": false}',
         "max_runtime_s": 3600.0,
         "heartbeat_timeout_s": 15.0,
@@ -108,16 +115,25 @@ class TestActuatorFailureBehaviour:
     def test_valid_actuator_is_accepted(self) -> None:
         run(lambda: _insert(_device_sql(), **_actuator()))
 
-    @pytest.mark.parametrize(
-        "field", ["safe_state", "max_runtime_s", "heartbeat_timeout_s", "actuator_class"]
-    )
-    def test_actuator_without_declared_failure_behaviour_is_rejected(self, field: str) -> None:
-        with pytest.raises(IntegrityError, match="actuator_declares_failure_behaviour"):
+    # The constraint these assert on was renamed and narrowed by migration 0008:
+    # the safety triple is now demanded of *authoritative* actuators rather than
+    # every actuator (docs/device-classes.md §2.1). The default `_actuator()` is
+    # authoritative, so the behaviour under test is unchanged for these rows —
+    # only the constraint that enforces it has moved.
+    @pytest.mark.parametrize("field", ["safe_state", "max_runtime_s", "heartbeat_timeout_s"])
+    def test_authoritative_actuator_without_failure_behaviour_is_rejected(self, field: str) -> None:
+        with pytest.raises(IntegrityError, match="authoritative_declares_failure_behaviour"):
             run(lambda: _insert(_device_sql(), **_actuator(**{field: None})))
+
+    def test_an_actuator_without_a_class_is_rejected(self) -> None:
+        """Electrical class is required of every actuator regardless of
+        authority — it moved to the authority constraint, not out of the schema."""
+        with pytest.raises(IntegrityError, match="actuator_declares_authority"):
+            run(lambda: _insert(_device_sql(), **_actuator(actuator_class=None)))
 
     @pytest.mark.parametrize("field", ["max_runtime_s", "heartbeat_timeout_s"])
     def test_non_positive_timers_are_rejected(self, field: str) -> None:
-        with pytest.raises(IntegrityError, match="actuator_declares_failure_behaviour"):
+        with pytest.raises(IntegrityError, match="authoritative_declares_failure_behaviour"):
             run(lambda: _insert(_device_sql(), **_actuator(**{field: 0.0})))
 
 
@@ -357,3 +373,83 @@ class TestPairingRequests:
                 exp=datetime.now(UTC),
             )
         )
+
+
+class TestControlAuthority:
+    """docs/device-classes.md §2, at rest."""
+
+    def test_an_actuator_must_declare_its_authority(self) -> None:
+        with pytest.raises(IntegrityError, match="actuator_declares_authority"):
+            run(lambda: _insert(_device_sql(), **_actuator(control_authority=None)))
+
+    def test_an_unknown_authority_is_rejected(self) -> None:
+        with pytest.raises(IntegrityError, match="actuator_declares_authority"):
+            run(lambda: _insert(_device_sql(), **_actuator(control_authority="best_effort")))
+
+    @pytest.mark.parametrize("field", ["safe_state", "max_runtime_s", "heartbeat_timeout_s"])
+    def test_authoritative_needs_the_full_triple(self, field: str) -> None:
+        """R1 at rest, now scoped to the authority that can honour it."""
+        with pytest.raises(IntegrityError, match="authoritative_declares_failure_behaviour"):
+            run(lambda: _insert(_device_sql(), **_actuator(**{field: None})))
+
+    def test_authoritative_must_be_failsafe_capable(self) -> None:
+        with pytest.raises(IntegrityError, match="authoritative_declares_failure_behaviour"):
+            run(lambda: _insert(_device_sql(), **_actuator(failsafe_capable=False)))
+
+    def test_authoritative_must_be_local(self) -> None:
+        with pytest.raises(IntegrityError, match="authoritative_declares_failure_behaviour"):
+            run(lambda: _insert(_device_sql(), **_actuator(transport="network")))
+
+    def test_advisory_stores_without_a_triple(self) -> None:
+        run(
+            lambda: _insert(
+                _device_sql(),
+                **_actuator(
+                    control_authority="advisory",
+                    failsafe_capable=False,
+                    transport="network",
+                    safe_state=None,
+                    max_runtime_s=None,
+                    heartbeat_timeout_s=None,
+                ),
+            )
+        )
+
+    def test_advisory_may_not_carry_a_safe_state(self) -> None:
+        """Rejected, not ignored. A stored safe_state is indistinguishable from
+        an enforced one to every reader of this table."""
+        with pytest.raises(IntegrityError, match="advisory_declares_no_safe_state"):
+            run(
+                lambda: _insert(
+                    _device_sql(),
+                    **_actuator(
+                        control_authority="advisory",
+                        failsafe_capable=False,
+                        transport="network",
+                        max_runtime_s=None,
+                        heartbeat_timeout_s=None,
+                    ),
+                )
+            )
+
+    def test_observe_only_stores_bare(self) -> None:
+        run(
+            lambda: _insert(
+                _device_sql(),
+                **_actuator(
+                    control_authority="observe_only",
+                    failsafe_capable=False,
+                    transport="network",
+                    safe_state=None,
+                    max_runtime_s=None,
+                    heartbeat_timeout_s=None,
+                ),
+            )
+        )
+
+    def test_a_sensor_carries_no_authority(self) -> None:
+        # `observe_only` rather than `authoritative`: an authoritative sensor
+        # trips the failure-behaviour constraint first, which is also a
+        # rejection but not the one under test here.
+        with pytest.raises(IntegrityError, match="sensors_carry_no_authority"):
+            run(lambda: _insert(_device_sql(), **_sensor(control_authority="observe_only")))

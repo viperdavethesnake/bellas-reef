@@ -27,6 +27,11 @@ def _valid() -> dict[str, Any]:
         "actuator_class": "binary",
         "role": "outlet",
         "driver_id": "gpio-relay-0",
+        # The authority axis is required with no default (device-classes.md §2).
+        # A GPIO relay is the canonical authoritative device.
+        "control_authority": "authoritative",
+        "failsafe_capable": True,
+        "transport": "local",
         "safe_state": {"kind": "binary", "on": False},
         "max_runtime_s": 3600.0,
         "heartbeat_timeout_s": 15.0,
@@ -40,9 +45,9 @@ def test_valid_registration_is_accepted() -> None:
     assert reg.safe_state.on is False
 
 
-@pytest.mark.parametrize("missing", ["safe_state", "max_runtime_s", "heartbeat_timeout_s", "role"])
-def test_registration_rejected_without_required_safety_field(missing: str) -> None:
-    """The whole point: no safe state, no runtime cap, no heartbeat -> no device."""
+@pytest.mark.parametrize("missing", ["role", "control_authority", "failsafe_capable", "transport"])
+def test_registration_rejected_without_a_required_field(missing: str) -> None:
+    """Fields with no default at all: absence is a `missing` error on the field."""
     payload = _valid()
     del payload[missing]
 
@@ -51,6 +56,29 @@ def test_registration_rejected_without_required_safety_field(missing: str) -> No
 
     errors = exc.value.errors()
     assert any(e["loc"] == (missing,) and e["type"] == "missing" for e in errors), errors
+
+
+@pytest.mark.parametrize("missing", ["safe_state", "max_runtime_s", "heartbeat_timeout_s"])
+def test_authoritative_registration_rejected_without_the_safety_triple(missing: str) -> None:
+    """The whole point, narrowed: no safe state, no runtime cap, no heartbeat ->
+    no *authoritative* device.
+
+    The guarantee is unchanged for every device we actually drive. What moved is
+    its scope: docs/device-classes.md §2.2 makes the triple inapplicable to an
+    advisory device, which cannot honour it and must therefore be unable to
+    claim it. The fields are consequently optional on the model and mandatory in
+    the validator, so the rejection is a value error rather than a missing-field
+    error — the device is refused either way, which is what R1 is protecting.
+
+    NOTE: this narrows PRD R1 as written ("Every actuator registration declares
+    ...") and the CLAUDE.md rule that mirrors it. Flagged for a ruling; not
+    resolved here.
+    """
+    payload = _valid()
+    del payload[missing]
+
+    with pytest.raises(ValidationError, match="full safety triple"):
+        ActuatorRegistration.model_validate(payload)
 
 
 @pytest.mark.parametrize("missing", ["safe_state", "max_runtime_s", "heartbeat_timeout_s"])
@@ -127,5 +155,11 @@ def test_an_unknown_role_is_refused() -> None:
 
 
 def test_schema_version_is_two() -> None:
-    """v2 is the role addition. The envelope version is coarse by design."""
+    """The envelope version is coarse by design and has not moved.
+
+    v2 was the ``role`` addition. The control-authority axis is a *package*
+    MAJOR (contracts 3.0.0) because it adds required fields to an existing
+    message, but the shared wire envelope is unchanged — bumping it would
+    signal "changed" for every message type that was not touched.
+    """
     assert ActuatorRegistration.model_validate(_valid()).schema_version == 2

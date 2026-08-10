@@ -225,7 +225,7 @@ requires-dist = [
 
 [[package]]
 name = "bellasreef-contracts"
-version = "2.1.0"
+version = "3.0.0"
 source = { editable = "contracts/python" }
 dependencies = [
     { name = "pydantic" },

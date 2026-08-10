@@ -289,3 +289,98 @@ class TestApproversAndSelfRevoke:
             return r.status_code
 
         assert run(scenario) != 422
+
+
+class TestObserveOnlyClosesTheCommandPath:
+    """docs/device-classes.md §2.3, enforced at the API boundary."""
+
+    async def _seed(self, engine: AsyncEngine, authority: str) -> None:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO devices (id, device_id, kind, driver_id, actuator_class, "
+                    "role, control_authority, failsafe_capable, transport, safe_state, "
+                    "max_runtime_s, heartbeat_timeout_s) VALUES "
+                    "(gen_random_uuid(), :device_id, 'actuator', 'kessil', 'pwm', 'light', "
+                    ":authority, :failsafe, :transport, CAST(:safe AS JSONB), :runtime, :beat)"
+                ),
+                {
+                    "device_id": f"light-{authority}",
+                    "authority": authority,
+                    "failsafe": authority == "authoritative",
+                    "transport": "local" if authority == "authoritative" else "network",
+                    "safe": '{"kind": "pwm", "duty": 0.0}'
+                    if authority == "authoritative"
+                    else None,
+                    "runtime": 3600.0 if authority == "authoritative" else None,
+                    "beat": 15.0 if authority == "authoritative" else None,
+                },
+            )
+
+    def test_an_override_on_an_observe_only_device_is_refused(self) -> None:
+        """Refused *here*, not filtered downstream.
+
+        Filtering later would mean the command was accepted, journaled, and
+        quietly dropped by something that happened to know better — while the
+        operator was told the hold had been placed.
+        """
+
+        async def scenario() -> tuple[int, str]:
+            engine = await fresh_engine()
+            await self._seed(engine, "observe_only")
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={"target": "light-observe_only", "duty": 0.5, "duration_s": 600},
+                )
+            await engine.dispose()
+            return r.status_code, r.text
+
+        code, body = run(scenario)
+        assert code == 409
+        assert "observe_only" in body
+
+    def test_an_authoritative_device_still_accepts_overrides(self) -> None:
+        async def scenario() -> int:
+            engine = await fresh_engine()
+            await self._seed(engine, "authoritative")
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={"target": "light-authoritative", "duty": 0.5, "duration_s": 600},
+                )
+            await engine.dispose()
+            return r.status_code
+
+        assert run(scenario) == 200
+
+    def test_an_unknown_target_is_not_treated_as_observe_only(self) -> None:
+        """An absent row means "the hub does not know this device", which is a
+        different thing from "this device refuses commands"."""
+
+        async def scenario() -> int:
+            engine = await fresh_engine()
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={"target": "not-a-device", "duty": 0.5, "duration_s": 600},
+                )
+            await engine.dispose()
+            return r.status_code
+
+        assert run(scenario) != 409

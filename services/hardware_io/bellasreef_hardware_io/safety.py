@@ -88,6 +88,30 @@ class _Guard:
     latch_detail: str = ""
     heartbeat_lost: bool = False
 
+    @property
+    def heartbeat_timeout_s(self) -> float:
+        """Non-optional by construction — see `InterlockSupervisor.register`.
+
+        The registration models these as optional because an advisory device
+        has none. A guard only ever exists for an authoritative one, which the
+        contract validator guarantees is complete.
+        """
+        timeout = self.registration.heartbeat_timeout_s
+        assert timeout is not None
+        return timeout
+
+    @property
+    def max_runtime_s(self) -> float:
+        runtime = self.registration.max_runtime_s
+        assert runtime is not None
+        return runtime
+
+    @property
+    def safe_state(self) -> ActuatorLevel:
+        level = self.registration.safe_state
+        assert level is not None
+        return level
+
     at_safe_state: bool = True
     runtime_task: asyncio.Task[None] | None = None
     watch_task: asyncio.Task[None] | None = None
@@ -122,14 +146,35 @@ class InterlockSupervisor:
     # ------------------------------------------------------------- lifecycle
 
     def register(self, registration: ActuatorRegistration, driver: ActuatorDriver) -> None:
-        """Register an actuator.
+        """Register an actuator. Authoritative devices only.
 
-        The model already guarantees ``safe_state``, ``max_runtime_s`` and
-        ``heartbeat_timeout_s`` are present — an unregisterable actuator cannot
-        be constructed — so there is nothing to re-validate here.
+        docs/device-classes.md §3: this service is the one that is allowed to
+        drive a heater, and it takes only devices we can actually command. A
+        non-authoritative registration is refused here rather than tolerated,
+        because everything below this line — the runtime cap, the heartbeat
+        deadline, the drive-to-safe-state on lapse — assumes a guarantee that an
+        advisory device never offered.
+
+        Refusing it also makes the narrowing below sound: the contract validator
+        guarantees an authoritative registration carries the complete safety
+        triple, so these values are never ``None`` past this point.
         """
         if registration.actuator_id in self._guards:
             raise ValueError(f"actuator already registered: {registration.actuator_id}")
+        if registration.control_authority != "authoritative":
+            raise ValueError(
+                f"hardware-io registers authoritative actuators only; "
+                f"{registration.actuator_id!r} is {registration.control_authority!r}"
+            )
+        if (
+            registration.safe_state is None
+            or registration.max_runtime_s is None
+            or registration.heartbeat_timeout_s is None
+        ):  # pragma: no cover - unreachable while the contract validator holds
+            raise ValueError(
+                f"{registration.actuator_id!r} is authoritative but incomplete; "
+                "the contract validator should have refused it"
+            )
         self._guards[registration.actuator_id] = _Guard(registration=registration, driver=driver)
 
     async def start(self) -> None:
@@ -204,7 +249,7 @@ class InterlockSupervisor:
 
     async def _watch_heartbeat(self, guard: _Guard) -> None:
         loop = asyncio.get_running_loop()
-        timeout = guard.registration.heartbeat_timeout_s
+        timeout = guard.heartbeat_timeout_s
         while self._running:
             remaining = (guard.last_beat + timeout) - loop.time()
             if remaining <= 0:
@@ -256,7 +301,7 @@ class InterlockSupervisor:
 
     def _note_level(self, guard: _Guard, level: ActuatorLevel) -> None:
         """Start or cancel the continuous-runtime timer."""
-        is_safe = level == guard.registration.safe_state
+        is_safe = level == guard.safe_state
 
         if is_safe:
             guard.at_safe_state = True
@@ -276,7 +321,7 @@ class InterlockSupervisor:
                 )
 
     async def _runtime_deadline(self, guard: _Guard) -> None:
-        await asyncio.sleep(guard.registration.max_runtime_s)
+        await asyncio.sleep(guard.max_runtime_s)
         guard.latched = True
         guard.latch_detail = (
             f"ran continuously past max_runtime_s={guard.registration.max_runtime_s}"
