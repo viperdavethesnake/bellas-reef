@@ -54,6 +54,7 @@ async def clean_spine() -> Spine:
 def dawn_profile() -> ChannelProfile:
     return ChannelProfile(
         channel_id="led-blue",
+        anchor="clock",
         points=(
             RampPoint(at=time(6), duty=0.0),
             RampPoint(at=time(12), duty=1.0),

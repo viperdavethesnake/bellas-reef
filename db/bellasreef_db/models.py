@@ -32,6 +32,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -338,5 +339,52 @@ class PairingRequest(Base):
         CheckConstraint(
             "state <> 'approved' OR (client_pk IS NOT NULL AND decided_at IS NOT NULL)",
             name="approved_has_client",
+        ),
+    )
+
+
+class Override(Base):
+    """A temporary manual level that outranks the schedule.
+
+    "Off for 30 minutes" for feeding or maintenance. The duration is what the
+    operator asked for, so it is counted in elapsed seconds — immune to DST and
+    timezone by construction. ``expires_at`` is a wall-clock deadline persisted
+    *only* so the override can be re-armed or lapsed across a restart; within a
+    run the engine counts on a monotonic clock.
+
+    One active override per target, enforced by a partial unique index rather
+    than by whoever writes the next caller remembering.
+    """
+
+    __tablename__ = "overrides"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    target: Mapped[str] = mapped_column(String(64), index=True)
+    level: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    #: Why it ended. NULL while active.
+    release_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
+        CheckConstraint(
+            "(released_at IS NULL) = (release_reason IS NULL)",
+            name="release_reason_iff_released",
+        ),
+        CheckConstraint(
+            "release_reason IS NULL OR release_reason IN "
+            "('expired', 'lapsed', 'manual', 'superseded')",
+            name="release_reason_valid",
+        ),
+        Index(
+            "uq_overrides_one_active_per_target",
+            "target",
+            unique=True,
+            postgresql_where=text("released_at IS NULL"),
         ),
     )

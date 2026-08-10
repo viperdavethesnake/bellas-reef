@@ -239,18 +239,22 @@ name = "bellasreef-control-engine"
 version = "0.1.0"
 source = { editable = "services/control_engine" }
 dependencies = [
+    { name = "asyncpg" },
     { name = "bellasreef-contracts" },
     { name = "bellasreef-service" },
     { name = "nats-py" },
     { name = "pydantic" },
+    { name = "sqlalchemy" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "asyncpg", specifier = ">=0.30" },
     { name = "bellasreef-contracts", editable = "contracts/python" },
     { name = "bellasreef-service", editable = "services/shared" },
     { name = "nats-py", specifier = ">=2.9" },
     { name = "pydantic", specifier = ">=2.10" },
+    { name = "sqlalchemy", specifier = ">=2.0.36" },
 ]
 
 [[package]]

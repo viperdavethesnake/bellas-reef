@@ -23,6 +23,7 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 def profile() -> ChannelProfile:
     return ChannelProfile(
         channel_id="led-blue",
+        anchor="clock",
         points=(RampPoint(at=time(6), duty=0.0), RampPoint(at=time(18), duty=1.0)),
     )
 
@@ -81,7 +82,15 @@ class TestProfileLoading:
         """Half a schedule would light a tank to a shape nobody designed."""
         bad = tmp_path / "bad.json"
         bad.write_text(
-            json.dumps([{"channel_id": "x", "points": [{"at": "08:00:00", "duty": 2.0}]}])
+            json.dumps(
+                [
+                    {
+                        "channel_id": "x",
+                        "anchor": "clock",
+                        "points": [{"at": "08:00:00", "duty": 2.0}],
+                    }
+                ]
+            )
         )
         with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
             load_profiles(bad)

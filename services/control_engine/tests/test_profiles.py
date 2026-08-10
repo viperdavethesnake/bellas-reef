@@ -19,6 +19,7 @@ from pydantic import ValidationError
 def profile(*points: tuple[str, float], zone: str = "UTC", channel: str = "blue") -> ChannelProfile:
     return ChannelProfile(
         channel_id=channel,
+        anchor="clock",
         zone=zone,
         points=tuple(RampPoint(at=time.fromisoformat(t), duty=d) for t, d in points),
     )
@@ -125,7 +126,9 @@ class TestValidation:
 
     def test_a_single_point_is_not_a_profile(self) -> None:
         with pytest.raises(ValidationError):
-            ChannelProfile(channel_id="blue", points=(RampPoint(at=time(8), duty=0.5),))
+            ChannelProfile(
+                channel_id="blue", anchor="clock", points=(RampPoint(at=time(8), duty=0.5),)
+            )
 
     def test_unknown_timezone_is_refused(self) -> None:
         with pytest.raises(ValidationError, match="unknown timezone"):

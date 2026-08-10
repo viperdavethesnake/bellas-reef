@@ -10,7 +10,9 @@ are database behaviour, and a mocked store would prove none of it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -420,3 +422,82 @@ def test_the_openapi_schema_is_generated() -> None:
     assert {"/healthz", "/api/v1/info", "/api/v1/pair", "/api/v1/token", "/api/v1/clients"} <= paths
     # Not this pass.
     assert "/api/v1/stream" not in paths
+
+
+# ------------------------------------------------------- audit reaches the spine
+
+_NATS = "BELLASREEF_TEST_NATS_URL"
+
+
+@pytest.mark.skipif(not os.environ.get(_NATS), reason=f"{_NATS} not set")
+def test_auth_events_reach_bellasreef_audit_auth() -> None:
+    """auth.md §3, end to end on a real broker.
+
+    Closes the gap flagged at the end of the previous pass: the sink existed
+    but was wired to a no-op, so auth events were logged locally and never
+    reached the trail.
+    """
+
+    async def scenario() -> tuple[int, list[str]]:
+        from bellasreef_api.audit import NatsAuditSink
+        from bellasreef_contracts import subjects
+        from bellasreef_hardware_io.spine import Spine
+
+        spine = Spine(os.environ[_NATS])
+        await spine.connect()
+        await spine.provision()
+        await spine.js.purge_stream("BR_AUDIT")
+        for consumer in await spine.js.consumers_info("BR_AUDIT"):
+            await spine.js.delete_consumer("BR_AUDIT", consumer.name)
+
+        sub = await spine.js.pull_subscribe(
+            subjects.ALL_AUDIT, durable=f"auth-{uuid.uuid4().hex[:8]}", stream="BR_AUDIT"
+        )
+
+        sink = NatsAuditSink(os.environ[_NATS])
+        engine = await fresh_engine()
+        app = build_app(engine, audit=sink)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://hub"
+        ) as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+            await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
+
+        msgs = await sub.fetch(10, timeout=5.0)
+        subjects_seen = [m.subject for m in msgs]
+        events = []
+        for m in msgs:
+            events.append(json.loads(m.data)["event"])
+            await m.ack()
+
+        await sink.close()
+        await engine.dispose()
+        await spine.close()
+        return len(msgs), events + subjects_seen
+
+    count, seen = run(scenario)
+    assert count >= 2, "pairing and token minting should both be audited"
+    assert "pair.tofu_granted" in seen
+    assert "token.minted" in seen
+    assert all(s == "bellasreef.audit.auth" for s in seen if s.startswith("bellasreef"))
+
+
+@pytest.mark.skipif(not os.environ.get(_NATS), reason=f"{_NATS} not set")
+def test_a_broker_outage_does_not_break_pairing() -> None:
+    """The deliberate trade: a logging failure must not lock an operator out."""
+
+    async def scenario() -> int:
+        from bellasreef_api.audit import NatsAuditSink
+
+        sink = NatsAuditSink("nats://127.0.0.1:1")  # nothing listening
+        engine = await fresh_engine()
+        app = build_app(engine, audit=sink)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://hub"
+        ) as c:
+            r = await c.post("/api/v1/pair", json={"client_name": "phone"})
+        await engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 200

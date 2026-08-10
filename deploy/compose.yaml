@@ -113,12 +113,17 @@ services:
       dockerfile: deploy/Dockerfile.control-engine
     depends_on:
       nats: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     # No devices, no group_add. It reaches hardware only through NATS, and the
     # absence of device access here is the enforcement of that.
     user: "1000:1000"
     environment:
       BELLASREEF_NATS_URL: nats://nats:4222
       BELLASREEF_LIGHTING_PROFILES: /config/lighting.json
+      BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
+      # Global slew: max duty change per second. 0.01 walks 0->100% in 100s,
+      # which is a visible fade rather than a pop over livestock.
+      BELLASREEF_MAX_DUTY_DELTA_PER_S: "0.01"
       # No timedatectl in the container; the host guarantees clock trust by
       # ordering the stack After=time-sync.target. Explicit, never assumed.
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"

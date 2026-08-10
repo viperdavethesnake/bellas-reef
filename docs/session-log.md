@@ -32,3 +32,8 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 18:02 | S6.3 migration 0003: paired_clients, signing_keys, pairing_requests, devices.role CHECK | `0015a32` | green |
 | 2026-08-09 18:02 | S6.4 _bellasreef._tcp registered on host, verified from the Mac | `0015a32` | n/a |
 | 2026-08-09 18:14 | S6.5 api service: /info, /pair TOFU + 202-poll-approve, /token, /clients + revoke, /healthz; 14 lifecycle tests | `73a454b` | green |
+| 2026-08-09 18:30 | S7.0 time-and-scheduling.md reviewed and committed; 4 flags raised | `03109c0` | n/a |
+| 2026-08-09 18:38 | S7.1 profile schema: anchor (solar reserved+rejected), locale, on_miss, global slew knob | pending | green |
+| 2026-08-09 18:38 | S7.2 converge-with-slew on restart, from SAFE_DUTY; mid-ramp restart tested | pending | green |
+| 2026-08-09 18:38 | S7.3 migration 0004 overrides; monotonic in-run, lapse-on-wake, one active per target | pending | green |
+| 2026-08-09 18:38 | S7.4 API audit sink wired to bellasreef.audit.auth; broker outage does not break pairing | pending | green |

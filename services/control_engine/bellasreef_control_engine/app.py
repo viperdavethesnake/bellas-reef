@@ -41,7 +41,9 @@ from bellasreef_service import (
     watchdog_interval_s,
 )
 from prometheus_client import CollectorRegistry, Counter, Gauge
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from bellasreef_control_engine.overrides import ActiveOverride, OverrideStore
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import Intent, LightingScheduler
@@ -125,11 +127,15 @@ class ControlEngine:
         loop_interval_s: float = 1.0,
         liveness_timeout_s: float = 15.0,
         metrics_port: int = 9102,
+        max_duty_delta_per_s: float | None = None,
+        override_store: OverrideStore | None = None,
     ) -> None:
         self.registry = CollectorRegistry()
         self.metrics = _Metrics(self.registry)
 
-        self.scheduler = LightingScheduler(profiles)
+        self.scheduler = LightingScheduler(profiles, max_duty_delta_per_s=max_duty_delta_per_s)
+        self.overrides = override_store
+        self._held: dict[str, ActiveOverride] = {}
         self.publisher = CommandPublisher(nats_url) if nats_url else None
 
         self._loop_interval_s = loop_interval_s
@@ -155,6 +161,8 @@ class ControlEngine:
         )
         if self.publisher is not None:
             await self.publisher.connect()
+
+        await self._rearm_overrides()
 
         await self.httpd.start()
         self.liveness.start()
@@ -200,8 +208,37 @@ class ControlEngine:
             except TimeoutError:
                 pass
 
+    async def _rearm_overrides(self) -> None:
+        """Lapse-on-wake, then re-arm what is still owed.
+
+        An override whose deadline passed while we were down is closed by the
+        store and never applied — the operator asked for thirty minutes, and
+        honouring it hours later is not that.
+        """
+        if self.overrides is None:
+            return
+        live = await self.overrides.load_active()
+        self._held = {o.target: o for o in live}
+        log.info(
+            "overrides re-armed after wake",
+            extra={"active": sorted(self._held), "count": len(live)},
+        )
+
+    async def _expire_overrides(self) -> None:
+        """Release anything whose monotonic deadline has passed."""
+        if self.overrides is None or not self._held:
+            return
+        for target, override in list(self._held.items()):
+            if override.is_expired():
+                await self.overrides.release(override.id, "expired")
+                del self._held[target]
+                self.metrics.suppressed.labels("override_expired").inc()
+                log.info("override expired", extra={"target": target})
+
     async def _tick(self, now: datetime) -> None:
-        intents = self.scheduler.due(now)
+        await self._expire_overrides()
+        held = {t: o.duty for t, o in self._held.items()}
+        intents = self.scheduler.due(now, held)
         for intent in intents:
             await self._publish(intent, now)
 
@@ -282,11 +319,16 @@ async def _amain() -> int:
     if not profiles:
         log.warning("no lighting profiles configured; the engine will schedule nothing")
 
+    slew_raw = os.environ.get("BELLASREEF_MAX_DUTY_DELTA_PER_S")
+    dsn = os.environ.get("BELLASREEF_DATABASE_URL")
+
     engine = ControlEngine(
         profiles,
         nats_url=os.environ.get("BELLASREEF_NATS_URL"),
         liveness_timeout_s=float(os.environ.get("BELLASREEF_LIVENESS_TIMEOUT_S", "15")),
         metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9102")),
+        max_duty_delta_per_s=float(slew_raw) if slew_raw else None,
+        override_store=OverrideStore(create_async_engine(dsn, future=True)) if dsn else None,
     )
 
     loop = asyncio.get_running_loop()

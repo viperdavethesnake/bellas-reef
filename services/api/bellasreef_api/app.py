@@ -30,6 +30,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -337,4 +338,16 @@ def build_app(
 def create_app() -> FastAPI:
     configure_logging(service=SERVICE, level=os.environ.get("BELLASREEF_LOG_LEVEL", "INFO"))
     dsn = os.environ["BELLASREEF_DATABASE_URL"]
-    return build_app(create_async_engine(dsn, future=True))
+
+    nats_url = os.environ.get("BELLASREEF_NATS_URL")
+    if nats_url:
+        sink: AuditSink | None = NatsAuditSink(nats_url)
+    else:
+        # Loud, because auth.md §3 requires these events on the trail and the
+        # no-op only logs them locally.
+        log.critical(
+            "BELLASREEF_NATS_URL is unset: auth events will NOT reach bellasreef.audit.auth"
+        )
+        sink = None
+
+    return build_app(create_async_engine(dsn, future=True), audit=sink)

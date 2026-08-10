@@ -14,6 +14,7 @@ from bellasreef_control_engine.scheduler import LightingScheduler
 def ramp(channel: str = "blue") -> ChannelProfile:
     return ChannelProfile(
         channel_id=channel,
+        anchor="clock",
         points=(
             RampPoint(at=time(6), duty=0.0),
             RampPoint(at=time(12), duty=1.0),
@@ -75,6 +76,7 @@ class TestMultiChannel:
         blue = ramp("blue")
         white = ChannelProfile(
             channel_id="white",
+            anchor="clock",
             points=(RampPoint(at=time(8), duty=0.0), RampPoint(at=time(18), duty=1.0)),
         )
         s = LightingScheduler([blue, white])
