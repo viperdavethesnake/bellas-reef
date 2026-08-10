@@ -193,6 +193,7 @@ class HardwareIO:
                 source=SERVICE,
                 actuator_id="drill-dummy",
                 actuator_class="binary",
+                role="outlet",
                 driver_id="fake-actuator",
                 safe_state=off,
                 max_runtime_s=3600.0,

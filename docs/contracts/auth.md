@@ -58,8 +58,8 @@ operation, and any paired device can do it.
               Every app launch: silent step 4, then authenticated traffic.
 
 5. USE        Authorization: Bearer <jwt> on all other endpoints.
-              GET  /api/v1/devices                list paired devices by name
-              DELETE /api/v1/devices/{id}         revoke (lost phone = one tap)
+              GET  /api/v1/clients                list paired clients by name
+              DELETE /api/v1/clients/{id}         revoke (lost phone = one tap)
               WS   /api/v1/stream                 live state+sensor fan-out
               ... (remaining surface per the OpenAPI spec)
 ```
@@ -79,6 +79,11 @@ token refresh and straight to the dashboard.
   that machinery buys nothing at this scale.
 - All auth events (pair open/close, pair success/deny, token mint, revocation)
   publish to `bellasreef.audit.auth` per the existing audit contract.
+
+> **Naming:** paired phones and tablets are *clients*. `devices` is already
+> taken by sensors and actuators — the Postgres table, the NATS subjects and
+> the driver contract all mean hardware by it. One word, two meanings, on
+> adjacent API surfaces was going to cost someone an afternoon.
 
 ## 4. Explicit non-goals
 

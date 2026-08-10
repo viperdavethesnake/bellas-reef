@@ -32,6 +32,7 @@ __all__ = [
     "ActuatorCommand",
     "ActuatorLevel",
     "ActuatorRegistration",
+    "ActuatorRole",
     "ActuatorState",
     "BinaryLevel",
     "DeviceId",
@@ -43,13 +44,33 @@ __all__ = [
 
 #: Wire schema version. Bumping this is a MAJOR contract change — see the semver
 #: policy in docs/contracts/nats-subjects.md.
-SCHEMA_VERSION: Final[Literal[1]] = 1
+#:
+#: v2 added the required ``role`` on ActuatorRegistration.
+#:
+#: Known bluntness, accepted deliberately: this lives on the shared envelope,
+#: so bumping it for a change that touches only one message type also signals
+#: "changed" for every other. Per-message-type versioning would be finer but
+#: is not worth the machinery at two consumers.
+SCHEMA_VERSION: Final[Literal[2]] = 2
 
 #: Device identifiers double as NATS subject tokens, so they carry the same
 #: restrictions. See :mod:`bellasreef_contracts.subjects`.
 DeviceId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
 
 ActuatorClass = Literal["binary", "pwm"]
+
+#: What an actuator *is for*, as opposed to how it is driven.
+#:
+#: ``actuator_class`` is the electrical contract (on/off vs proportional);
+#: ``role`` is the husbandry one. A client renders by role — a light gets a
+#: day curve, a doser gets millilitres — while the wire stays class-based.
+#:
+#: Required, not optional. An actuator with an unspecified role forces every
+#: client to guess from its id, and removing that guess is the entire point.
+#: Values trace to the PRD control modules: light R7, heater R5, pump R6,
+#: doser R9, outlet R8. Only ``light`` is implemented; the rest are reserved
+#: so adding them later is not another breaking change.
+ActuatorRole = Literal["light", "heater", "pump", "doser", "outlet"]
 
 StateReason = Literal[
     "commanded",
@@ -69,7 +90,7 @@ class _Frozen(BaseModel):
 class _Message(_Frozen):
     """Common envelope on every message published to the spine."""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
     message_id: UUID
     emitted_at: AwareDatetime
     source: DeviceId
@@ -202,6 +223,7 @@ class ActuatorRegistration(_Message):
 
     actuator_id: DeviceId
     actuator_class: ActuatorClass
+    role: ActuatorRole
     driver_id: DeviceId
 
     safe_state: ActuatorLevel

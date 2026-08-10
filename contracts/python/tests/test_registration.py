@@ -25,6 +25,7 @@ def _valid() -> dict[str, Any]:
         "source": "hardware-io",
         "actuator_id": "return-pump",
         "actuator_class": "binary",
+        "role": "outlet",
         "driver_id": "gpio-relay-0",
         "safe_state": {"kind": "binary", "on": False},
         "max_runtime_s": 3600.0,
@@ -39,7 +40,7 @@ def test_valid_registration_is_accepted() -> None:
     assert reg.safe_state.on is False
 
 
-@pytest.mark.parametrize("missing", ["safe_state", "max_runtime_s", "heartbeat_timeout_s"])
+@pytest.mark.parametrize("missing", ["safe_state", "max_runtime_s", "heartbeat_timeout_s", "role"])
 def test_registration_rejected_without_required_safety_field(missing: str) -> None:
     """The whole point: no safe state, no runtime cap, no heartbeat -> no device."""
     payload = _valid()
@@ -95,6 +96,7 @@ def test_pwm_actuator_registers_with_pwm_safe_state() -> None:
     payload = _valid()
     payload["actuator_id"] = "led-channel-a"
     payload["actuator_class"] = "pwm"
+    payload["role"] = "light"
     payload["safe_state"] = {"kind": "pwm", "duty": 0.0}
 
     reg = ActuatorRegistration.model_validate(payload)
@@ -106,3 +108,24 @@ def test_registration_is_frozen() -> None:
     reg = ActuatorRegistration.model_validate(_valid())
     with pytest.raises(ValidationError):
         reg.max_runtime_s = 1.0
+
+
+@pytest.mark.parametrize("role", ["light", "heater", "pump", "doser", "outlet"])
+def test_reserved_roles_are_accepted(role: str) -> None:
+    """Reserved values exist so adding them later is not another break."""
+    payload = _valid()
+    payload["role"] = role
+    assert ActuatorRegistration.model_validate(payload).role == role
+
+
+def test_an_unknown_role_is_refused() -> None:
+    """role is a closed set: a client that cannot render it must not receive it."""
+    payload = _valid()
+    payload["role"] = "disco-ball"
+    with pytest.raises(ValidationError):
+        ActuatorRegistration.model_validate(payload)
+
+
+def test_schema_version_is_two() -> None:
+    """v2 is the role addition. The envelope version is coarse by design."""
+    assert ActuatorRegistration.model_validate(_valid()).schema_version == 2

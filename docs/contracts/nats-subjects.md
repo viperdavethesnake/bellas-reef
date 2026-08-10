@@ -198,6 +198,24 @@ That strictness is chosen, not accidental. In a system where a firmware typo on 
 spoke could silently mean a dose is misread, loud rejection beats quiet
 tolerance. The cost is that field additions need a migration.
 
+### Pre-release exception (expires at the first tagged release)
+
+**contracts 2.0.0 added the required `role` on `ActuatorRegistration` without
+the dual-publish migration.** That is a deliberate, bounded exception, taken
+because the migration path protects *consumers* and there were none: nothing
+subscribed to `bellasreef.registry.>`, there were zero git tags, the package
+had never been published, and the only two users of the model are in this repo
+and were updated in the same commit.
+
+The version number still says 2.0.0, because under our own rule this *is*
+breaking and calling it 1.1.0 would mislead anyone later building against 1.x.
+Honest version, skipped ceremony.
+
+**This exception expires at the first tagged release and does not renew.**
+Once anything outside this repository can depend on the contract, the
+dual-publish path below is mandatory. An exception without an expiry becomes a
+habit.
+
 **Migration path for a MAJOR bump:** publish both versions concurrently under a
 new subject root (`bellasreef2.…`), move consumers over, then retire the old
 root. The `bellasreef.` root is fixed for v1 — version lives in the payload and,

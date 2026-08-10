@@ -27,3 +27,7 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 17:58 | S5.2 control-engine: skeleton, sole command publisher, lighting scheduler R7, clock-trust gate, NATS integration | pending | green |
 | 2026-08-09 18:02 | S5.3 auth.md reviewed against contracts and committed; 5 conflicts flagged for ruling | pending | n/a |
 | 2026-08-09 18:06 | S5.4 ios-design-brief.md committed; §5 `role` contract change proposed (2.0.0, no dual-publish, exception with expiry) — awaiting approval | pending | n/a |
+| 2026-08-09 18:02 | S6.1 contracts 2.0.0: role required Literal, schema_version->2, pre-release exception documented with first-tag expiry | pending | green |
+| 2026-08-09 18:02 | S6.2 PRD v1.2: auth row + no-local-trust wording amended; clients rename | pending | n/a |
+| 2026-08-09 18:02 | S6.3 migration 0003: paired_clients, signing_keys, pairing_requests, devices.role CHECK | pending | green |
+| 2026-08-09 18:02 | S6.4 _bellasreef._tcp registered on host, verified from the Mac | pending | n/a |

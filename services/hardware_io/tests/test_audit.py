@@ -213,8 +213,8 @@ def test_idempotency_key_uniqueness_under_a_real_race() -> None:
             await conn.execute(
                 text(
                     "INSERT INTO devices (id, device_id, kind, driver_id, actuator_class,"
-                    " safe_state, max_runtime_s, heartbeat_timeout_s) VALUES "
-                    "(:id, :did, 'actuator', 'fake', 'binary',"
+                    " role, safe_state, max_runtime_s, heartbeat_timeout_s) VALUES "
+                    "(:id, :did, 'actuator', 'fake', 'binary', 'doser',"
                     " CAST(:safe AS JSONB), 60, 15)"
                 ),
                 # Bound, never inlined. A ':' inside a SQL string literal is

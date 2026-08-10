@@ -125,6 +125,31 @@ to an address that does not work. An allowlist is used rather than denying
 `docker0` because Docker also creates `br-*` bridges for user-defined networks
 and avahi has no wildcard syntax.
 
+### Service discovery: `_bellasreef._tcp`
+
+A hostname A record is not enough. An app that only knows `bellasreef.local`
+cannot tell a reef controller from anything else answering to that name, and
+cannot learn the API port. `auth.md` step 1 browses for the service type, so
+it has to be registered:
+
+```bash
+sudo cp deploy/avahi/bellasreef.service /etc/avahi/services/bellasreef.service
+sudo systemctl reload avahi-daemon
+```
+
+Verify from another machine, not from the Pi — avahi does not reliably
+reflect its own services back to a local browse, so a local check that finds
+nothing proves nothing:
+
+```bash
+dns-sd -B _bellasreef._tcp            # macOS
+avahi-browse -rt _bellasreef._tcp     # Linux
+```
+
+Verified 2026-08-09: advertises as `Bella's Reef on bellasreef`, discovered
+from the dev Mac. The TXT records carry the API base path and the contracts
+version, so a client can refuse a hub it is too old to talk to.
+
 WiFi power save is disabled and persisted in the NetworkManager connection
 profile:
 

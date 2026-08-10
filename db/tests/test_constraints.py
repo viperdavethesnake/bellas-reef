@@ -33,7 +33,7 @@ async def _insert(sql: str, **params: object) -> None:
 
 _DEVICE_COLS = (
     "id, device_id, kind, driver_id, sensor_type, poll_interval_s, "
-    "actuator_class, safe_state, max_runtime_s, heartbeat_timeout_s"
+    "actuator_class, role, safe_state, max_runtime_s, heartbeat_timeout_s"
 )
 
 
@@ -41,7 +41,8 @@ def _device_sql() -> str:
     return (
         f"INSERT INTO devices ({_DEVICE_COLS}) VALUES "
         "(:id, :device_id, :kind, :driver_id, :sensor_type, :poll_interval_s, "
-        ":actuator_class, CAST(:safe_state AS JSONB), :max_runtime_s, :heartbeat_timeout_s)"
+        ":actuator_class, :role, CAST(:safe_state AS JSONB), :max_runtime_s, "
+        ":heartbeat_timeout_s)"
     )
 
 
@@ -54,6 +55,7 @@ def _sensor(**over: object) -> dict[str, object]:
         "sensor_type": "temp",
         "poll_interval_s": 1.0,
         "actuator_class": None,
+        "role": None,
         "safe_state": None,
         "max_runtime_s": None,
         "heartbeat_timeout_s": None,
@@ -71,6 +73,7 @@ def _actuator(**over: object) -> dict[str, object]:
         "sensor_type": None,
         "poll_interval_s": None,
         "actuator_class": "binary",
+        "role": "outlet",
         "safe_state": '{"kind": "binary", "on": false}',
         "max_runtime_s": 3600.0,
         "heartbeat_timeout_s": 15.0,
@@ -247,3 +250,110 @@ class TestDosingJournalEvidence:
         device_pk = run(self._device)
         with pytest.raises(IntegrityError, match="failed_has_reason"):
             run(lambda: _insert(self._dose_sql(), **self._row(device_pk, state="failed")))
+
+
+class TestActuatorRole:
+    """contracts 2.0.0 requires a role; the storage layer agrees."""
+
+    def test_actuator_without_a_role_is_rejected(self) -> None:
+        """The NULL case specifically.
+
+        `role IN (...)` with role NULL evaluates to NULL, and a CHECK that is
+        NULL PASSES in Postgres. Only the explicit IS NOT NULL closes it — the
+        same trap as the sensor cadence constraint in 0001.
+        """
+        with pytest.raises(IntegrityError, match="actuator_declares_role"):
+            run(lambda: _insert(_device_sql(), **_actuator(role=None)))
+
+    def test_an_unknown_role_is_rejected(self) -> None:
+        with pytest.raises(IntegrityError, match="actuator_declares_role"):
+            run(lambda: _insert(_device_sql(), **_actuator(role="disco-ball")))
+
+    @pytest.mark.parametrize("role", ["light", "heater", "pump", "doser", "outlet"])
+    def test_reserved_roles_are_accepted(self, role: str) -> None:
+        run(lambda: _insert(_device_sql(), **_actuator(role=role)))
+
+    def test_sensors_need_no_role(self) -> None:
+        """sensor_type already carries it; a role on a probe would be noise."""
+        run(lambda: _insert(_device_sql(), **_sensor(role=None)))
+
+
+class TestPairedClients:
+    def _client_sql(self) -> str:
+        return (
+            "INSERT INTO paired_clients (id, name, refresh_token_hash, revoked_at) "
+            "VALUES (:id, :name, :hash, :revoked)"
+        )
+
+    def test_a_live_client_has_a_hash(self) -> None:
+        run(
+            lambda: _insert(
+                self._client_sql(),
+                id=uuid.uuid4(),
+                name="David's iPad",
+                hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                revoked=None,
+            )
+        )
+
+    def test_a_revoked_client_must_not_keep_a_usable_hash(self) -> None:
+        """Revocation deletes the hash (auth.md §3). Keeping both states in
+        sync is what stops a 'revoked' client still minting JWTs."""
+        with pytest.raises(IntegrityError, match="revoked_iff_hash_cleared"):
+            run(
+                lambda: _insert(
+                    self._client_sql(),
+                    id=uuid.uuid4(),
+                    name="lost phone",
+                    hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                    revoked=datetime.now(UTC),
+                )
+            )
+
+    def test_a_live_client_without_a_hash_is_rejected(self) -> None:
+        with pytest.raises(IntegrityError, match="revoked_iff_hash_cleared"):
+            run(
+                lambda: _insert(
+                    self._client_sql(),
+                    id=uuid.uuid4(),
+                    name="ghost",
+                    hash=None,
+                    revoked=None,
+                )
+            )
+
+    def test_a_blank_name_is_rejected(self) -> None:
+        with pytest.raises(IntegrityError, match="name_not_blank"):
+            run(
+                lambda: _insert(
+                    self._client_sql(),
+                    id=uuid.uuid4(),
+                    name="   ",
+                    hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                    revoked=None,
+                )
+            )
+
+
+class TestPairingRequests:
+    def test_approved_without_a_client_is_rejected(self) -> None:
+        """An approved request with no client would mint tokens for nobody."""
+        with pytest.raises(IntegrityError, match="approved_has_client"):
+            run(
+                lambda: _insert(
+                    "INSERT INTO pairing_requests (id, client_name, state, expires_at) "
+                    "VALUES (:id, 'phone', 'approved', :exp)",
+                    id=uuid.uuid4(),
+                    exp=datetime.now(UTC),
+                )
+            )
+
+    def test_pending_is_fine_without_a_client(self) -> None:
+        run(
+            lambda: _insert(
+                "INSERT INTO pairing_requests (id, client_name, state, expires_at) "
+                "VALUES (:id, 'phone', 'pending', :exp)",
+                id=uuid.uuid4(),
+                exp=datetime.now(UTC),
+            )
+        )

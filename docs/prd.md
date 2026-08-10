@@ -1,11 +1,12 @@
 # Bella's Reef — Product Requirements Document
 
-**Version:** 1.1
+**Version:** 1.2
 **Owner:** David / Bella's Reef LLC
 **Date:** 2026-08-09
 **Status:** Active
 
 **Changelog:**
+- **1.2 (2026-08-09):** Auth row restated as device-bound refresh + short-lived JWT, and "no local-trust mode" restated as "no unauthenticated operation" with the TOFU bootstrap window per `docs/contracts/auth.md`. The original wording forbade the pairing bootstrap the auth design requires; the intent — nothing operates unauthenticated — is unchanged. Client-device endpoints renamed `/api/v1/clients` to stop "devices" meaning both sensors/actuators and paired phones.
 - **1.1 (2026-08-09):** Q3 resolved — AGPL-3.0 backend with dual commercial licensing, Apache-2.0 contracts/OpenAPI, closed-source paid iOS app in private repo, CLA-or-no-contributions policy. Q4 partially resolved earlier — Day-1 driver slice (R10a: PCA9685 + DS18B20).
 - **1.0 (2026-08-09):** Initial draft.
 
@@ -122,7 +123,7 @@ Phase 1: single Pi 5-class hub. Five services + message spine, all containerized
 | API | FastAPI + Pydantic v2, OpenAPI-first | OpenAPI spec is a published, versioned artifact |
 | iOS client | Swift/SwiftUI, iOS 26+, client generated via swift-openapi-generator | Zero hand-written bindings |
 | Web UI | Standalone SPA container consuming the same API + WebSocket as iOS | Two independent clients keep the contract honest |
-| Auth | Token auth (OAuth2/JWT) from the first endpoint | No local-trust mode; no retrofit |
+| Auth | Token auth (device-bound refresh + short-lived JWT) from the first endpoint | No unauthenticated operation; TOFU bootstrap window per `docs/contracts/auth.md`. No retrofit |
 | GPIO/I2C | libgpiod v2 / kernel character device | No sysfs, no RPi.GPIO shims |
 | Observability | Structured JSON logs + metrics from every service, day 1 | |
 | CI | Multi-arch builds + API contract tests from repo creation | |

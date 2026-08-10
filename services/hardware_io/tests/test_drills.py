@@ -58,6 +58,7 @@ def _registration(
         source="hardware-io",
         actuator_id=actuator_id,
         actuator_class="binary",
+        role="outlet",
         driver_id="fake-actuator",
         safe_state=OFF,
         max_runtime_s=max_runtime_s,

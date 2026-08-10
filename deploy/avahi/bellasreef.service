@@ -1,0 +1,21 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+
+<!--
+  Advertises the API as _bellasreef._tcp so clients can browse for it.
+
+  A hostname A record is not enough: an app that only knows bellasreef.local
+  cannot tell a reef controller from any other host with that name, and cannot
+  learn the port. auth.md step 1 browses for this service type.
+
+  Install to /etc/avahi/services/bellasreef.service on the host.
+-->
+<service-group>
+  <name replace-wildcards="yes">Bella's Reef on %h</name>
+  <service>
+    <type>_bellasreef._tcp</type>
+    <port>8000</port>
+    <txt-record>api=/api/v1</txt-record>
+    <txt-record>contracts=2.0.0</txt-record>
+  </service>
+</service-group>

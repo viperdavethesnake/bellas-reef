@@ -76,6 +76,9 @@ class Device(Base):
 
     # Actuator-only. Non-null for actuators, enforced by check constraint below.
     actuator_class: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: What the actuator is for, as opposed to how it is driven. Required for
+    #: actuators, meaningless for sensors (sensor_type already carries it).
+    role: Mapped[str | None] = mapped_column(String(16), nullable=True)
     safe_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     max_runtime_s: Mapped[float | None] = mapped_column(Float, nullable=True)
     heartbeat_timeout_s: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -119,6 +122,18 @@ class Device(Base):
             )
             """,
             name="sensor_declares_type_and_cadence",
+        ),
+        # IS NOT NULL first, for the same reason as the constraints above: a
+        # CHECK that evaluates to NULL passes in Postgres, so `role IN (...)`
+        # alone would let an actuator with no role straight through.
+        CheckConstraint(
+            """
+            kind <> 'actuator' OR (
+                role IS NOT NULL
+            AND role IN ('light', 'heater', 'pump', 'doser', 'outlet')
+            )
+            """,
+            name="actuator_declares_role",
         ),
     )
 
@@ -239,5 +254,89 @@ class AuditLog(Base):
         CheckConstraint(
             "category IN ('command', 'config', 'auth', 'state', 'safety', 'calibration')",
             name="category_valid",
+        ),
+    )
+
+
+class PairedClient(Base):
+    """A phone, tablet or browser that has paired with the hub.
+
+    Distinct from :class:`Device`, which is hardware. Paired *clients* are
+    people's things; *devices* are the tank's.
+    """
+
+    __tablename__ = "paired_clients"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(128))
+
+    #: SHA-256 of the refresh token, never the token itself. Set to NULL on
+    #: revocation — auth.md says revocation deletes the hash, and keeping the
+    #: row preserves the audit trail and the client list.
+    refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("length(trim(name)) > 0", name="name_not_blank"),
+        # A revoked client must not keep a usable hash, and a live one must
+        # have one. Either state is fine; the mismatch is what would be a bug.
+        CheckConstraint(
+            "(revoked_at IS NULL) <> (refresh_token_hash IS NULL)",
+            name="revoked_iff_hash_cleared",
+        ),
+    )
+
+
+class SigningKey(Base):
+    """The server-side key JWTs are signed with.
+
+    Generated at first boot. Kept in Postgres rather than a file so that a
+    restore of the database restores working sessions with it.
+    """
+
+    __tablename__ = "signing_keys"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    secret: Mapped[str] = mapped_column(Text)
+    algorithm: Mapped[str] = mapped_column(String(16), server_default="HS256")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PairingRequest(Base):
+    """A pending pair awaiting approval from an already-paired client.
+
+    The id is what the new client polls. Expiry is stored rather than computed
+    so a request cannot be resurrected by moving the clock — which matters on a
+    board with no RTC battery.
+    """
+
+    __tablename__ = "pairing_requests"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    client_name: Mapped[str] = mapped_column(String(128))
+    state: Mapped[str] = mapped_column(String(16), index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    #: Set when approved: the client row that was created for it.
+    client_pk: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("paired_clients.id", ondelete="RESTRICT"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'approved', 'denied', 'expired')", name="state_valid"
+        ),
+        # Approved means a client exists and a decision was recorded. Without
+        # this, an "approved" row with no client would mint tokens for nobody.
+        CheckConstraint(
+            "state <> 'approved' OR (client_pk IS NOT NULL AND decided_at IS NOT NULL)",
+            name="approved_has_client",
         ),
     )
