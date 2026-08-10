@@ -1,9 +1,10 @@
-# iOS app — design brief v1
+# iOS app — design brief v1.1
 
-**Status:** direction settled, pre-implementation · **Owner:** David / Bella's Reef LLC
-**Scope:** look/feel, palette, screen map, and the one contract change the app
-design requires. The app is closed-source (see PRD Q3); this brief lives in the
-public repo because it drives API and contract decisions, not app code.
+**Status:** active — v1.1 adds §7 UX standards · **Owner:** David / Bella's Reef LLC
+**Scope:** look/feel, palette, screen map, UX standards, and the one contract
+change the app design requires. The app is closed-source (see PRD Q3); this
+brief lives in the public repo because it drives API and contract decisions,
+not app code.
 
 ---
 
@@ -74,3 +75,67 @@ only ever temp. The generalization is solved **in the model, not the UI**:
 Custom design systems, light-mode-first, per-user themes, widgets/watch/live
 activities (later, on their own merits), any UI for hardware not yet in the
 PRD. The ceiling is the PRD.
+
+## 7. UX standards — interaction law
+
+Added v1.1, after milestone 1 proved the vertical. These are review criteria,
+not suggestions: a PR that violates one gets flagged in design review the same
+way a failing test gets flagged in CI.
+
+### 7.1 State completeness
+
+Every view designs all five states explicitly: **loading, empty, populated,
+error, reconnecting**. No spinner-forever, no blank panels, no view that only
+looks right when everything works. The milestone-1 amber "Disconnected — could
+not connect" (instead of red, instead of a stale number) is the canon example;
+that instinct is now law.
+
+### 7.2 Data honesty
+
+Never present a stale value as current. A reading older than its expected
+cadence dims and gains an age stamp ("78.3° · 2m ago"). A faulted sensor shows
+*fault*, never its last good number. This is the UI twin of the driver rule
+that a timeout yields `quality="fault"` rather than a stale value with a fresh
+timestamp — the honesty chain runs probe → wire → glass unbroken.
+
+### 7.3 Motion
+
+One motion system. Values crossfade on change, never jump-cut. The spectrum
+bar animates level changes at the engine's slew rate — the app *shows* the
+ramp physics rather than teleporting between states. Reduce Motion is
+respected everywhere: crossfades become instant swaps, nothing essential is
+conveyed by animation alone.
+
+### 7.4 Touch and haptics
+
+44pt minimum touch targets, no exceptions. Overrides and approvals confirm
+with haptics (success notification style). Destructive actions — revoke a
+client, release an override early — use the standard iOS confirmation
+pattern; nothing destructive fires on a single tap. Buttons that talk to the
+hub show their in-flight state; a tap that silently does nothing for 800ms is
+a bug.
+
+### 7.5 Dynamic Type and accessibility
+
+Hero numbers and body text scale with Dynamic Type; layouts reflow rather
+than truncate at accessibility sizes. VoiceOver labels carry meaning, not
+widget names: the spectrum bar reads "Royal blue, ninety percent," the status
+line reads its actual state. Contrast for all text against the dark palette
+meets WCAG AA; the dimmed stale-data treatment (§7.2) must remain readable,
+not decorative-gray.
+
+### 7.6 Glass discipline (enforcement of §1)
+
+Glass appears on exactly: tab bar, toolbars, contextual action sheets.
+Content — readings, charts, lists, banners — is solid. A PR that applies
+glass/material to a content surface fails design review. When in doubt: if
+it displays data, it is not glass.
+
+### 7.7 Alert presentation
+
+Alerts follow the palette's severity law (§2). Amber banners state the
+reading, the threshold, and the age ("78.9° — above 78.5° max · now"), not
+just "alert." Red is reserved for the safety class and always names what
+latched. Banners never cover the data they describe. Clearing an alert in the
+UI never clears the condition — acknowledgment and resolution are visibly
+different things.
