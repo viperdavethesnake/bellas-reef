@@ -310,6 +310,9 @@ class InterlockSupervisor:
 
     # ------------------------------------------------------------- inspection
 
+    def registration_of(self, actuator_id: str) -> ActuatorRegistration:
+        return self._guards[actuator_id].registration
+
     def is_latched(self, actuator_id: str) -> bool:
         return self._guards[actuator_id].latched
 

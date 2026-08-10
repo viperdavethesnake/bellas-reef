@@ -14,7 +14,12 @@ import pytest
 from bellasreef_hardware_io.app import HardwareIO
 from bellasreef_hardware_io.httpd import probe_once
 from bellasreef_hardware_io.logging import JsonFormatter, configure_logging
-from bellasreef_hardware_io.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
+from bellasreef_hardware_io.watchdog import (
+    LIVENESS_EXIT_CODE,
+    LivenessGuard,
+    SdNotifier,
+    watchdog_interval_s,
+)
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -106,6 +111,16 @@ class TestLivenessGuard:
     def test_rejects_non_positive_timeout(self) -> None:
         with pytest.raises(ValueError):
             LivenessGuard(timeout_s=0.0)
+
+    def test_exit_code_is_distinct_from_other_death_modes(self) -> None:
+        """Post-incident, you need to know WHICH mechanism killed the process.
+
+        0 is a clean stop, 137 is SIGKILL/OOM, 134 is systemd's watchdog
+        SIGABRT. A liveness kill must not be confusable with any of them.
+        """
+        assert LIVENESS_EXIT_CODE != 0
+        assert LIVENESS_EXIT_CODE not in (134, 137)
+        assert LIVENESS_EXIT_CODE == 70  # EX_SOFTWARE
 
 
 class TestSdNotifier:

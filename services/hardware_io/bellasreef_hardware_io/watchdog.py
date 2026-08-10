@@ -40,7 +40,19 @@ from typing import Self
 
 from bellasreef_hardware_io.logging import get_logger
 
-__all__ = ["LivenessGuard", "SdNotifier", "watchdog_interval_s"]
+__all__ = ["LIVENESS_EXIT_CODE", "LivenessGuard", "SdNotifier", "watchdog_interval_s"]
+
+#: Exit code used when the liveness guard kills us. Deliberately distinct so a
+#: post-incident `docker inspect` or journal entry says WHICH mechanism fired:
+#:
+#:   0    clean stop
+#:   70   liveness guard — the supervisor loop stalled  (EX_SOFTWARE)
+#:   134  systemd watchdog SIGABRT (128+6)
+#:   137  SIGKILL / OOM killer (128+9)
+#:
+#: Knowing a stall killed us rather than the OOM killer changes what you go
+#: and look at next.
+LIVENESS_EXIT_CODE = 70
 
 log = get_logger(__name__)
 
@@ -169,7 +181,7 @@ class LivenessGuard:
 
     @staticmethod
     def _hard_exit() -> None:  # pragma: no cover - process death
-        os._exit(70)  # EX_SOFTWARE
+        os._exit(LIVENESS_EXIT_CODE)
 
     def beat(self) -> None:
         """Called from the supervisor loop. Cheap and thread-safe."""

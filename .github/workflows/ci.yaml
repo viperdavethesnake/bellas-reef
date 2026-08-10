@@ -40,6 +40,7 @@ jobs:
     env:
       BELLASREEF_DATABASE_URL: postgresql+asyncpg://bellasreef:bellasreef@localhost:5432/bellasreef
       BELLASREEF_TEST_DATABASE_URL: postgresql+asyncpg://bellasreef:bellasreef@localhost:5432/bellasreef
+      BELLASREEF_TEST_NATS_URL: nats://localhost:4222
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +50,22 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+
+      # NOT a `services:` container: JetStream is opt-in via `--jetstream`,
+      # and Actions service containers give no way to pass CMD arguments. A
+      # NATS without JetStream would fail every stream test in a way that looks
+      # like our bug rather than a missing flag.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats-ci -p 4222:4222 -p 8222:8222 \
+            nats:2.10-alpine --jetstream --http_port=8222
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8222/healthz >/dev/null 2>&1; then
+              echo "nats ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "nats did not become ready"; docker logs nats-ci; exit 1
 
       - name: Sync workspace
         run: uv sync --frozen

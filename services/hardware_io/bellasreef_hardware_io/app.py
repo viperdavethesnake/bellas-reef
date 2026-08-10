@@ -16,14 +16,18 @@ import os
 import signal
 import subprocess
 import time
+from datetime import UTC, datetime
 from typing import Final
+from uuid import uuid4
 
+from bellasreef_contracts import ActuatorRegistration, Heartbeat
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
 from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
 from bellasreef_hardware_io.httpd import Health, MetricsServer
 from bellasreef_hardware_io.logging import configure_logging, get_logger
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
+from bellasreef_hardware_io.spine import CommandConsumer, Spine
 from bellasreef_hardware_io.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
 
 __all__ = ["HardwareIO", "clock_is_trusted", "main"]
@@ -138,6 +142,10 @@ class HardwareIO:
         self._stopping = asyncio.Event()
         self._frozen = False
         self._drill_actuator: object | None = None
+        self.spine: Spine | None = None
+        self.commands: CommandConsumer | None = None
+        self._registrations: list[ActuatorRegistration] = []
+        self._beat_seq = 0
         self._sensor_deadlines: dict[str, float] = {}
 
     # ------------------------------------------------------------- lifecycle
@@ -191,6 +199,7 @@ class HardwareIO:
             actuator,
         )
         self._drill_actuator = actuator
+        self._registrations.append(self.supervisor.registration_of("drill-dummy"))
         log.warning(
             "drill actuator registered, starting ENERGISED", extra={"actuator_id": "drill-dummy"}
         )
@@ -222,6 +231,8 @@ class HardwareIO:
             },
         )
 
+        await self._connect_spine()
+
         await self.httpd.start()
         self.liveness.start()
         self.notifier.ready()
@@ -236,6 +247,8 @@ class HardwareIO:
         self.notifier.stopping()
         self.liveness.stop()
         await self.httpd.stop()
+        if self.spine is not None:
+            await self.spine.close()
         try:
             await self.supervisor.stop()
         except ExceptionGroup:
@@ -244,6 +257,46 @@ class HardwareIO:
 
     def request_stop(self) -> None:
         self._stopping.set()
+
+    async def _connect_spine(self) -> None:
+        """Attach to the spine if one is configured.
+
+        Optional on purpose: the supervisor and its interlocks must work with
+        no broker at all, and the restart drill exercises exactly that path.
+        """
+        url = os.environ.get("BELLASREEF_NATS_URL")
+        if not url:
+            log.info("no BELLASREEF_NATS_URL; running without the spine")
+            return
+
+        self.spine = Spine(url)
+        await self.spine.connect()
+        await self.spine.provision()
+
+        for registration in self._registrations:
+            await self.spine.publish_registration(registration)
+        log.info("registrations published", extra={"count": len(self._registrations)})
+
+        self.commands = CommandConsumer(self.spine, self.supervisor)
+        await self.commands.subscribe()
+
+    async def _beat_and_serve(self) -> None:
+        """Publish a heartbeat and take one pass at the command queue."""
+        if self.spine is None:
+            return
+        self._beat_seq += 1
+        await self.spine.publish_heartbeat(
+            Heartbeat(
+                message_id=uuid4(),
+                emitted_at=datetime.now(UTC),
+                source=SERVICE,
+                component=SERVICE,
+                sequence=self._beat_seq,
+                interval_s=self._loop_interval_s,
+            )
+        )
+        if self.commands is not None:
+            await self.commands.drain_once(timeout=0.2)
 
     # ------------------------------------------------------------- main loop
 
@@ -274,6 +327,7 @@ class HardwareIO:
                 next_ping = now + ping_every
 
             self._refresh_clock_trust()
+            await self._beat_and_serve()
             await self._poll_due_sensors(now)
             self._refresh_latch_metrics()
 

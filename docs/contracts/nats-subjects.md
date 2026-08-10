@@ -57,34 +57,52 @@ polling.
 
 ## 3. JetStream layout
 
-Durations are `timedelta` and policy fields are string literals — this is the
-current `nats.jetstream` API, not the older `nats.js` one.
+**API correction (2026-08-09).** An earlier draft of this document showed a
+`nats.jetstream` API with `timedelta` durations and string-literal policies.
+That API belongs to a separate, future package — it does **not** exist in
+`nats-py` 2.15.0, which is what we install. Verified by introspecting the
+installed package, not by reading docs.
+
+The real API is `nats.js`: durations are **floats in seconds** and policies are
+**enums** (`RetentionPolicy`, `AckPolicy`, …). Everything below reflects that.
 
 ### `BR_CMD` — durable actuator commands
 
 ```python
+from nats.js.api import DiscardPolicy, RetentionPolicy, StorageType, StreamConfig
+
 StreamConfig(
     name="BR_CMD",
     subjects=["bellasreef.cmd.>"],
-    retention="workqueue",  # consumed once by hardware-io, then gone
-    storage="file",
-    discard="old",
-    max_age=timedelta(hours=1),  # backstop only; see §4
-    duplicate_window=timedelta(minutes=5),
+    retention=RetentionPolicy.WORK_QUEUE,  # consumed once by hardware-io, then gone
+    storage=StorageType.FILE,
+    discard=DiscardPolicy.OLD,
+    max_age=3600.0,  # seconds. Backstop only; see §4
+    duplicate_window=300.0,  # seconds
 )
 ```
 
 Consumer:
 
 ```python
+from nats.js.api import AckPolicy, ConsumerConfig
+
 ConsumerConfig(
-    name="hardware-io",
     durable_name="hardware-io",
-    ack_policy="explicit",
-    ack_wait=timedelta(seconds=5),
+    ack_policy=AckPolicy.EXPLICIT,
+    ack_wait=5.0,  # seconds
     max_deliver=3,
 )
 ```
+
+**Workqueue retention permits exactly one consumer per filter subject.**
+Attempting a second returns `filtered consumer not unique on workqueue
+stream`. That is fine for v1 — `hardware-io` is the only subscriber — but it
+is a real constraint on anything later that wants to *observe* commands
+(a shadow-mode recorder, a second spoke, an external integration). Such a
+consumer cannot simply attach to `BR_CMD`; it needs either a non-overlapping
+filter or a separate mirrored stream. Discovered against a live broker, not
+inferred.
 
 `max_deliver=3` is deliberate. Infinite redelivery of a command that keeps
 failing is how a poison message becomes an outage, and by the third attempt the
@@ -97,8 +115,8 @@ just useless but dangerous.
 StreamConfig(
     name="BR_STATE",
     subjects=["bellasreef.state.>"],
-    retention="limits",
-    storage="file",
+    retention=RetentionPolicy.LIMITS,
+    storage=StorageType.FILE,
     max_msgs_per_subject=1,  # exactly the current state, nothing older
 )
 ```
@@ -112,9 +130,9 @@ of every actuator without asking hardware-io and without replaying history.
 StreamConfig(
     name="BR_AUDIT",
     subjects=["bellasreef.audit.>"],
-    retention="workqueue",
-    storage="file",
-    max_age=timedelta(days=7),
+    retention=RetentionPolicy.WORK_QUEUE,
+    storage=StorageType.FILE,
+    max_age=604800.0,  # 7 days, in seconds
 )
 ```
 

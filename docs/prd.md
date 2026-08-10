@@ -1,9 +1,13 @@
 # Bella's Reef — Product Requirements Document
 
-**Version:** 1.0 draft
+**Version:** 1.1
 **Owner:** David / Bella's Reef LLC
 **Date:** 2026-08-09
-**Status:** Draft for review
+**Status:** Active
+
+**Changelog:**
+- **1.1 (2026-08-09):** Q3 resolved — AGPL-3.0 backend with dual commercial licensing, Apache-2.0 contracts/OpenAPI, closed-source paid iOS app in private repo, CLA-or-no-contributions policy. Q4 partially resolved earlier — Day-1 driver slice (R10a: PCA9685 + DS18B20).
+- **1.0 (2026-08-09):** Initial draft.
 
 ---
 
@@ -151,7 +155,7 @@ Phase 1: single Pi 5-class hub. Five services + message spine, all containerized
 
 **Sensors/drivers (v1 hardware-io)**
 - R10a. **Day-1 driver slice:** PCA9685 PWM over I2C (LED dimming; open-drain mode, parallel Mean Well XLG-AB-class drivers) and DS18B20 1-wire temperature. These two prove the full vertical: driver contract → hardware-io → NATS subjects → control-engine → telemetry → API → clients. Both implemented against the driver interface contract (§7.3.3).
-- R10b. **Remaining v1 drivers:** GPIO out (relays), GPIO digital in (float/optical), ADS1115 ADC path (pH/analog), Atlas Scientific EZO (I2C). Same contract; landed after the Day-1 vertical is proven. Calibration records for all drivers stored in Postgres.
+- R10b. **Remaining v1 drivers:** GPIO out (relays), GPIO digital in (float/optical), ADS1115 ADC path (pH/analog), Atlas Scientific EZO (I2C). Same contract; landed after the Day-1 vertical is proven. Calibration records for all drivers stored in Postgres. Heater and ATO circuits wire on normally-open relay contacts so coil de-energize = load off — power loss itself is the ultimate safe state.
 
 **Platform**
 - R11. Telemetry: all sensor readings and actuator states into VictoriaMetrics with per-metric retention policy.
@@ -198,7 +202,7 @@ No hard external deadline. Sequencing is dependency-driven:
 2. **Spine + safety + Day-1 vertical:** hardware-io with safety framework (R1–R4) and the Day-1 driver slice (R10a: PCA9685 dimming + DS18B20 temp). Fail-safe drills passing before any control logic ships. Lighting schedules (R7) and temperature monitoring land first because they exercise the entire stack end-to-end with the lowest-risk actuator class — a dimmed light failing safe is a non-event; a heater is not.
 3. **Control modules:** temperature *control* (R5, heater actuation) waits for GPIO relay drivers (R10b) and passed drills; then R6, R8, R9 individually, each entering service via shadow mode on the reference tank.
 4. **Clients:** API completeness (R15), web UI (R17), iOS app (R16) — iOS starts as soon as the OpenAPI spec stabilizes for the dashboard surface.
-5. **Hardening + publication:** backup/restore, docs, stranger-install test, LLC publication under chosen license.
+5. **Hardening + publication:** backup/restore, docs, stranger-install test, LLC publication under the licensing structure in Q3 (resolved).
 
 Gate between 2→3 is explicit: no control loop actuates a real tank until safety drills pass.
 
@@ -206,9 +210,9 @@ Gate between 2→3 is explicit: no control loop actuates a real tank until safet
 
 | # | Question | Blocks | Owner |
 |---|---|---|---|
-| Q1 | **Cloud relay for push:** APNs requires a hosted relay — does Bella's Reef LLC run minimal notification infrastructure, or does v1 ship webhook/email only and defer push? | P1 push work; iOS alert UX design | David (business + architecture) |
+| Q1 | **Cloud relay for push:** APNs requires a hosted relay — does Bella's Reef LLC run minimal notification infrastructure, or does v1 ship webhook/email only and defer push? Weight increased by Q3 resolution: a paid App Store app makes push table stakes. | P1 push work; iOS alert UX design | David (business + architecture) |
 | Q2 | **Remote access story:** Tailscale-first documented pattern vs. anything built-in. Leaning documented-pattern; confirm. | Docs, iOS connectivity UX | David |
-| Q3 | **License + monetization:** Apache-2.0 / AGPL / dual-license? Is the iOS app free, paid, or the commercial component? Shapes repo structure now. | Publication; repo layout | David (LLC) |
+| Q3 | **RESOLVED (2026-08-09):** Backend AGPL-3.0 with dual commercial licensing offered by Bella's Reef LLC (bundlers/OEMs buy out of the AGPL disclosure obligations). Contracts package + OpenAPI spec: Apache-2.0, same public repo, so third-party clients stay unencumbered. iOS app: closed-source, paid App Store product, separate private repo (`clients/ios/` in the public tree becomes a README pointer). Contribution policy: CLA required or contributions not accepted — LLC must retain relicensing rights for the commercial side; policy set before the repo goes public. Commercial license text to be reviewed by an IP attorney before first sale. | — | Closed |
 | Q4 | **Reference tank inventory — partially resolved:** Day-1 slice decided (PCA9685 dimming + DS18B20 temp, R10a). Remaining: relay channel count, float/optical sensor count, and pH probe strategy (ties to Q6) for R10b ordering. | R10b build order | David |
 | Q5 | **Phase 2 spoke firmware:** custom minimal firmware speaking the subject contract vs. adopting ESPHome and bridging. No v1 work either way; decision influences how strictly the subject schema mirrors ESPHome concepts. | Nothing in v1 (non-blocking) | David |
 | Q6 | **pH/probe strategy:** ADS1115 + analog boards vs. standardizing on Atlas EZO across the board (cost vs. calibration workflow quality). | R10 details (non-blocking, both supported by driver contract) | David |
@@ -216,4 +220,3 @@ Gate between 2→3 is explicit: no control loop actuates a real tank until safet
 ---
 
 *Next artifacts on request: engineering ticket breakdown from R1–R17, NATS subject schema draft, or Postgres schema v1 draft.*
-

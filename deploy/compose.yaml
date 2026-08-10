@@ -93,8 +93,14 @@ services:
       # silent default is the point — see docs/host-setup.md.
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
-    ports:
-      - "127.0.0.1:9101:9101"   # health + metrics, loopback only
+    # Deliberately NOT published. health + metrics ride the compose network
+    # only: victoria-metrics scrapes http://hardware-io:9101/metrics from
+    # inside. The one container holding /dev should not also own a listening
+    # socket on the host. For ad-hoc debugging use
+    #   docker compose exec hardware-io python -c "..."
+    # rather than making the port permanent.
+    expose:
+      - "9101"
     # NOTE: Docker does NOT restart a merely *unhealthy* container — this acts
     # on process exit. That is why the service carries its own LivenessGuard,
     # which terminates the process when the supervisor loop stalls. The

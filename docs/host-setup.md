@@ -224,6 +224,30 @@ So the service carries both:
 The guard runs on a **thread**, not an asyncio task, because a frozen event loop
 cannot run the task that would have rescued it.
 
+### Telling the death modes apart
+
+The liveness guard exits **70** (`EX_SOFTWARE`) deliberately, so a post-incident
+`docker inspect` or journal entry says which mechanism fired:
+
+| Exit | Meaning |
+|---|---|
+| `0` | clean stop |
+| `70` | **liveness guard — the supervisor loop stalled** |
+| `134` | systemd watchdog SIGABRT (128+6) |
+| `137` | SIGKILL / OOM killer (128+9) |
+
+`docker inspect --format '{{.State.ExitCode}}' bellasreef-hardware-io-1`
+
+A stall and an OOM kill send you to completely different places, and at 3 a.m.
+the exit code is the fastest way to know which.
+
+### Metrics are not published to the host
+
+`hardware-io` uses `expose:` rather than `ports:`. Health and metrics ride the
+compose network only — victoria-metrics scrapes `http://hardware-io:9101/metrics`
+from inside it. The one container holding `/dev` should not also own a listening
+socket on the host.
+
 ### Running the drill
 
 ```bash
