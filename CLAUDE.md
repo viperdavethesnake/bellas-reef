@@ -64,6 +64,8 @@ Five services + spine, all containers. Hub-and-spoke ready; phase 1 is single Pi
 - Python 3.13+, fully typed, `mypy --strict` clean. Ruff for lint/format.
 - Pydantic v2 models for every message payload and API schema. One source of truth per model.
 - Tests: pytest; contract tests for NATS payloads and OpenAPI; hardware drivers get a fake implementation of the driver interface for engine tests.
+- **Integration tests must delete every durable they create.** A test that leaves the system broken is as bad as one that silently skips. A JetStream workqueue stream permits exactly one consumer per filter subject, so a leaked durable does not merely litter — it stops the real service from ever binding again. This has cost three separate debugging detours; both known leaks (`ramp-<uuid>` on BR_CMD, a test-scoped audit durable on BR_AUDIT) now clean up on teardown.
+- A test skipped for a missing environment **fails** the gate (`conftest.py`). Skips are decisions, declared with `BELLASREEF_ALLOW_ENV_SKIPS=1`, never incidental.
 - Commits: conventional commits. PRs must pass CI (lint, types, tests, multi-arch build) — no direct pushes to main once CI exists.
 - Every service: healthcheck endpoint, structured JSON logs, metrics endpoint. Day 1, not later.
 

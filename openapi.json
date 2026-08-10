@@ -628,6 +628,178 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HistoryBucket": {
+        "additionalProperties": false,
+        "description": "One downsampled interval.\n\n``average`` is the line; ``minimum``/``maximum`` are the envelope. Clients\nmust draw the band \u2014 a bucket whose spike is only in ``maximum`` is exactly\nthe sample an alert episode was raised on.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "average": {
+            "title": "Average",
+            "type": "number"
+          },
+          "maximum": {
+            "title": "Maximum",
+            "type": "number"
+          },
+          "minimum": {
+            "title": "Minimum",
+            "type": "number"
+          }
+        },
+        "required": [
+          "at",
+          "minimum",
+          "average",
+          "maximum"
+        ],
+        "title": "HistoryBucket",
+        "type": "object"
+      },
+      "HistoryEpisode": {
+        "additionalProperties": false,
+        "description": "An alert episode, for banding under the curve.",
+        "properties": {
+          "bound": {
+            "enum": [
+              "min",
+              "max"
+            ],
+            "title": "Bound",
+            "type": "string"
+          },
+          "cleared_at": {
+            "format": "date-time",
+            "title": "Cleared At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleared_value": {
+            "title": "Cleared Value",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "raised_at": {
+            "format": "date-time",
+            "title": "Raised At",
+            "type": "string"
+          },
+          "raised_value": {
+            "title": "Raised Value",
+            "type": "number"
+          },
+          "sensor_type": {
+            "title": "Sensor Type",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "number"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "sensor_type",
+          "bound",
+          "threshold",
+          "unit",
+          "raised_at",
+          "raised_value",
+          "cleared_at",
+          "cleared_value"
+        ],
+        "title": "HistoryEpisode",
+        "type": "object"
+      },
+      "HistorySeries": {
+        "additionalProperties": false,
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/HistoryBucket"
+            },
+            "title": "Buckets",
+            "type": "array"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "metric": {
+            "title": "Metric",
+            "type": "string"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "metric",
+          "unit",
+          "buckets"
+        ],
+        "title": "HistorySeries",
+        "type": "object"
+      },
+      "HistoryView": {
+        "additionalProperties": false,
+        "properties": {
+          "bucket_s": {
+            "title": "Bucket S",
+            "type": "integer"
+          },
+          "end": {
+            "format": "date-time",
+            "title": "End",
+            "type": "string"
+          },
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/HistoryEpisode"
+            },
+            "title": "Episodes",
+            "type": "array"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/HistorySeries"
+            },
+            "title": "Series",
+            "type": "array"
+          },
+          "start": {
+            "format": "date-time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "bucket_s",
+          "series",
+          "episodes"
+        ],
+        "title": "HistoryView",
+        "type": "object"
+      },
       "Info": {
         "additionalProperties": false,
         "properties": {
@@ -1760,6 +1932,81 @@
         "summary": "Put Thresholds",
         "tags": [
           "alerts"
+        ]
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "description": "Downsampled history for every registered device, plus alert episodes.\n\nDownsampled *server-side* on purpose: a day of 5-second samples is 17k\npoints per probe, and a phone drawing a 44pt chart cannot use them. What\nit can lose by downsampling is the spike that caused an alert, so every\nbucket carries its min/avg/max envelope rather than a single average.",
+        "operationId": "history",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "title": "Start",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "buckets",
+            "required": false,
+            "schema": {
+              "default": 240,
+              "title": "Buckets",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "description": "Unusable window."
+          },
+          "503": {
+            "description": "No telemetry store configured."
+          }
+        },
+        "summary": "History",
+        "tags": [
+          "history"
         ]
       }
     },

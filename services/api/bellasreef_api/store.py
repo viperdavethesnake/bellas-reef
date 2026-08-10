@@ -209,6 +209,35 @@ class Store:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
 
+    async def alert_episodes_between(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        """Episodes overlapping a window, for the chart's alert bands.
+
+        Overlap, not containment: an episode that started before the window and
+        is still open is exactly the one an operator most needs to see banded.
+        An open episode (``cleared_at IS NULL``) is included and left open —
+        the client clamps the band to the window edge rather than the API
+        inventing a clear time.
+        """
+        async with self._engine.connect() as conn:
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT device_id, sensor_type, bound, threshold, unit, "
+                            "raised_at, raised_value, cleared_at, cleared_value "
+                            "FROM sensor_alerts "
+                            "WHERE raised_at <= :end "
+                            "AND (cleared_at IS NULL OR cleared_at >= :start) "
+                            "ORDER BY raised_at"
+                        ),
+                        {"start": start, "end": end},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
     async def recent_audit(
         self, limit: int = 50, category: str | None = None
     ) -> list[dict[str, Any]]:

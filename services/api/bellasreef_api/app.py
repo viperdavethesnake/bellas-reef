@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
+from bellasreef_api.history import DEFAULT_BUCKETS, MAX_BUCKETS, HistoryReader
 from bellasreef_api.registry import RegistryConsumer
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
@@ -100,6 +101,64 @@ class Info(BaseModel):
     #: "an already-paired device will need to approve this one" at a person who
     #: has no such device, and they wait for something that can never arrive.
     approvers_available: bool
+
+
+class HistoryBucket(BaseModel):
+    """One downsampled interval.
+
+    ``average`` is the line; ``minimum``/``maximum`` are the envelope. Clients
+    must draw the band — a bucket whose spike is only in ``maximum`` is exactly
+    the sample an alert episode was raised on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: datetime
+    minimum: float
+    average: float
+    maximum: float
+
+
+class HistorySeries(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    metric: str
+    unit: str
+    #: Buckets with data. Absent buckets are gaps and must be rendered as
+    #: breaks: `bellasreef_actuator_level` comes from a last-value-retained
+    #: stream, so duty genuinely has holes, and a line drawn across one asserts
+    #: a continuity nothing measured.
+    buckets: list[HistoryBucket]
+
+
+class HistoryEpisode(BaseModel):
+    """An alert episode, for banding under the curve."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    sensor_type: str
+    bound: Literal["min", "max"]
+    threshold: float
+    unit: str
+    raised_at: datetime
+    raised_value: float
+    #: ``None`` while the episode is still open. Left open deliberately; the
+    #: client clamps the band to the window edge rather than the hub inventing
+    #: a clear time that never happened.
+    cleared_at: datetime | None
+    cleared_value: float | None
+
+
+class HistoryView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: datetime
+    end: datetime
+    bucket_s: int
+    series: list[HistorySeries]
+    episodes: list[HistoryEpisode]
 
 
 class AuditEvent(BaseModel):
@@ -386,6 +445,7 @@ def build_app(
     store = Store(engine)
     overrides = OverrideStore(engine, clock_trusted=clock_trusted)
     alerts = PostgresAlertStore(engine)
+    reader = HistoryReader(vm_url) if vm_url else None
     bridge = StreamBridge(nats_url, overrides) if nats_url else None
     sink: AuditSink = audit or _noop_audit
     pending = _PendingTokens(tokens={})
@@ -825,6 +885,94 @@ def build_app(
             )
             for row in await store.recent_audit(limit=limit, category=category)
         ]
+
+    @app.get(
+        "/api/v1/history",
+        response_model=HistoryView,
+        tags=["history"],
+        operation_id="history",
+        responses={
+            401: AUTH_401,
+            422: {"description": "Unusable window."},
+            503: {"description": "No telemetry store configured."},
+        },
+    )
+    async def history(
+        _: Annotated[UUID, Depends(current_client)],
+        start: datetime,
+        end: datetime,
+        buckets: int = DEFAULT_BUCKETS,
+    ) -> HistoryView:
+        """Downsampled history for every registered device, plus alert episodes.
+
+        Downsampled *server-side* on purpose: a day of 5-second samples is 17k
+        points per probe, and a phone drawing a 44pt chart cannot use them. What
+        it can lose by downsampling is the spike that caused an alert, so every
+        bucket carries its min/avg/max envelope rather than a single average.
+        """
+        if reader is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "no telemetry store configured"
+            )
+        if end <= start:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "end must be after start")
+
+        wanted = max(1, min(buckets, MAX_BUCKETS))
+        bucket_s = HistoryReader.bucket_seconds(start, end, wanted)
+
+        series: list[HistorySeries] = []
+        for device in await store.list_devices():
+            if device["kind"] == "sensor":
+                metric, unit = "bellasreef_sensor_reading", "degC"
+            else:
+                # Duty is dimensionless 0–1; the client renders it as a
+                # percentage. Saying "ratio" beats an empty string, which reads
+                # as a missing field rather than a deliberate one.
+                metric, unit = "bellasreef_actuator_level", "ratio"
+            found = await reader.series(
+                metric=metric,
+                device_id=device["device_id"],
+                unit=unit,
+                start=start,
+                end=end,
+                buckets=wanted,
+            )
+            if found.buckets:
+                series.append(
+                    HistorySeries(
+                        device_id=found.device_id,
+                        metric=found.metric,
+                        unit=found.unit,
+                        buckets=[
+                            HistoryBucket(
+                                at=b.at,
+                                minimum=b.minimum,
+                                average=b.average,
+                                maximum=b.maximum,
+                            )
+                            for b in found.buckets
+                        ],
+                    )
+                )
+
+        episodes = [
+            HistoryEpisode(
+                device_id=row["device_id"],
+                sensor_type=row["sensor_type"],
+                bound="min" if row["bound"] == "min" else "max",
+                threshold=row["threshold"],
+                unit=row["unit"],
+                raised_at=row["raised_at"],
+                raised_value=row["raised_value"],
+                cleared_at=row["cleared_at"],
+                cleared_value=row["cleared_value"],
+            )
+            for row in await store.alert_episodes_between(start, end)
+        ]
+
+        return HistoryView(
+            start=start, end=end, bucket_s=bucket_s, series=series, episodes=episodes
+        )
 
     # ------------------------------------------------------------- alerts
 
