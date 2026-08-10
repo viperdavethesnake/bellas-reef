@@ -5,6 +5,13 @@
 `BR_AUDIT` is a delivery buffer; Postgres `audit_log` is the system of record.
 This consumer moves events from one to the other.
 
+Lives in the API service, alongside the telemetry writer. It used to live in
+hardware-io, which contradicted device-classes.md §3 — that process is
+Postgres-free by design — and, more to the point, it was constructed only by
+tests: no entrypoint ever started it, so every audit event published to
+`BR_AUDIT` expired in the stream without reaching `audit_log`. The same shape as
+the sensor publish that recorded a healthy gauge while the wire was dead.
+
 `audit_log` is append-only by trigger — UPDATE and DELETE raise — so this can
 only ever insert. That is deliberate: post-incident analysis is worthless if
 the log can be edited after the incident.
@@ -12,6 +19,8 @@ the log can be edited after the incident.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -20,11 +29,17 @@ from typing import Any
 import nats
 from bellasreef_contracts import subjects
 from bellasreef_service.logging import get_logger
+from nats.aio.client import Client
 from nats.js.api import AckPolicy, ConsumerConfig
+from nats.js.errors import NotFoundError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from bellasreef_hardware_io.spine import AUDIT_STREAM, Spine
+#: hardware-io provisions this stream. Named rather than imported: the API must
+#: not depend on the hardware service, and a shared constant across a process
+#: boundary is exactly the coupling that put this consumer in the wrong service
+#: to begin with.
+AUDIT_STREAM = "BR_AUDIT"
 
 __all__ = ["AuditWriter"]
 
@@ -51,24 +66,75 @@ _VALID_CATEGORIES = frozenset({"command", "config", "auth", "state", "safety", "
 class AuditWriter:
     """Durable consumer: `bellasreef.audit.>` → `audit_log`."""
 
+    RETRY_S = 5.0
+
     def __init__(
         self,
-        spine: Spine,
+        nats_url: str,
         engine: AsyncEngine,
         *,
         durable: str = "audit-writer",
         ack_wait_s: float = 30.0,
         max_deliver: int = 5,
+        poll_interval_s: float = 1.0,
     ) -> None:
-        self._spine = spine
+        self._nats_url = nats_url
         self._engine = engine
         self._durable = durable
         self._ack_wait_s = ack_wait_s
         self._max_deliver = max_deliver
+        self._poll_interval_s = poll_interval_s
+        self._nc: Client | None = None
+        self._js: Any = None
         self._sub: Any = None
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def is_running(self) -> bool:
+        """True once the drain loop is live.
+
+        Exposed so a test can assert the service *runs* this, not merely that it
+        can be constructed — which was true the whole time it was doing nothing.
+        """
+        return self._task is not None and not self._task.done()
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._run_forever())
+
+    async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._nc is not None:
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
+
+    async def _run_forever(self) -> None:
+        while True:
+            try:
+                if self._sub is None:
+                    await self.subscribe()
+                await self.drain_once()
+                await asyncio.sleep(self._poll_interval_s)
+            except asyncio.CancelledError:
+                raise
+            except NotFoundError:
+                log.info("audit stream not provisioned yet; waiting")
+                self._sub = None
+                await asyncio.sleep(self.RETRY_S)
+            except Exception:
+                log.exception("audit writer stalled; retrying")
+                self._sub = None
+                await asyncio.sleep(self.RETRY_S)
 
     async def subscribe(self) -> None:
-        self._sub = await self._spine.js.pull_subscribe(
+        if self._nc is None or not self._nc.is_connected:
+            self._nc = await nats.connect(self._nats_url)
+            self._js = self._nc.jetstream()
+        self._sub = await self._js.pull_subscribe(
             subjects.ALL_AUDIT,
             durable=self._durable,
             stream=AUDIT_STREAM,

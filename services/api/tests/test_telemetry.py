@@ -45,15 +45,25 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 class FakeStore:
     """Answers the one question the writer asks Postgres."""
 
-    def __init__(self, answer: tuple[bool, str | None]) -> None:
+    def __init__(self, answer: tuple[bool, str | None], transport: str | None = "local") -> None:
         self.answer = answer
+        self.transport = transport
 
     async def control_authority_of(self, device_id: str) -> tuple[bool, str | None]:
         return self.answer
 
+    async def device_labels(self, device_id: str) -> tuple[bool, str | None, str | None]:
+        known, authority = self.answer
+        return (known, authority, self.transport if known else None)
 
-def writer(authority: tuple[bool, str | None] = (True, "authoritative")) -> TelemetryWriter:
-    return TelemetryWriter("nats://unused", "http://unused", cast(Store, FakeStore(authority)))
+
+def writer(
+    authority: tuple[bool, str | None] = (True, "authoritative"),
+    transport: str | None = "local",
+) -> TelemetryWriter:
+    return TelemetryWriter(
+        "nats://unused", "http://unused", cast(Store, FakeStore(authority, transport))
+    )
 
 
 def reading(**over: Any) -> bytes:
@@ -161,6 +171,22 @@ class TestAuthorityLabel:
         (line,) = parse(run(lambda: writer((True, "advisory"))._alert_lines(alert())))
         assert line["metric"]["control_authority"] == "advisory"
         assert line["values"] == [1.0]
+
+    def test_an_alert_carries_the_transport_of_its_device(self) -> None:
+        """The axis that actually separates these episodes today.
+
+        Every alert is sensor-sourced, so control_authority is truthfully
+        not_applicable; transport is what distinguishes a probe measured on the
+        board from a value relayed over a network. Both labels are on the series
+        from the first sample so a future actuator-sourced alert class has a
+        place to land without forking it.
+        """
+        (line,) = parse(run(lambda: writer((True, None), "local")._alert_lines(alert())))
+        assert line["metric"]["transport"] == "local"
+        assert line["metric"]["control_authority"] == "not_applicable"
+
+        (relayed,) = parse(run(lambda: writer((True, None), "network")._alert_lines(alert())))
+        assert relayed["metric"]["transport"] == "network"
 
     def test_a_cleared_alert_is_zero(self) -> None:
         (line,) = parse(

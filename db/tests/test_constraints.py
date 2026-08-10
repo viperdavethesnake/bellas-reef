@@ -59,7 +59,7 @@ def _sensor(**over: object) -> dict[str, object]:
         "role": None,
         "control_authority": None,
         "failsafe_capable": None,
-        "transport": None,
+        "transport": "local",
         "safe_state": None,
         "max_runtime_s": None,
         "heartbeat_timeout_s": None,
@@ -99,15 +99,15 @@ class TestSensorCadence:
         Before the fix this INSERT succeeded, because the CHECK evaluated to
         NULL and Postgres only rejects a CHECK that is FALSE.
         """
-        with pytest.raises(IntegrityError, match="sensor_declares_type_and_cadence"):
+        with pytest.raises(IntegrityError, match="sensor_declares_type_cadence_and_transport"):
             run(lambda: _insert(_device_sql(), **_sensor(poll_interval_s=None)))
 
     def test_zero_cadence_sensor_is_rejected(self) -> None:
-        with pytest.raises(IntegrityError, match="sensor_declares_type_and_cadence"):
+        with pytest.raises(IntegrityError, match="sensor_declares_type_cadence_and_transport"):
             run(lambda: _insert(_device_sql(), **_sensor(poll_interval_s=0.0)))
 
     def test_null_sensor_type_is_rejected(self) -> None:
-        with pytest.raises(IntegrityError, match="sensor_declares_type_and_cadence"):
+        with pytest.raises(IntegrityError, match="sensor_declares_type_cadence_and_transport"):
             run(lambda: _insert(_device_sql(), **_sensor(sensor_type=None)))
 
 
@@ -449,9 +449,16 @@ class TestControlAuthority:
             )
         )
 
-    def test_a_sensor_carries_no_authority(self) -> None:
+    def test_a_sensor_carries_no_control_authority(self) -> None:
         # `observe_only` rather than `authoritative`: an authoritative sensor
         # trips the failure-behaviour constraint first, which is also a
         # rejection but not the one under test here.
-        with pytest.raises(IntegrityError, match="sensors_carry_no_authority"):
+        with pytest.raises(IntegrityError, match="sensors_carry_no_control_authority"):
             run(lambda: _insert(_device_sql(), **_sensor(control_authority="observe_only")))
+
+    def test_a_sensor_must_declare_a_transport(self) -> None:
+        """Provenance, not authority. An alert episode is labelled with it, so a
+        sensor without one would produce a series that cannot say whether the
+        reading behind it was measured locally or relayed."""
+        with pytest.raises(IntegrityError, match="sensor_declares_type_cadence_and_transport"):
+            run(lambda: _insert(_device_sql(), **_sensor(transport=None)))

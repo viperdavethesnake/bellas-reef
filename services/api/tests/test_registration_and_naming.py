@@ -65,12 +65,14 @@ class TestRegistrationUpsert:
                 driver_id="ds18b20",
                 sensor_type="temp",
                 poll_interval_s=5.0,
+                transport="local",
             )
             second = await store.upsert_sensor(
                 device_id="ds18b20-28-000000bfe244",
                 driver_id="ds18b20",
                 sensor_type="temp",
                 poll_interval_s=7.0,
+                transport="local",
             )
             rows = await store.list_devices()
             await engine.dispose()
@@ -94,13 +96,21 @@ class TestRegistrationUpsert:
             engine = await fresh_engine()
             store = Store(engine)
             await store.upsert_sensor(
-                device_id="probe", driver_id="ds18b20", sensor_type="temp", poll_interval_s=5.0
+                device_id="probe",
+                driver_id="ds18b20",
+                sensor_type="temp",
+                poll_interval_s=5.0,
+                transport="local",
             )
             await store.set_display_name("probe", "Display tank")
             await store.set_thresholds("probe", minimum=24.0, maximum=27.0, clear_margin=0.5)
 
             await store.upsert_sensor(
-                device_id="probe", driver_id="ds18b20", sensor_type="temp", poll_interval_s=5.0
+                device_id="probe",
+                driver_id="ds18b20",
+                sensor_type="temp",
+                poll_interval_s=5.0,
+                transport="local",
             )
             rows = await store.list_devices()
             await engine.dispose()
@@ -117,7 +127,11 @@ class TestNaming:
             engine = await fresh_engine()
             store = Store(engine)
             await store.upsert_sensor(
-                device_id="probe", driver_id="ds18b20", sensor_type="temp", poll_interval_s=5.0
+                device_id="probe",
+                driver_id="ds18b20",
+                sensor_type="temp",
+                poll_interval_s=5.0,
+                transport="local",
             )
             audit = Audit()
             app = build_app(engine, audit=audit)
@@ -152,7 +166,11 @@ class TestNaming:
             engine = await fresh_engine()
             store = Store(engine)
             await store.upsert_sensor(
-                device_id="probe", driver_id="ds18b20", sensor_type="temp", poll_interval_s=5.0
+                device_id="probe",
+                driver_id="ds18b20",
+                sensor_type="temp",
+                poll_interval_s=5.0,
+                transport="local",
             )
             app = build_app(engine, audit=Audit())
             headers = await paired(app)

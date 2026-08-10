@@ -209,6 +209,41 @@ class Store:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
 
+    async def recent_audit(
+        self, limit: int = 50, category: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent audit events, newest first."""
+        sql = (
+            "SELECT message_id, occurred_at, category, actor, subject, device_id, event "
+            "FROM audit_log"
+        )
+        params: dict[str, object] = {"limit": limit}
+        if category is not None:
+            sql += " WHERE category = :category"
+            params["category"] = category
+        sql += " ORDER BY occurred_at DESC, id DESC LIMIT :limit"
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(text(sql), params)).mappings().all()
+        return [dict(r) for r in rows]
+
+    async def device_labels(self, device_id: str) -> tuple[bool, str | None, str | None]:
+        """``(known, control_authority, transport)`` for telemetry labelling.
+
+        One round trip, because both labels are needed on the same series and a
+        second query could observe a different row.
+        """
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT control_authority, transport FROM devices "
+                        "WHERE device_id = :device_id"
+                    ),
+                    {"device_id": device_id},
+                )
+            ).first()
+        return (False, None, None) if row is None else (True, row[0], row[1])
+
     async def control_authority_of(self, device_id: str) -> tuple[bool, str | None]:
         """``(the hub knows this device, its declared authority)``.
 
@@ -236,6 +271,7 @@ class Store:
         driver_id: str,
         sensor_type: str,
         poll_interval_s: float,
+        transport: str,
     ) -> bool:
         """Record a registered sensor. Returns True when the row was new.
 
@@ -250,12 +286,14 @@ class Store:
                     await conn.execute(
                         text(
                             "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                            "poll_interval_s) VALUES (gen_random_uuid(), :device_id, 'sensor', "
-                            ":driver_id, :sensor_type, :poll_interval_s) "
+                            "poll_interval_s, transport) VALUES (gen_random_uuid(), "
+                            ":device_id, 'sensor', :driver_id, :sensor_type, "
+                            ":poll_interval_s, :transport) "
                             "ON CONFLICT (device_id) DO UPDATE SET "
                             "driver_id = EXCLUDED.driver_id, "
                             "sensor_type = EXCLUDED.sensor_type, "
                             "poll_interval_s = EXCLUDED.poll_interval_s, "
+                            "transport = EXCLUDED.transport, "
                             "updated_at = now() "
                             "RETURNING (xmax = 0) AS inserted"
                         ),
@@ -264,6 +302,7 @@ class Store:
                             "driver_id": driver_id,
                             "sensor_type": sensor_type,
                             "poll_interval_s": poll_interval_s,
+                            "transport": transport,
                         },
                     )
                 )

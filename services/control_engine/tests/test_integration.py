@@ -12,6 +12,7 @@ the consumer rather than executed late.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
 from collections.abc import Callable, Coroutine
@@ -199,9 +200,13 @@ def test_a_full_ramp_publishes_monotonically_rising_duties() -> None:
 
     async def scenario() -> list[float]:
         spine = await clean_spine()
-        sub = await spine.js.pull_subscribe(
-            subjects.ALL_COMMANDS, durable=f"ramp-{uuid.uuid4().hex[:8]}"
-        )
+        # Deleted in the `finally` below. BR_CMD is a *workqueue* stream, which
+        # permits exactly one consumer per filter subject — a durable left
+        # behind here does not just litter, it stops hardware-io from ever
+        # binding its command consumer again. That failure has cost three
+        # debugging detours; the leak was always this line.
+        durable = f"ramp-{uuid.uuid4().hex[:8]}"
+        sub = await spine.js.pull_subscribe(subjects.ALL_COMMANDS, durable=durable)
         publisher = CommandPublisher(url())
         await publisher.connect()
         scheduler = LightingScheduler([dawn_profile()], deadband=0.01, refresh_s=3600)
@@ -226,6 +231,10 @@ def test_a_full_ramp_publishes_monotonically_rising_duties() -> None:
             await msg.ack()
 
         await publisher.close()
+        # Give the durable back. A workqueue stream allows one consumer per
+        # filter; leaving this one behind blocks hardware-io's command consumer.
+        with contextlib.suppress(Exception):
+            await spine.js.delete_consumer("BR_CMD", durable)
         await spine.close()
         return duties
 

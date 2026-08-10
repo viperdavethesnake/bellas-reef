@@ -13,15 +13,19 @@ both are things that only misbehave when contended.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
+import nats
 import pytest
-from bellasreef_hardware_io.audit import AuditWriter
-from bellasreef_hardware_io.spine import Spine
+from bellasreef_api.audit_writer import AUDIT_STREAM, AuditWriter
+from bellasreef_contracts import subjects
+from nats.js.api import RetentionPolicy, StorageType, StreamConfig
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -43,13 +47,52 @@ def engine() -> AsyncEngine:
     return create_async_engine(os.environ[_PG], future=True)
 
 
-async def fresh() -> tuple[Spine, AsyncEngine]:
-    spine = Spine(os.environ[_NATS])
-    await spine.connect()
-    await spine.provision()
-    await spine.js.purge_stream("BR_AUDIT")
-    for consumer in await spine.js.consumers_info("BR_AUDIT"):
-        await spine.js.delete_consumer("BR_AUDIT", consumer.name)
+class Publisher:
+    """Provisions BR_AUDIT and publishes onto it.
+
+    Deliberately not hardware-io's `Spine`. The audit writer moved into the API
+    service precisely to break that dependency, and a test that reaches back
+    across it would quietly restore the coupling the move exists to remove.
+    """
+
+    def __init__(self, nc: Any, js: Any) -> None:
+        self.nc, self.js = nc, js
+
+    async def publish_audit(self, category: str, event: dict[str, Any]) -> None:
+        message_id = event.get("message_id") or str(uuid4())
+        payload = {**event, "message_id": str(message_id)}
+        await self.js.publish(
+            subjects.audit(category),
+            json.dumps(payload).encode(),
+            headers={"Nats-Msg-Id": str(message_id)},
+        )
+
+    async def close(self) -> None:
+        await self.nc.close()
+
+
+async def fresh() -> tuple[Publisher, AsyncEngine]:
+    nc = await nats.connect(os.environ[_NATS])
+    js = nc.jetstream()
+    # Must match what hardware-io provisions, exactly. JetStream refuses to
+    # change a stream's retention policy, so a test that "helpfully" declares a
+    # slightly different config fails against any hub that has ever run the real
+    # service — which is every hub that matters.
+    config = StreamConfig(
+        name=AUDIT_STREAM,
+        subjects=[subjects.ALL_AUDIT],
+        retention=RetentionPolicy.WORK_QUEUE,
+        storage=StorageType.FILE,
+        max_age=604800.0,
+    )
+    try:
+        await js.add_stream(config)
+    except Exception:
+        await js.update_stream(config)
+    await js.purge_stream(AUDIT_STREAM)
+    for consumer in await js.consumers_info(AUDIT_STREAM):
+        await js.delete_consumer(AUDIT_STREAM, consumer.name)
+    spine = Publisher(nc, js)
 
     eng = engine()
     async with eng.begin() as conn:
@@ -81,7 +124,7 @@ def test_audit_load_with_a_redelivery_overlapping_a_live_batch() -> None:
 
     async def scenario() -> tuple[int, int, int]:
         spine, eng = await fresh()
-        writer = AuditWriter(spine, eng, durable="load", ack_wait_s=3.0, max_deliver=5)
+        writer = AuditWriter(os.environ[_NATS], eng, durable="load", ack_wait_s=3.0, max_deliver=5)
         await writer.subscribe()
 
         for i in range(200):

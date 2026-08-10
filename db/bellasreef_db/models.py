@@ -142,10 +142,9 @@ class Device(Base):
             kind <> 'sensor' OR (
                 control_authority IS NULL
             AND failsafe_capable  IS NULL
-            AND transport         IS NULL
             )
             """,
-            name="sensors_carry_no_authority",
+            name="sensors_carry_no_control_authority",
         ),
         # The safety framework, at rest — now scoped to the authority that can
         # actually honour it (device-classes.md §2.1). This replaces the old
@@ -186,9 +185,11 @@ class Device(Base):
             kind <> 'sensor' OR (
                 sensor_type     IS NOT NULL
             AND poll_interval_s IS NOT NULL AND poll_interval_s > 0
+            AND transport       IS NOT NULL
+            AND transport       IN ('local', 'network')
             )
             """,
-            name="sensor_declares_type_and_cadence",
+            name="sensor_declares_type_cadence_and_transport",
         ),
         # IS NOT NULL first, for the same reason as the constraints above: a
         # CHECK that evaluates to NULL passes in Postgres, so `role IN (...)`

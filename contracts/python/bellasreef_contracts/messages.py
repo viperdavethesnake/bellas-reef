@@ -330,6 +330,15 @@ class SensorRegistration(_Message):
     sensor_id: DeviceId
     sensor_type: DeviceId
     driver_id: DeviceId
+    #: How the probe is reached. Required, no default, for the same reason as on
+    #: an actuator: an unstated value silently reads as the trustworthy one.
+    #:
+    #: A sensor has no *control* authority — it controls nothing — but it does
+    #: have provenance, and that is the axis that matters for a reading. A
+    #: 1-Wire probe on the board is measured; a value relayed from a vendor's
+    #: cloud is reported. Charted without a distinguishing label those two lines
+    #: are identical, which is the same failure §4 describes for actuators.
+    transport: Transport
     unit: str = Field(min_length=1, max_length=16)
     #: Nominal seconds between reads. A consumer deciding whether a reading has
     #: gone stale needs the cadence the driver actually intends, not a constant

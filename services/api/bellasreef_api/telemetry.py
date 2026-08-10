@@ -107,22 +107,46 @@ class TelemetryWriter:
     does not belong in the one thing allowed to drive a heater.
     """
 
+    #: A durable consumer name is shared state on the broker. Two processes
+    #: using the same name do not each get a copy — the second is refused with
+    #: "consumer is already bound", or worse, steals the first's position. The
+    #: suffix exists so a test (or a second instance) can take its own without
+    #: colliding with the service that is actually running.
     RETRY_S = 5.0
     #: How long a looked-up authority is trusted before re-reading. Authority
     #: changes only by re-registration, so this is about picking up a new device
     #: promptly, not about staleness of a fast-moving value.
     AUTHORITY_TTL_S = 30.0
 
-    def __init__(self, nats_url: str, vm_url: str, store: Store) -> None:
+    def __init__(
+        self, nats_url: str, vm_url: str, store: Store, *, durable_suffix: str = ""
+    ) -> None:
+        self._suffix = durable_suffix
         self._nats_url = nats_url
         self._vm_url = vm_url.rstrip("/")
         self._store = store
         self._nc: Client | None = None
         self._task: asyncio.Task[None] | None = None
+        self._subscribed = False
         self._http: httpx.AsyncClient | None = None
-        self._authority: dict[str, tuple[str, float]] = {}
+        self._labels: dict[str, tuple[tuple[str, str], float]] = {}
 
     # ------------------------------------------------------------- lifecycle
+
+    @property
+    def is_running(self) -> bool:
+        """True once subscribed and still connected.
+
+        Deliberately not "the setup task is alive". These are *push* consumers:
+        the task exists only to establish the subscription and then returns, so
+        a liveness check on the task reports False exactly when the component is
+        working correctly. Work happens in NATS callbacks afterwards.
+
+        The composed-service test caught that distinction — the first version of
+        this property would have failed a healthy service, which is the mirror
+        image of the bug it exists to prevent.
+        """
+        return self._subscribed and self._nc is not None and self._nc.is_connected
 
     async def start(self) -> None:
         self._http = httpx.AsyncClient(timeout=10.0)
@@ -174,13 +198,13 @@ class TelemetryWriter:
 
         await js.subscribe(
             subjects.ALL_SENSORS,
-            durable="telemetry-sensors",
+            durable=f"telemetry-sensors{self._suffix}",
             cb=self._on_sensor,
             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW),
         )
         await js.subscribe(
             subjects.ALL_ALERTS,
-            durable="telemetry-alerts",
+            durable=f"telemetry-alerts{self._suffix}",
             cb=self._on_alert,
             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW),
         )
@@ -190,13 +214,32 @@ class TelemetryWriter:
         # retention policy, not in this consumer.
         await js.subscribe(
             subjects.ALL_STATE,
-            durable="telemetry-state",
+            durable=f"telemetry-state{self._suffix}",
             cb=self._on_state,
             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW),
         )
+        self._subscribed = True
         log.info("telemetry writer subscribed", extra={"vm": self._vm_url})
 
     # ------------------------------------------------------------- authority
+
+    async def labels_for(self, device_id: str) -> tuple[str, str]:
+        """``(control_authority, transport)`` label values for a device."""
+        cached = self._labels.get(device_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < self.AUTHORITY_TTL_S:
+            return cached[0]
+        try:
+            known, authority, transport = await self._store.device_labels(device_id)
+        except Exception:
+            log.exception("could not read device labels", extra={"device_id": device_id})
+            return ("unknown", "unknown")
+        resolved = (
+            authority or ("not_applicable" if known else "unknown"),
+            transport or ("not_applicable" if known else "unknown"),
+        )
+        self._labels[device_id] = (resolved, now)
+        return resolved
 
     async def authority_of(self, device_id: str) -> str:
         """The label value for this device's control authority.
@@ -216,17 +259,7 @@ class TelemetryWriter:
             though it were a measurement, and the label *is* the series, so it
             cannot be corrected in place afterwards.
         """
-        cached = self._authority.get(device_id)
-        now = time.monotonic()
-        if cached is not None and now - cached[1] < self.AUTHORITY_TTL_S:
-            return cached[0]
-        try:
-            known, declared = await self._store.control_authority_of(device_id)
-        except Exception:
-            log.exception("could not read control_authority", extra={"device_id": device_id})
-            return "unknown"
-        authority = declared or ("not_applicable" if known else "unknown")
-        self._authority[device_id] = (authority, now)
+        authority, _ = await self.labels_for(device_id)
         return authority
 
     # -------------------------------------------------------------- handlers
@@ -343,7 +376,7 @@ class TelemetryWriter:
         # intent — telling a fail-safe-backed episode from one that is not —
         # needs either sensors to carry an authority of their own or this label
         # to be transport-based. Flagged, not resolved here.
-        authority = await self.authority_of(alert.device_id)
+        authority, transport = await self.labels_for(alert.device_id)
         return [
             _line(
                 "bellasreef_alert_state",
@@ -352,6 +385,14 @@ class TelemetryWriter:
                     "sensor_type": alert.sensor_type,
                     "bound": alert.bound,
                     "control_authority": authority,
+                    # The axis that actually distinguishes these episodes today.
+                    # Every alert is currently sensor-sourced, so
+                    # control_authority is truthfully not_applicable; transport
+                    # is what separates a probe measured on the board from a
+                    # value relayed over a network. control_authority stays on
+                    # the series so a future actuator-sourced alert class has a
+                    # place to land without forking it.
+                    "transport": transport,
                 },
                 1.0 if alert.state == "breach" else 0.0,
                 alert.emitted_at,

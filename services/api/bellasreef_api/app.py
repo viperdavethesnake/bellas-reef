@@ -19,6 +19,7 @@ land next.
 # fails with "is not fully defined".
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -43,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from bellasreef_api.audit import NatsAuditSink
+from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
 from bellasreef_api.registry import RegistryConsumer
 from bellasreef_api.security import (
@@ -98,6 +100,20 @@ class Info(BaseModel):
     #: "an already-paired device will need to approve this one" at a person who
     #: has no such device, and they wait for something that can never arrive.
     approvers_available: bool
+
+
+class AuditEvent(BaseModel):
+    """One persisted audit event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    occurred_at: datetime
+    category: str
+    actor: str
+    subject: str
+    device_id: str | None
+    event: dict[str, Any]
 
 
 class DeviceView(BaseModel):
@@ -365,6 +381,7 @@ def build_app(
     nats_url: str | None = None,
     vm_url: str | None = None,
     clock_trusted: Callable[[], bool] | None = None,
+    durable_suffix: str = "",
 ) -> FastAPI:
     store = Store(engine)
     overrides = OverrideStore(engine, clock_trusted=clock_trusted)
@@ -386,7 +403,14 @@ def build_app(
         return secret_cache["secret"]
 
     registry = RegistryConsumer(nats_url, store) if nats_url else None
-    telemetry = TelemetryWriter(nats_url, vm_url, store) if nats_url and vm_url else None
+    telemetry = (
+        TelemetryWriter(nats_url, vm_url, store, durable_suffix=durable_suffix)
+        if nats_url and vm_url
+        else None
+    )
+    audit_writer = (
+        AuditWriter(nats_url, engine, durable=f"audit-writer{durable_suffix}") if nats_url else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -397,7 +421,11 @@ def build_app(
         entire point of it. Note that the ASGI transport used in tests does not
         run lifespans, so the consumer stays out of the way there.
         """
-        for name, component in (("registry consumer", registry), ("telemetry writer", telemetry)):
+        for name, component in (
+            ("registry consumer", registry),
+            ("telemetry writer", telemetry),
+            ("audit writer", audit_writer),
+        ):
             if component is None:
                 continue
             try:
@@ -407,7 +435,7 @@ def build_app(
         try:
             yield
         finally:
-            for component in (registry, telemetry):
+            for component in (registry, telemetry, audit_writer):
                 if component is not None:
                     await component.close()
 
@@ -418,6 +446,13 @@ def build_app(
         lifespan=lifespan,
     )
     app.state.signing_secret_getter = signing_secret
+    # Named so a test can assert these are *running*, not merely constructed.
+    # The audit writer spent its whole life constructible and unstarted.
+    app.state.background = {
+        "registry consumer": registry,
+        "telemetry writer": telemetry,
+        "audit writer": audit_writer,
+    }
 
     async def current_client(
         authorization: Annotated[str | None, Header()] = None,
@@ -758,6 +793,38 @@ def build_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
         await sink("device.renamed", {"device_id": device_id, "display_name": body.display_name})
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
+
+    @app.get(
+        "/api/v1/audit",
+        response_model=list[AuditEvent],
+        tags=["audit"],
+        operation_id="listAudit",
+        responses={401: AUTH_401},
+    )
+    async def list_audit(
+        _: Annotated[UUID, Depends(current_client)],
+        limit: int = 50,
+        category: str | None = None,
+    ) -> list[AuditEvent]:
+        """The audit trail, as persisted.
+
+        Reads `audit_log`, not the stream. `BR_AUDIT` is a delivery buffer that
+        expires; Postgres is the system of record, and this endpoint is what
+        makes "the event was recorded" checkable from outside the hub — which is
+        how the writer's absence stayed invisible for as long as it did.
+        """
+        return [
+            AuditEvent(
+                message_id=str(row["message_id"]),
+                occurred_at=row["occurred_at"],
+                category=row["category"],
+                actor=row["actor"],
+                subject=row["subject"],
+                device_id=row["device_id"],
+                event=row["event"] if isinstance(row["event"], dict) else json.loads(row["event"]),
+            )
+            for row in await store.recent_audit(limit=limit, category=category)
+        ]
 
     # ------------------------------------------------------------- alerts
 

@@ -43,6 +43,22 @@ class RegistryConsumer:
         self._store = store
         self._nc: Client | None = None
         self._task: asyncio.Task[None] | None = None
+        self._subscribed = False
+
+    @property
+    def is_running(self) -> bool:
+        """True once subscribed and still connected.
+
+        Deliberately not "the setup task is alive". These are *push* consumers:
+        the task exists only to establish the subscription and then returns, so
+        a liveness check on the task reports False exactly when the component is
+        working correctly. Work happens in NATS callbacks afterwards.
+
+        The composed-service test caught that distinction — the first version of
+        this property would have failed a healthy service, which is the mirror
+        image of the bug it exists to prevent.
+        """
+        return self._subscribed and self._nc is not None and self._nc.is_connected
 
     async def start(self) -> None:
         """Begin subscribing, retrying until the stream exists.
@@ -84,6 +100,7 @@ class RegistryConsumer:
             cb=self._on_message,
             config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
         )
+        self._subscribed = True
         log.info("registry consumer subscribed", extra={"subject": subjects.ALL_REGISTRY})
 
     async def close(self) -> None:
@@ -118,6 +135,7 @@ class RegistryConsumer:
                 driver_id=registration.driver_id,
                 sensor_type=registration.sensor_type,
                 poll_interval_s=registration.poll_interval_s,
+                transport=registration.transport,
             )
         except Exception:  # broad by design: a bad row must not kill the consumer
             log.exception("could not upsert a registration", extra={"subject": msg.subject})

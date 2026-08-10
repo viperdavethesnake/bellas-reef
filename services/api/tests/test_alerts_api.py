@@ -46,8 +46,8 @@ async def fresh_engine() -> AsyncEngine:
         await conn.execute(
             text(
                 "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                "poll_interval_s) VALUES (:id, 'display-tank', 'sensor', 'ds18b20', "
-                "'temp', 5.0)"
+                "poll_interval_s, transport) VALUES (:id, 'display-tank', 'sensor', "
+                "'ds18b20', 'temp', 5.0, 'local')"
             ),
             {"id": uuid.uuid4()},
         )

@@ -301,6 +301,8 @@ class HardwareIO:
                     sensor_id=driver.driver_id,
                     sensor_type=driver.sensor_type,
                     driver_id=driver.driver_id,
+                    # hardware-io only ever owns local buses (§3).
+                    transport="local",
                     unit=driver.unit,
                     poll_interval_s=driver.poll_interval_s,
                 )

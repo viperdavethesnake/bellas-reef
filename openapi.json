@@ -332,6 +332,56 @@
         "title": "AlertsView",
         "type": "object"
       },
+      "AuditEvent": {
+        "additionalProperties": false,
+        "description": "One persisted audit event.",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "additionalProperties": true,
+            "title": "Event",
+            "type": "object"
+          },
+          "message_id": {
+            "title": "Message Id",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id",
+          "occurred_at",
+          "category",
+          "actor",
+          "subject",
+          "device_id",
+          "event"
+        ],
+        "title": "AuditEvent",
+        "type": "object"
+      },
       "BinaryLevel": {
         "additionalProperties": false,
         "description": "An on/off actuator level \u2014 relays, outlets, solenoids.",
@@ -1208,6 +1258,81 @@
         "summary": "List Alerts",
         "tags": [
           "alerts"
+        ]
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "description": "The audit trail, as persisted.\n\nReads `audit_log`, not the stream. `BR_AUDIT` is a delivery buffer that\nexpires; Postgres is the system of record, and this endpoint is what\nmakes \"the event was recorded\" checkable from outside the hub \u2014 which is\nhow the writer's absence stayed invisible for as long as it did.",
+        "operationId": "listAudit",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "title": "Category",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AuditEvent"
+                  },
+                  "title": "Response Listaudit",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Audit",
+        "tags": [
+          "audit"
         ]
       }
     },
