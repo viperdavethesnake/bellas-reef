@@ -22,7 +22,12 @@ from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
 
-from bellasreef_contracts import ActuatorRegistration, Heartbeat, SensorReading
+from bellasreef_contracts import (
+    ActuatorRegistration,
+    Heartbeat,
+    SensorReading,
+    SensorRegistration,
+)
 from bellasreef_contracts.driver import SensorSample
 from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
@@ -279,7 +284,25 @@ class HardwareIO:
 
         for registration in self._registrations:
             await self.spine.publish_registration(registration)
-        log.info("registrations published", extra={"count": len(self._registrations)})
+
+        for driver in self.sensors:
+            await self.spine.publish_sensor_registration(
+                SensorRegistration(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source=SERVICE,
+                    sensor_id=driver.driver_id,
+                    sensor_type=driver.sensor_type,
+                    driver_id=driver.driver_id,
+                    unit=driver.unit,
+                    poll_interval_s=driver.poll_interval_s,
+                )
+            )
+
+        log.info(
+            "registrations published",
+            extra={"actuators": len(self._registrations), "sensors": len(self.sensors)},
+        )
 
         self.commands = CommandConsumer(self.spine, self.supervisor)
         await self.commands.subscribe()

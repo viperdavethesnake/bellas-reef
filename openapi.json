@@ -380,6 +380,44 @@
         "title": "Client",
         "type": "object"
       },
+      "DeviceName": {
+        "additionalProperties": false,
+        "description": "A new display name, or ``null`` to go back to the raw id.",
+        "properties": {
+          "display_name": {
+            "maxLength": 128,
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "DeviceName",
+        "type": "object"
+      },
+      "DeviceNameView": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device_id",
+          "display_name"
+        ],
+        "title": "DeviceNameView",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -399,6 +437,10 @@
           "api_version": {
             "title": "Api Version",
             "type": "string"
+          },
+          "approvers_available": {
+            "title": "Approvers Available",
+            "type": "boolean"
           },
           "contracts_version": {
             "title": "Contracts Version",
@@ -422,7 +464,8 @@
           "api_version",
           "contracts_version",
           "paired_client_count",
-          "pairing_open"
+          "pairing_open",
+          "approvers_available"
         ],
         "title": "Info",
         "type": "object"
@@ -1073,6 +1116,59 @@
         ]
       }
     },
+    "/api/v1/clients/me": {
+      "delete": {
+        "description": "Revoke the calling client.\n\nSigning out has to reach the hub. Forgetting the credential locally\nleaves a row the hub still counts as live, so the hub believes someone\ncan approve a new device while the only device that could is the one\nthat just signed out \u2014 a lockout with no way back except the recovery\nCLI.",
+        "operationId": "revokeSelf",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Revokeself",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Self",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/api/v1/clients/{client_id}": {
       "delete": {
         "description": "Revoke. Any paired client may revoke any other, including itself.\n\nauth.md \u00a71: revocation is the only privilege operation and a paired\ndevice has full operator rights. A lost phone is revoked from the one\nyou still have.",
@@ -1188,6 +1284,77 @@
           }
         },
         "summary": "Devices",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}": {
+      "patch": {
+        "description": "Name a device, or clear the name.\n\nPATCH rather than PUT: this changes one operator-owned field on a row\nthe hub otherwise maintains from hardware announcements, and a PUT would\nimply the client is supplying the whole device.",
+        "operationId": "renameDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceNameView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Device",
         "tags": [
           "hardware"
         ]

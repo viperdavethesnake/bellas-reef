@@ -20,7 +20,8 @@ land next.
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
@@ -43,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.frames import ReadyFrame
+from bellasreef_api.registry import RegistryConsumer
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -85,6 +87,45 @@ class Info(BaseModel):
     contracts_version: str
     paired_client_count: int
     pairing_open: bool
+    #: True when at least one live client exists to approve a new one.
+    #:
+    #: Distinct from ``pairing_open``, and the distinction is the whole point.
+    #: ``pairing_open`` is keyed on clients *ever* paired, so that revoking
+    #: everything cannot reopen trust-on-first-use. That leaves a third state
+    #: the old contract could not express: paired before, nothing live now,
+    #: nobody able to approve anyone. A client that cannot see this renders
+    #: "an already-paired device will need to approve this one" at a person who
+    #: has no such device, and they wait for something that can never arrive.
+    approvers_available: bool
+
+
+class DeviceName(BaseModel):
+    """A new display name, or ``null`` to go back to the raw id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _blank_is_not_a_name(self) -> "DeviceName":
+        """Whitespace is not a name.
+
+        Without this, "   " stores as a non-NULL value and every client shows a
+        blank label where the id used to be, with no way back short of another
+        request. Normalising it to NULL means clearing the field and never
+        setting one are the same state, which is the honest model.
+        """
+        if self.display_name is not None:
+            trimmed = self.display_name.strip()
+            object.__setattr__(self, "display_name", trimmed or None)
+        return self
+
+
+class DeviceNameView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    display_name: str | None
 
 
 class AlertThresholds(BaseModel):
@@ -298,10 +339,33 @@ def build_app(
             secret_cache["secret"] = await store.signing_secret()
         return secret_cache["secret"]
 
+    registry = RegistryConsumer(nats_url, store) if nats_url else None
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """Run the registry consumer for the life of the process.
+
+        A lifespan rather than lazy-on-first-use, because this one has to be
+        listening whether or not anybody has made a request yet — that is the
+        entire point of it. Note that the ASGI transport used in tests does not
+        run lifespans, so the consumer stays out of the way there.
+        """
+        if registry is not None:
+            try:
+                await registry.start()
+            except Exception:  # broad by design: no spine must not stop the API
+                log.exception("registry consumer failed to start")
+        try:
+            yield
+        finally:
+            if registry is not None:
+                await registry.close()
+
     app = FastAPI(
         title="Bella's Reef API",
         version=CONTRACTS_VERSION,
         summary="Reef controller: pairing, auth, and device control.",
+        lifespan=lifespan,
     )
     app.state.signing_secret_getter = signing_secret
 
@@ -346,6 +410,7 @@ def build_app(
             contracts_version=CONTRACTS_VERSION,
             paired_client_count=total,
             pairing_open=total == 0,
+            approvers_available=await store.active_client_count() > 0,
         )
 
     # ------------------------------------------------------------------ pairing
@@ -552,6 +617,28 @@ def build_app(
             for row in await store.list_clients()
         ]
 
+    # Declared BEFORE /clients/{client_id}. FastAPI matches routes in order, and
+    # "me" would otherwise be parsed as a UUID path parameter and 422 before it
+    # ever reached a handler.
+    @app.delete(
+        "/api/v1/clients/me",
+        tags=["clients"],
+        operation_id="revokeSelf",
+        responses={401: AUTH_401},
+    )
+    async def revoke_self(actor: Annotated[UUID, Depends(current_client)]) -> dict[str, str]:
+        """Revoke the calling client.
+
+        Signing out has to reach the hub. Forgetting the credential locally
+        leaves a row the hub still counts as live, so the hub believes someone
+        can approve a new device while the only device that could is the one
+        that just signed out — a lockout with no way back except the recovery
+        CLI.
+        """
+        await store.revoke(actor)
+        await sink("client.revoked", {"client_id": str(actor), "actor": str(actor), "self": True})
+        return {"status": "revoked"}
+
     @app.delete(
         "/api/v1/clients/{client_id}",
         tags=["clients"],
@@ -595,6 +682,30 @@ def build_app(
     )
     async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         return await store.list_devices(kind="sensor")
+
+    @app.patch(
+        "/api/v1/devices/{device_id}",
+        response_model=DeviceNameView,
+        tags=["hardware"],
+        operation_id="renameDevice",
+        responses={401: AUTH_401, 404: {"description": "No such device."}},
+    )
+    async def rename_device(
+        device_id: str,
+        body: DeviceName,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> DeviceNameView:
+        """Name a device, or clear the name.
+
+        PATCH rather than PUT: this changes one operator-owned field on a row
+        the hub otherwise maintains from hardware announcements, and a PUT would
+        imply the client is supplying the whole device.
+        """
+        row = await store.set_display_name(device_id, body.display_name)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+        await sink("device.renamed", {"device_id": device_id, "display_name": body.display_name})
+        return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
 
     # ------------------------------------------------------------- alerts
 

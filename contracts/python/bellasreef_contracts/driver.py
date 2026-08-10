@@ -142,6 +142,17 @@ class SensorDriver(Protocol):
         ...
 
     @property
+    def unit(self) -> str:
+        """Unit every sample from this driver carries, e.g. ``degC``.
+
+        Declared on the driver rather than read off the first sample, because
+        registration happens before anything has been read — and a consumer
+        that has to wait for a reading to learn the unit cannot render a
+        threshold form for a probe that is currently faulted.
+        """
+        ...
+
+    @property
     def poll_interval_s(self) -> float:
         """Cadence this driver wants to be polled at. Must be > 0.
 

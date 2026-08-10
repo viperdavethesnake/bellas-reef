@@ -123,6 +123,10 @@ class DS18B20:
         return "temp"
 
     @property
+    def unit(self) -> str:
+        return "degC"
+
+    @property
     def poll_interval_s(self) -> float:
         return self._poll_interval_s
 

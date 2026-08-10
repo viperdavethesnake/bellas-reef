@@ -142,6 +142,10 @@ class FakeSensor:
         return self._sensor_type
 
     @property
+    def unit(self) -> str:
+        return self._unit
+
+    @property
     def poll_interval_s(self) -> float:
         return self._poll_interval_s
 

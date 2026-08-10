@@ -399,10 +399,15 @@ def test_info_leaks_nothing_sensitive() -> None:
         return body
 
     body = run(scenario)
+    # An allowlist, not a snapshot. /info is unauthenticated, so every field
+    # added here is published to anything that can reach the hub —
+    # `approvers_available` is a bare boolean derived from a count, and reveals
+    # nothing a client could not learn by attempting to pair.
     assert set(body) == {
         "name",
         "api_version",
         "contracts_version",
+        "approvers_available",
         "paired_client_count",
         "pairing_open",
     }

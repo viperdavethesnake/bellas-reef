@@ -22,6 +22,7 @@ from bellasreef_contracts.messages import (
     PwmLevel,
     SensorAlert,
     SensorReading,
+    SensorRegistration,
     StateReason,
 )
 
@@ -41,5 +42,6 @@ __all__ = [
     "PwmLevel",
     "SensorAlert",
     "SensorReading",
+    "SensorRegistration",
     "StateReason",
 ]

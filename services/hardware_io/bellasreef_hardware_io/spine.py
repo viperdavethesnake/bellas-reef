@@ -23,6 +23,7 @@ from bellasreef_contracts import (
     ActuatorState,
     Heartbeat,
     SensorReading,
+    SensorRegistration,
     subjects,
 )
 from bellasreef_service.logging import get_logger
@@ -48,6 +49,7 @@ log = get_logger(__name__)
 CMD_STREAM: Final = "BR_CMD"
 STATE_STREAM: Final = "BR_STATE"
 AUDIT_STREAM: Final = "BR_AUDIT"
+REGISTRY_STREAM: Final = "BR_REGISTRY"
 
 STREAMS: Final = (
     StreamConfig(
@@ -62,6 +64,20 @@ STREAMS: Final = (
     StreamConfig(
         name=STATE_STREAM,
         subjects=[subjects.ALL_STATE],
+        retention=RetentionPolicy.LIMITS,
+        storage=StorageType.FILE,
+        max_msgs_per_subject=1,
+    ),
+    # Registrations are announced once, at hardware-io startup. Without
+    # retention, a consumer that starts later — or restarts — never learns the
+    # hub has any hardware at all, and the devices table stays empty until
+    # somebody power-cycles the right service in the right order.
+    #
+    # Last-value-per-subject, like state: a registration is not an event to
+    # replay but a current fact about one device, and the newest one wins.
+    StreamConfig(
+        name=REGISTRY_STREAM,
+        subjects=[subjects.ALL_REGISTRY],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
         max_msgs_per_subject=1,
@@ -153,6 +169,21 @@ class Spine:
             raise RuntimeError("spine not connected")
         await self._nc.publish(
             subjects.registry(registration.actuator_id),
+            registration.model_dump_json().encode(),
+        )
+
+    async def publish_sensor_registration(self, registration: SensorRegistration) -> None:
+        """Announce a sensor on the registry subject.
+
+        Same subject family as actuator registration, so one consumer sees every
+        device the hub has. hardware-io announces and forgets: it never learns
+        whether anything stored the result, which is what keeps it free of a
+        database dependency.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+        await self._nc.publish(
+            subjects.registry(registration.sensor_id),
             registration.model_dump_json().encode(),
         )
 

@@ -193,9 +193,10 @@ class Store:
         The split is why the client endpoints moved to /api/v1/clients.
         """
         sql = (
-            "SELECT device_id, kind, driver_id, sensor_type, poll_interval_s, "
-            "actuator_class, role, safe_state, max_runtime_s, heartbeat_timeout_s, "
-            "enabled FROM devices"
+            "SELECT device_id, display_name, kind, driver_id, sensor_type, "
+            "poll_interval_s, actuator_class, role, safe_state, max_runtime_s, "
+            "heartbeat_timeout_s, enabled, alert_min, alert_max, alert_clear_margin "
+            "FROM devices"
         )
         params: dict[str, object] = {}
         if kind is not None:
@@ -206,6 +207,68 @@ class Store:
         async with self._engine.connect() as conn:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
+
+    async def upsert_sensor(
+        self,
+        *,
+        device_id: str,
+        driver_id: str,
+        sensor_type: str,
+        poll_interval_s: float,
+    ) -> bool:
+        """Record a registered sensor. Returns True when the row was new.
+
+        ON CONFLICT updates only what the hardware announces. It deliberately
+        does not touch ``display_name`` or the alert thresholds: those belong to
+        the operator, and a probe re-announcing itself after a hardware-io
+        restart must not silently reset the name and the band somebody chose.
+        """
+        async with self._engine.begin() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
+                            "poll_interval_s) VALUES (gen_random_uuid(), :device_id, 'sensor', "
+                            ":driver_id, :sensor_type, :poll_interval_s) "
+                            "ON CONFLICT (device_id) DO UPDATE SET "
+                            "driver_id = EXCLUDED.driver_id, "
+                            "sensor_type = EXCLUDED.sensor_type, "
+                            "poll_interval_s = EXCLUDED.poll_interval_s, "
+                            "updated_at = now() "
+                            "RETURNING (xmax = 0) AS inserted"
+                        ),
+                        {
+                            "device_id": device_id,
+                            "driver_id": driver_id,
+                            "sensor_type": sensor_type,
+                            "poll_interval_s": poll_interval_s,
+                        },
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return bool(row["inserted"]) if row is not None else False
+
+    async def set_display_name(self, device_id: str, name: str | None) -> dict[str, Any] | None:
+        """Name a device, or clear the name back to NULL."""
+        async with self._engine.begin() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE devices SET display_name = :name, updated_at = now() "
+                            "WHERE device_id = :device_id "
+                            "RETURNING device_id, kind, display_name, sensor_type"
+                        ),
+                        {"device_id": device_id, "name": name},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
 
     async def thresholds_for(self, device_id: str) -> dict[str, Any] | None:
         """Alert configuration for one sensor, or ``None`` if no such device."""

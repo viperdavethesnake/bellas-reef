@@ -93,6 +93,11 @@ class Device(Base):
     #: cannot strobe breach/clear/breach on sensor noise.
     alert_clear_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    #: What the operator calls this device. Never generated, never defaulted to
+    #: the id: an empty display name is how a client knows to fall back to the
+    #: id rather than showing "ds18b20-28-000000bfe244" and calling it a name.
+    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
@@ -103,6 +108,12 @@ class Device(Base):
 
     __table_args__ = (
         CheckConstraint("kind IN ('sensor', 'actuator')", name="kind_valid"),
+        # A name of spaces is not a name. Blank-but-present would defeat the
+        # fallback: clients check for NULL, and "   " is not NULL.
+        CheckConstraint(
+            "display_name IS NULL OR length(btrim(display_name)) > 0",
+            name="display_name_not_blank",
+        ),
         CheckConstraint(
             "actuator_class IS NULL OR actuator_class IN ('binary', 'pwm')",
             name="actuator_class_valid",

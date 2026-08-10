@@ -42,6 +42,7 @@ __all__ = [
     "PwmLevel",
     "SensorAlert",
     "SensorReading",
+    "SensorRegistration",
     "StateReason",
 ]
 
@@ -268,6 +269,31 @@ class Heartbeat(_Message):
     component: DeviceId
     sequence: int = Field(ge=0)
     interval_s: float = Field(gt=0.0)
+
+
+class SensorRegistration(_Message):
+    """Declaration that a sensor exists, and at what cadence it reports.
+
+    The counterpart to :class:`ActuatorRegistration`, and deliberately thinner:
+    a sensor has no safe state to declare because it cannot do anything unsafe.
+    What it must declare is its cadence, because that is what makes "this
+    reading is stale" a decidable question rather than a guess.
+
+    Published on ``bellasreef.registry.<sensor_id>``. hardware-io announces; it
+    never writes to Postgres. The database is downstream of the spine, which is
+    what lets a phase-2 ESP32 spoke register itself without knowing a database
+    exists.
+    """
+
+    sensor_id: DeviceId
+    sensor_type: DeviceId
+    driver_id: DeviceId
+    unit: str = Field(min_length=1, max_length=16)
+    #: Nominal seconds between reads. A consumer deciding whether a reading has
+    #: gone stale needs the cadence the driver actually intends, not a constant
+    #: someone picked in a client.
+    poll_interval_s: float = Field(gt=0.0)
+    description: str | None = Field(default=None, max_length=512)
 
 
 class ActuatorRegistration(_Message):

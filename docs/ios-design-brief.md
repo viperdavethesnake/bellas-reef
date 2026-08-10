@@ -1,6 +1,6 @@
-# iOS app — design brief v1.1
+# iOS app — design brief v1.2
 
-**Status:** active — v1.1 adds §7 UX standards · **Owner:** David / Bella's Reef LLC
+**Status:** active — v1.2 amends §2 (destructive controls vs safety red); v1.1 added §7 UX standards · **Owner:** David / Bella's Reef LLC
 **Scope:** look/feel, palette, screen map, UX standards, and the one contract
 change the app design requires. The app is closed-source (see PRD Q3); this
 brief lives in the public repo because it drives API and contract decisions,
@@ -30,7 +30,8 @@ The tank carries the color; the UI stays nearly monochrome.
 | Base (dark) | Deep blue-gray near-black — 20,000K water, not pure black | **Dark mode is primary.** This app opens at night next to an actinic-lit tank; a white screen is a flashbang. Light mode supported, secondary. |
 | Accent | Single saturated electric teal/cyan | Interactive elements and the healthy state. One accent, everywhere. |
 | Amber | Attention | Stale sensor, pending approval, override active. |
-| Red | Safety only | Interlock latched, fail-safe fired, clock untrusted. **Red appears nowhere else in the app, ever** — when it shows, it means something. |
+| Red | Safety only, in status and data | Interlock latched, fail-safe fired, clock untrusted. **Red never appears in status or data display for anything else** — when a reading or a status line goes red, it means something. |
+| Destructive controls | Standard iOS red | Amended v1.2. Destructive *controls* — `.destructive` buttons, confirmation dialogs, swipe-to-delete — follow the platform convention, including its red. This is not a safety signal and does not weaken the rule above: safety-red governs what the app is *telling you about the tank*, while control-red is what iOS uses to say "this deletes something". Overloading a system-standard control colour would make unpair look like a hardware fault. |
 | Channel colors | Inherited from fixture config | A royal-blue channel renders royal blue. The lighting screen's palette comes from the hardware, not the design system. |
 
 ## 3. Screen map — four tabs
