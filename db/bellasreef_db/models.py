@@ -219,6 +219,13 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    #: The envelope's message_id, carried end to end from the publisher.
+    #: JetStream is at-least-once, so a redelivered audit event arrives twice;
+    #: dedup belongs here, at the terminal store, rather than in pretending the
+    #: broker is exactly-once.
+    message_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), unique=True)
+
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

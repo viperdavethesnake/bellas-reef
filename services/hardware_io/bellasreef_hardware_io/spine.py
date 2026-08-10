@@ -11,8 +11,10 @@ Layout follows docs/contracts/nats-subjects.md.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Final
+from uuid import uuid4
 
 import nats
 from bellasreef_contracts import (
@@ -139,9 +141,21 @@ class Spine:
         )
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
-        import json
+        """Publish an audit event, stamped with an id the store dedups on.
 
-        await self.js.publish(subjects.audit(category), json.dumps(event).encode())
+        The same id goes in the payload and the ``Nats-Msg-Id`` header: the
+        header lets the broker drop an accidental republish inside the
+        duplicate window, and the payload id lets Postgres reject a redelivery
+        after it. Delivery is at-least-once, so the terminal store is where
+        exactly-once actually gets decided.
+        """
+        message_id = event.get("message_id") or str(uuid4())
+        payload = {**event, "message_id": str(message_id)}
+        await self.js.publish(
+            subjects.audit(category),
+            json.dumps(payload).encode(),
+            headers={"Nats-Msg-Id": str(message_id)},
+        )
 
 
 class CommandConsumer:

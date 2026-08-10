@@ -128,12 +128,14 @@ def test_audit_load_with_a_redelivery_overlapping_a_live_batch() -> None:
     assert distinct == 300, f"expected 300 distinct events persisted, got {distinct}"
     assert rows >= 300
 
-    # KNOWN AND FLAGGED, asserted so it cannot drift unnoticed: JetStream is
-    # at-least-once and audit_log has no dedup key, so a redelivered event is
-    # written twice. That is duplication, not loss or corruption — but it is a
-    # real property of the current schema and it traces to PRD R13. Awaiting a
-    # ruling rather than a silently-added column.
-    assert rows >= distinct
+    # Exactly-once at rest. PRD R13 wants one row per event; the 40-message
+    # redelivery above would previously have written 40 second copies. The
+    # unique message_id plus ON CONFLICT DO NOTHING is what closes it — and it
+    # closes it without pretending JetStream is exactly-once, which it is not.
+    assert rows == distinct == 300, (
+        f"expected exactly 300 rows for 300 events, got {rows} "
+        "— a redelivered audit event was written twice"
+    )
 
 
 @pytest.mark.timeout(120)
@@ -151,11 +153,13 @@ def test_append_only_trigger_holds_under_concurrent_writers() -> None:
             async with eng.begin() as conn:
                 await conn.execute(
                     text(
-                        "INSERT INTO audit_log (occurred_at, category, actor, event) "
-                        "VALUES (:at, 'safety', :actor, CAST(:event AS JSONB))"
+                        "INSERT INTO audit_log "
+                        "(message_id, occurred_at, category, actor, event) "
+                        "VALUES (:mid, :at, 'safety', :actor, CAST(:event AS JSONB))"
                     ),
                     [
                         {
+                            "mid": uuid.uuid4(),
                             "at": datetime.now(UTC),
                             "actor": f"worker-{worker}",
                             "event": f'{{"i": {i}}}',

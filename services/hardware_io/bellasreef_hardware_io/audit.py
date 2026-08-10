@@ -13,6 +13,7 @@ the log can be edited after the incident.
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,9 +30,16 @@ __all__ = ["AuditWriter"]
 
 log = get_logger(__name__)
 
+#: ON CONFLICT DO NOTHING against the unique message_id is what turns
+#: at-least-once delivery into exactly-once at rest. Dedup lives here, in the
+#: terminal store, rather than in an assumption that the broker will not
+#: redeliver — it will, and that is not a fault.
 _INSERT = text(
-    "INSERT INTO audit_log (occurred_at, category, actor, subject, device_id, event) "
-    "VALUES (:occurred_at, :category, :actor, :subject, :device_id, CAST(:event AS JSONB))"
+    "INSERT INTO audit_log "
+    "(message_id, occurred_at, category, actor, subject, device_id, event) "
+    "VALUES (:message_id, :occurred_at, :category, :actor, :subject, :device_id, "
+    "        CAST(:event AS JSONB)) "
+    "ON CONFLICT (message_id) DO NOTHING"
 )
 
 #: audit_log.category has a CHECK constraint; anything outside this set would be
@@ -110,7 +118,13 @@ class AuditWriter:
             event = {**event, "original_category": category}
             category = "safety"
 
+        # An event published before message_id stamping, or by something that
+        # is not our publisher, still has to land. A synthesised id makes it
+        # storable; it just cannot be deduplicated.
+        message_id = event.get("message_id") or str(uuid.uuid4())
+
         return {
+            "message_id": message_id,
             "occurred_at": datetime.now(UTC),
             "category": category,
             "actor": str(event.get("actor", "hardware-io")),

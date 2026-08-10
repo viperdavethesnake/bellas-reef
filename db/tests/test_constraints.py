@@ -128,13 +128,18 @@ class TestAuditLogIsAppendOnly:
             async with eng.begin() as conn:
                 result = await conn.execute(
                     text(
-                        "INSERT INTO audit_log (occurred_at, category, actor, event) "
-                        "VALUES (:at, 'safety', 'test', CAST(:event AS JSONB)) "
+                        "INSERT INTO audit_log "
+                        "(message_id, occurred_at, category, actor, event) "
+                        "VALUES (:mid, :at, 'safety', 'test', CAST(:event AS JSONB)) "
                         "RETURNING id"
                     ),
                     # Bound, not inlined: a ':1' inside a SQL string literal is
                     # parsed by SQLAlchemy as a bind parameter.
-                    {"at": datetime.now(UTC), "event": '{"k": 1}'},
+                    {
+                        "mid": uuid.uuid4(),
+                        "at": datetime.now(UTC),
+                        "event": '{"k": 1}',
+                    },
                 )
                 return int(result.scalar_one())
         finally:
