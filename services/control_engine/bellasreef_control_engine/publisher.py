@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
+"""The sole command publisher (PRD §7.1).
+
+Every actuator command in the system leaves through :meth:`CommandPublisher.emit`
+and nowhere else. That is not tidiness — it is what makes several later things
+possible in one place instead of many:
+
+* **Shadow mode (R3, next pass)** becomes a branch here. The scheduler already
+  yields intents rather than side effects, so shadow mode is "journal the
+  intent and return" at this one method. If commands were published from inside
+  the scheduler, R3 would mean touching every control module instead.
+* **Command expiry** is set here from one policy, so no control module can
+  quietly issue something longer-lived than the rest.
+* **Idempotency keys** are minted here, so every command has one by
+  construction rather than by everyone remembering.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import nats
+from bellasreef_contracts import ActuatorCommand, PwmLevel, subjects
+from bellasreef_service import get_logger
+from nats.aio.client import Client
+from nats.js import JetStreamContext
+
+__all__ = ["DEFAULT_COMMAND_TTL_S", "CommandPublisher"]
+
+log = get_logger(__name__)
+
+#: How long a lighting command stays valid.
+#:
+#: Long enough to survive a brief spine hiccup, short enough that a command
+#: delivered after it is meaningless. A ramp step is superseded within seconds
+#: anyway, so executing a stale one would drive a channel to a level the
+#: schedule has already moved past.
+DEFAULT_COMMAND_TTL_S = 30.0
+
+
+class CommandPublisher:
+    """Publishes to `bellasreef.cmd.*` and heartbeats to `bellasreef.heartbeat.*`."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        source: str = "control-engine",
+        ttl_s: float = DEFAULT_COMMAND_TTL_S,
+    ) -> None:
+        if ttl_s <= 0:
+            raise ValueError("ttl_s must be > 0")
+        self._url = url
+        self._source = source
+        self._ttl_s = ttl_s
+        self._nc: Client | None = None
+        self._js: JetStreamContext | None = None
+        self._beat_seq = 0
+
+    async def connect(self) -> None:
+        self._nc = await nats.connect(self._url)
+        self._js = self._nc.jetstream()
+        log.info("publisher connected", extra={"url": self._url})
+
+    async def close(self) -> None:
+        if self._nc is not None:
+            await self._nc.close()
+            self._nc = None
+            self._js = None
+
+    @property
+    def connected(self) -> bool:
+        return self._js is not None
+
+    def build_pwm_command(
+        self, channel_id: str, duty: float, *, reason: str, now: datetime | None = None
+    ) -> ActuatorCommand:
+        """Mint a command. Every one carries an idempotency key and an expiry.
+
+        Separated from :meth:`emit` so tests can inspect what would be sent
+        without a broker — and so shadow mode can journal the exact command it
+        declined to publish, rather than a description of one.
+        """
+        issued = now or datetime.now(UTC)
+        return ActuatorCommand(
+            message_id=uuid4(),
+            emitted_at=issued,
+            source=self._source,
+            actuator_id=channel_id,
+            actuator_class="pwm",
+            level=PwmLevel(duty=duty),
+            idempotency_key=uuid4(),
+            expires_at=issued + timedelta(seconds=self._ttl_s),
+            reason=reason,
+        )
+
+    async def emit(self, command: ActuatorCommand) -> None:
+        """The one place a command leaves this service."""
+        if self._js is None:
+            raise RuntimeError("publisher not connected")
+        await self._js.publish(
+            subjects.cmd(command.actuator_class, command.actuator_id),
+            command.model_dump_json().encode(),
+            headers={"Nats-Msg-Id": str(command.idempotency_key)},
+        )
+        log.info(
+            "command published",
+            extra={
+                "actuator_id": command.actuator_id,
+                "duty": command.level.duty if isinstance(command.level, PwmLevel) else None,
+                "reason": command.reason,
+                "expires_at": command.expires_at.isoformat(),
+            },
+        )
+
+    async def heartbeat(self, interval_s: float) -> None:
+        """Core pub/sub, never JetStream.
+
+        hardware-io drives actuators to safe state when these stop arriving, so
+        a replayed heartbeat would defeat the mechanism it exists to feed.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+        from bellasreef_contracts import Heartbeat
+
+        self._beat_seq += 1
+        beat = Heartbeat(
+            message_id=uuid4(),
+            emitted_at=datetime.now(UTC),
+            source=self._source,
+            component=self._source,
+            sequence=self._beat_seq,
+            interval_s=interval_s,
+        )
+        await self._nc.publish(subjects.heartbeat(beat.component), beat.model_dump_json().encode())

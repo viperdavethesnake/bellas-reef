@@ -10,12 +10,14 @@ package = false
 
 [tool.uv.workspace]
 # services/* join this list as they land; session 1 is contracts + schema only.
-members = ["contracts/python", "db", "services/hardware_io"]
+members = ["contracts/python", "db", "services/shared", "services/hardware_io", "services/control_engine"]
 
 [tool.uv.sources]
 bellasreef-contracts = { workspace = true }
 bellasreef-db = { workspace = true }
 bellasreef-hardware-io = { workspace = true }
+bellasreef-service = { workspace = true }
+bellasreef-control-engine = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -23,6 +25,8 @@ dev = [
     "bellasreef-contracts",
     "bellasreef-db",
     "bellasreef-hardware-io",
+    "bellasreef-service",
+    "bellasreef-control-engine",
     "mypy>=1.14",
     "pytest>=8.3",
     "pytest-timeout>=2.4.0",
@@ -73,7 +77,13 @@ ignore_missing_imports = true
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
-testpaths = ["contracts/python/tests", "db/tests", "services/hardware_io/tests"]
+testpaths = [
+    "contracts/python/tests",
+    "db/tests",
+    "services/shared/tests",
+    "services/hardware_io/tests",
+    "services/control_engine/tests",
+]
 addopts = "-q --strict-markers"
 markers = [
     "hardware: requires real I2C/GPIO/1-wire on the Pi (never runs in CI)",

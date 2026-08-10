@@ -23,14 +23,14 @@ from typing import Final
 from uuid import uuid4
 
 from bellasreef_contracts import ActuatorRegistration, Heartbeat
+from bellasreef_service.httpd import Health, MetricsServer
+from bellasreef_service.logging import configure_logging, get_logger
+from bellasreef_service.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
 from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
-from bellasreef_hardware_io.httpd import Health, MetricsServer
-from bellasreef_hardware_io.logging import configure_logging, get_logger
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
-from bellasreef_hardware_io.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
 
 __all__ = ["HardwareIO", "clock_is_trusted", "main"]
 

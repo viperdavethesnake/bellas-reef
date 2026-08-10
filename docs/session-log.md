@@ -23,3 +23,5 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 17:22 | S4.0 licensing: AGPL-3.0 root, Apache-2.0 contracts, README, CONTRIBUTING (CLA), iOS pointer, SPDX headers (8 Apache / 23 AGPL) | `6f92eb3` | green |
 | 2026-08-09 17:34 | S4.1 migration 0002: audit_log.message_id unique; writer ON CONFLICT DO NOTHING; redelivery test flipped to exactly-once | `16a195a` | green |
 | 2026-08-09 17:34 | Note: verification against docs is not verification against the installed package (nats.jetstream did not exist in nats-py 2.15) | — | — |
+| 2026-08-09 17:58 | S5.1 shared service package extracted (logs/health/liveness) so control-engine need not depend on hardware-io | pending | green |
+| 2026-08-09 17:58 | S5.2 control-engine: skeleton, sole command publisher, lighting scheduler R7, clock-trust gate, NATS integration | pending | green |

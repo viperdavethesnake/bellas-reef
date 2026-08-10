@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 
-from bellasreef_hardware_io.logging import get_logger
+from bellasreef_service.logging import get_logger
 
 __all__ = ["Health", "HealthProbe", "MetricsServer"]
 

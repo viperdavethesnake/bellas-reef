@@ -107,7 +107,30 @@ services:
     # healthcheck reports; the guard is what actually recovers.
     restart: unless-stopped
 
-  # control-engine and api land with the NATS wiring pass.
+  control-engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.control-engine
+    depends_on:
+      nats: { condition: service_healthy }
+    # No devices, no group_add. It reaches hardware only through NATS, and the
+    # absence of device access here is the enforcement of that.
+    user: "1000:1000"
+    environment:
+      BELLASREEF_NATS_URL: nats://nats:4222
+      BELLASREEF_LIGHTING_PROFILES: /config/lighting.json
+      # No timedatectl in the container; the host guarantees clock trust by
+      # ordering the stack After=time-sync.target. Explicit, never assumed.
+      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
+      BELLASREEF_LIVENESS_TIMEOUT_S: "15"
+      BELLASREEF_METRICS_PORT: "9102"
+    volumes:
+      - ./config:/config:ro
+    expose:
+      - "9102"
+    restart: unless-stopped
+
+  # api lands with the OpenAPI pass.
   #
   # control-engine:
   #   build: { context: .., dockerfile: deploy/Dockerfile.control-engine }

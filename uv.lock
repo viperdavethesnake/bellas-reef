@@ -10,8 +10,10 @@ resolution-markers = [
 members = [
     "bellas-reef",
     "bellasreef-contracts",
+    "bellasreef-control-engine",
     "bellasreef-db",
     "bellasreef-hardware-io",
+    "bellasreef-service",
 ]
 
 [[package]]
@@ -141,8 +143,10 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "bellasreef-contracts" },
+    { name = "bellasreef-control-engine" },
     { name = "bellasreef-db" },
     { name = "bellasreef-hardware-io" },
+    { name = "bellasreef-service" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-timeout" },
@@ -154,8 +158,10 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "bellasreef-contracts", editable = "contracts/python" },
+    { name = "bellasreef-control-engine", editable = "services/control_engine" },
     { name = "bellasreef-db", editable = "db" },
     { name = "bellasreef-hardware-io", editable = "services/hardware_io" },
+    { name = "bellasreef-service", editable = "services/shared" },
     { name = "mypy", specifier = ">=1.14" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
@@ -172,6 +178,25 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "pydantic", specifier = ">=2.10" }]
+
+[[package]]
+name = "bellasreef-control-engine"
+version = "0.1.0"
+source = { editable = "services/control_engine" }
+dependencies = [
+    { name = "bellasreef-contracts" },
+    { name = "bellasreef-service" },
+    { name = "nats-py" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bellasreef-contracts", editable = "contracts/python" },
+    { name = "bellasreef-service", editable = "services/shared" },
+    { name = "nats-py", specifier = ">=2.9" },
+    { name = "pydantic", specifier = ">=2.10" },
+]
 
 [[package]]
 name = "bellasreef-db"
@@ -197,6 +222,7 @@ source = { editable = "services/hardware_io" }
 dependencies = [
     { name = "asyncpg" },
     { name = "bellasreef-contracts" },
+    { name = "bellasreef-service" },
     { name = "nats-py" },
     { name = "prometheus-client" },
     { name = "sqlalchemy" },
@@ -206,10 +232,22 @@ dependencies = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "bellasreef-contracts", editable = "contracts/python" },
+    { name = "bellasreef-service", editable = "services/shared" },
     { name = "nats-py", specifier = ">=2.9" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
 ]
+
+[[package]]
+name = "bellasreef-service"
+version = "0.1.0"
+source = { editable = "services/shared" }
+dependencies = [
+    { name = "prometheus-client" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "prometheus-client", specifier = ">=0.21" }]
 
 [[package]]
 name = "colorama"

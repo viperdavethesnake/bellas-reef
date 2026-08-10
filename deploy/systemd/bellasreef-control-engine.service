@@ -1,0 +1,58 @@
+[Unit]
+Description=Bella's Reef control-engine
+Documentation=https://github.com/viperdavethesnake/bellas-reef
+
+# This board has no RTC battery. After a power cut the clock is wrong until
+# chrony catches up, and a service that schedules or expires anything must not
+# start against a clock it cannot believe. chrony-wait is what makes
+# time-sync.target mean *actually synchronised* rather than "the NTP daemon
+# started" — without it this ordering is decorative.
+After=time-sync.target network-online.target
+Wants=time-sync.target network-online.target
+
+[Service]
+Type=notify
+# The python process itself sends sd_notify, so restrict notifications to it.
+NotifyAccess=main
+
+# systemd kills and restarts the unit if WATCHDOG=1 stops arriving. The service
+# pings from INSIDE its supervisor loop, so a deadlocked loop stops the pings.
+# The kernel watchdog only catches a wedged kernel; this catches a wedged us.
+WatchdogSec=15
+Restart=always
+RestartSec=2
+
+# Do not give up on a service whose job is keeping livestock alive. Default
+# start-limit behaviour would stop retrying after a burst of failures.
+StartLimitIntervalSec=0
+
+User=david
+Group=david
+# No device groups: this service must never touch hardware directly.
+
+WorkingDirectory=/home/david/bellasreef
+# The venv interpreter directly, not `uv run`. Type=notify needs the notifying
+# process to be the main PID, and an extra launcher in between complicates that
+# for no benefit.
+ExecStart=/home/david/bellasreef/.venv/bin/python -m bellasreef_control_engine.app
+
+Environment=BELLASREEF_LOG_LEVEL=INFO
+Environment=BELLASREEF_LIVENESS_TIMEOUT_S=15
+Environment=BELLASREEF_METRICS_PORT=9102
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# /sys must stay readable: the DS18B20 read path is sysfs, and w1-therm
+# exposes no character device.
+ProtectKernelLogs=yes
+
+[Install]
+WantedBy=multi-user.target

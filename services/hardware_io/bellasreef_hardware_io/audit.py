@@ -19,11 +19,11 @@ from typing import Any
 
 import nats
 from bellasreef_contracts import subjects
+from bellasreef_service.logging import get_logger
 from nats.js.api import AckPolicy, ConsumerConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from bellasreef_hardware_io.logging import get_logger
 from bellasreef_hardware_io.spine import AUDIT_STREAM, Spine
 
 __all__ = ["AuditWriter"]

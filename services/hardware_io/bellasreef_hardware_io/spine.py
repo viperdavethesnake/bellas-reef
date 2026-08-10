@@ -24,6 +24,7 @@ from bellasreef_contracts import (
     Heartbeat,
     subjects,
 )
+from bellasreef_service.logging import get_logger
 from nats.aio.client import Client
 from nats.js import JetStreamContext
 from nats.js.api import (
@@ -37,7 +38,6 @@ from nats.js.api import (
 from nats.js.errors import BadRequestError
 from pydantic import ValidationError
 
-from bellasreef_hardware_io.logging import get_logger
 from bellasreef_hardware_io.safety import CommandOutcome, InterlockSupervisor
 
 __all__ = ["STREAMS", "CommandConsumer", "Spine"]

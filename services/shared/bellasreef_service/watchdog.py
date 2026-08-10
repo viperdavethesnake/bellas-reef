@@ -40,7 +40,7 @@ import time
 from types import TracebackType
 from typing import Self
 
-from bellasreef_hardware_io.logging import get_logger
+from bellasreef_service.logging import get_logger
 
 __all__ = ["LIVENESS_EXIT_CODE", "LivenessGuard", "SdNotifier", "watchdog_interval_s"]
 
