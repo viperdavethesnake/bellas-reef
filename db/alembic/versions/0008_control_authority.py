@@ -19,13 +19,11 @@ to be on the first sample ever written. Added later it forks every series, and a
 duty of 0.6 that was a measurement becomes indistinguishable from one that was a
 request nobody acknowledged.
 
-**This migration relaxes a P0 constraint.** ``actuator_declares_failure_behaviour``
+**This migration rescopes a P0 constraint.** ``actuator_declares_failure_behaviour``
 required the safety triple of every actuator; it is replaced by
 ``authoritative_declares_failure_behaviour``, which requires it of authoritative
-devices only. That is a deliberate narrowing per §2.2, and it contradicts PRD R1
-as currently written — flagged for a ruling, not resolved here. For every row
-that exists today the two rules are identical, because every row is
-authoritative.
+devices only, per PRD R1 as amended. For every row that exists today the two
+rules are identical, because every row is authoritative.
 """
 
 from __future__ import annotations

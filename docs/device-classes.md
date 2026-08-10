@@ -91,6 +91,10 @@ mode, and PAR bookkeeping can reason about it.
 
 - No commands are ever emitted. The command path is closed at registration, not
   by convention.
+- A declared `safe_state` is **rejected**, exactly as for `advisory` (§2.2). The
+  reasoning is if anything stronger here: a device we never command has no path
+  by which a safe state could ever be applied, so storing one leaves a value
+  that reads as enforced and can never be reached.
 - Zero safety surface, zero protocol risk, no bench dependency.
 - This is the correct default for any third-party fixture we have not yet
   established a control path to — which today is every Kessil X-series light.

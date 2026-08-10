@@ -64,15 +64,11 @@ def test_authoritative_registration_rejected_without_the_safety_triple(missing: 
     no *authoritative* device.
 
     The guarantee is unchanged for every device we actually drive. What moved is
-    its scope: docs/device-classes.md §2.2 makes the triple inapplicable to an
-    advisory device, which cannot honour it and must therefore be unable to
-    claim it. The fields are consequently optional on the model and mandatory in
-    the validator, so the rejection is a value error rather than a missing-field
-    error — the device is refused either way, which is what R1 is protecting.
-
-    NOTE: this narrows PRD R1 as written ("Every actuator registration declares
-    ...") and the CLAUDE.md rule that mirrors it. Flagged for a ruling; not
-    resolved here.
+    its scope: PRD R1 as amended, and docs/device-classes.md §2.2/§2.3, make the
+    triple inapplicable to a device that cannot honour it. The fields are
+    consequently optional on the model and mandatory in the validator, so the
+    rejection is a value error rather than a missing-field error — the device is
+    refused either way, which is what R1 protects.
     """
     payload = _valid()
     del payload[missing]

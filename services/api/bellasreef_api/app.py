@@ -53,6 +53,7 @@ from bellasreef_api.security import (
 )
 from bellasreef_api.store import PAIRING_TTL_S, Store
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
+from bellasreef_api.telemetry import TelemetryWriter
 
 __all__ = ["AuditSink", "build_app"]
 
@@ -362,6 +363,7 @@ def build_app(
     audit: AuditSink | None = None,
     access_ttl_s: int = ACCESS_TOKEN_TTL_S,
     nats_url: str | None = None,
+    vm_url: str | None = None,
     clock_trusted: Callable[[], bool] | None = None,
 ) -> FastAPI:
     store = Store(engine)
@@ -384,6 +386,7 @@ def build_app(
         return secret_cache["secret"]
 
     registry = RegistryConsumer(nats_url, store) if nats_url else None
+    telemetry = TelemetryWriter(nats_url, vm_url, store) if nats_url and vm_url else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -394,16 +397,19 @@ def build_app(
         entire point of it. Note that the ASGI transport used in tests does not
         run lifespans, so the consumer stays out of the way there.
         """
-        if registry is not None:
+        for name, component in (("registry consumer", registry), ("telemetry writer", telemetry)):
+            if component is None:
+                continue
             try:
-                await registry.start()
+                await component.start()
             except Exception:  # broad by design: no spine must not stop the API
-                log.exception("registry consumer failed to start")
+                log.exception("%s failed to start", name)
         try:
             yield
         finally:
-            if registry is not None:
-                await registry.close()
+            for component in (registry, telemetry):
+                if component is not None:
+                    await component.close()
 
     app = FastAPI(
         title="Bella's Reef API",
@@ -899,7 +905,7 @@ def build_app(
         and was dropped by a component that happened to know better — and the
         operator would be told it had been placed.
         """
-        authority = await store.control_authority_of(body.target)
+        _, authority = await store.control_authority_of(body.target)
         if authority == "observe_only":
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1018,4 +1024,18 @@ def create_app() -> FastAPI:
         )
         sink = None
 
-    return build_app(create_async_engine(dsn, future=True), audit=sink, nats_url=nats_url)
+    vm_url = os.environ.get("BELLASREEF_VM_URL")
+    if not vm_url:
+        # Loud, for the same reason as the audit sink above: telemetry that is
+        # silently not written looks exactly like a tank with nothing to report.
+        log.critical(
+            "BELLASREEF_VM_URL is unset: telemetry will NOT reach VictoriaMetrics "
+            "and no history will be recorded"
+        )
+
+    return build_app(
+        create_async_engine(dsn, future=True),
+        audit=sink,
+        nats_url=nats_url,
+        vm_url=vm_url,
+    )

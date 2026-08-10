@@ -90,7 +90,8 @@ ActuatorRole = Literal["light", "heater", "pump", "doser", "outlet"]
 #: ``advisory`` — we send intent. A dropped command is an expected outcome, not
 #: an incident. A safe state cannot be declared because it could not be honoured.
 #: ``observe_only`` — registered for coordination, never written to. The command
-#: path is closed at registration.
+#: path is closed at registration, and a safe state is refused for the same
+#: reason as advisory: nothing could ever apply it.
 ControlAuthority = Literal["authoritative", "advisory", "observe_only"]
 
 #: How the device is reached. Local buses are deterministic; a network is not.
@@ -278,6 +279,27 @@ class ActuatorState(_Message):
     since: AwareDatetime
     latched: bool = False
 
+    #: Whether the device acknowledged the command that produced this level.
+    #:
+    #: ``None`` for an authoritative device, where the question is meaningless:
+    #: the level is verifiable at the electrical layer, so there is nothing to
+    #: acknowledge. Populated by a bridge that speaks to a device over a network
+    #: it does not control, which is the only case where "we asked" and "it
+    #: happened" are different statements.
+    #:
+    #: Required by docs/device-classes.md §4 as a label on advisory telemetry
+    #: series. Added optional rather than required because every producer that
+    #: exists today is authoritative — and because a value here on an
+    #: authoritative series would be noise that still forks the series.
+    command_acked: bool | None = None
+
+    #: Seconds since the last successful exchange with the device.
+    #:
+    #: The number behind "when did we stop knowing". ``None`` for authoritative
+    #: devices for the same reason as above — a local bus exchange either
+    #: happened or the write raised.
+    last_exchange_age_s: float | None = Field(default=None, ge=0.0)
+
 
 class Heartbeat(_Message):
     """Liveness beacon.
@@ -376,10 +398,14 @@ class ActuatorRegistration(_Message):
                     "authoritative devices must declare the full safety triple; "
                     f"missing: {', '.join(missing)}"
                 )
-        elif self.control_authority == "advisory" and self.safe_state is not None:
+        elif self.safe_state is not None:
+            # advisory (§2.2) and observe_only (§2.3) alike. For observe_only the
+            # argument is stronger, not weaker: no command is ever emitted, so
+            # there is no path by which a safe state could be applied at all.
             raise ValueError(
-                "advisory devices must not declare a safe_state: it could not be "
-                "enforced, and a value here is indistinguishable from one that is"
+                f"{self.control_authority} devices must not declare a safe_state: it "
+                "could not be enforced, and a value here is indistinguishable from "
+                "one that is"
             )
         return self
 

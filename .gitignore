@@ -30,3 +30,4 @@ config.local.*
 #
 # Note: this rule does not untrack files already committed. See below.
 artifacts/
+.env.local

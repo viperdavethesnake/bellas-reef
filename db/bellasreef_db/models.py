@@ -164,12 +164,18 @@ class Device(Base):
             """,
             name="authoritative_declares_failure_behaviour",
         ),
-        # §2.2: an advisory device must be unable to declare a safe state, not
-        # merely have one ignored. A stored value is indistinguishable from an
-        # enforced one to everything downstream.
+        # §2.2 and §2.3: a device we cannot command must be unable to declare a
+        # safe state, not merely have one ignored. A stored value is
+        # indistinguishable from an enforced one to everything downstream, and
+        # for observe_only there is no command path by which it could ever be
+        # applied at all.
         CheckConstraint(
-            "control_authority IS DISTINCT FROM 'advisory' OR safe_state IS NULL",
-            name="advisory_declares_no_safe_state",
+            """
+            control_authority IS DISTINCT FROM 'advisory'
+            AND control_authority IS DISTINCT FROM 'observe_only'
+             OR safe_state IS NULL
+            """,
+            name="unenforceable_authority_declares_no_safe_state",
         ),
         # The IS NOT NULL is load-bearing, not redundant. With poll_interval_s
         # NULL, `poll_interval_s > 0` is NULL, `TRUE AND NULL` is NULL, and a

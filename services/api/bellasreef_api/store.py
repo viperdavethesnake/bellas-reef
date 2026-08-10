@@ -209,11 +209,16 @@ class Store:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
 
-    async def control_authority_of(self, device_id: str) -> str | None:
-        """The declared authority of a device, or ``None`` if unknown here.
+    async def control_authority_of(self, device_id: str) -> tuple[bool, str | None]:
+        """``(the hub knows this device, its declared authority)``.
 
-        ``None`` means the hub has no row for it — which is not the same as
-        "no authority", and callers must not treat the two alike.
+        Two different absences, kept apart deliberately. A missing row means the
+        hub has never heard of the device; a present row with a NULL authority
+        means the device is a *sensor*, which carries none by construction
+        (docs/device-classes.md §2 confines the axis to actuators). Collapsing
+        them into one ``None`` made every alert on a probe read as
+        ``control_authority="unknown"`` — which says the lookup failed, when in
+        fact the answer is that the question does not apply.
         """
         async with self._engine.connect() as conn:
             row = (
@@ -222,7 +227,7 @@ class Store:
                     {"device_id": device_id},
                 )
             ).first()
-        return None if row is None else row[0]
+        return (False, None) if row is None else (True, row[0])
 
     async def upsert_sensor(
         self,

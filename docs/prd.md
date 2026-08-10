@@ -140,7 +140,7 @@ Phase 1: single Pi 5-class hub. Five services + message spine, all containerized
 ### P0 — v1 does not ship without these
 
 **Safety framework**
-- R1. Every actuator registration declares: safe state, maximum continuous runtime, and heartbeat timeout. Registration without all three is rejected.
+- R1. Every actuator registration declares a `control_authority`. Registrations with `control_authority: authoritative` must additionally declare safe state, maximum continuous runtime, and heartbeat timeout; registration without all three is rejected. Registrations with `control_authority: advisory` or `observe_only` must not declare a safe state; a declared safe state is rejected rather than ignored, because the system cannot enforce it.
   - *AC:* Given a registered heater outlet, when control-engine heartbeat is absent for the declared timeout, then hardware-io drives the outlet to safe state and emits an audit event. Verified for process kill, container kill, and NATS outage.
 - R2. ATO hard interlock: maximum pump runtime per window enforced in hardware-io (below control logic), independent of sensor state.
   - *AC:* Given a stuck-on ATO sensor reading, when cumulative pump runtime hits the cap, then the pump is forced off, latched, and an alert fires; latch clears only by explicit operator action.

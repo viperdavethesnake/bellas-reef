@@ -94,11 +94,16 @@ services:
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
     # Deliberately NOT published. health + metrics ride the compose network
-    # only: victoria-metrics scrapes http://hardware-io:9101/metrics from
-    # inside. The one container holding /dev should not also own a listening
+    # only. The one container holding /dev should not also own a listening
     # socket on the host. For ad-hoc debugging use
     #   docker compose exec hardware-io python -c "..."
     # rather than making the port permanent.
+    #
+    # NOTE: nothing scrapes this endpoint, by design. Telemetry reaches
+    # VictoriaMetrics through the API's telemetry writer, which records what the
+    # spine published rather than sampling a gauge at scrape cadence — and a
+    # scrape of hardware-io could not describe an advisory device at all, since
+    # hardware-io only emits authoritative ones. See docs/device-classes.md §4.
     expose:
       - "9101"
     # NOTE: Docker does NOT restart a merely *unhealthy* container — this acts
@@ -142,10 +147,14 @@ services:
     depends_on:
       nats: { condition: service_healthy }
       postgres: { condition: service_healthy }
+      victoria-metrics: { condition: service_started }
     user: "1000:1000"
     environment:
       BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
       BELLASREEF_NATS_URL: nats://nats:4222
+      # The telemetry writer lives here: it needs the spine to read and Postgres
+      # to resolve each device's control_authority (docs/device-classes.md §4).
+      BELLASREEF_VM_URL: http://victoria-metrics:8428
     # The ONE service published to the LAN: clients have to reach it. Bound to
     # all interfaces because the WiFi address changes, per the host facts.
     ports:

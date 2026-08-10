@@ -118,6 +118,17 @@ class TestObserveOnly:
         )
         assert made.safe_state is None
 
+    def test_observe_only_with_a_safe_state_is_rejected(self) -> None:
+        """§2.3. Stronger than the advisory case, not weaker: no command is ever
+        emitted, so nothing could ever apply the value."""
+        with pytest.raises(ValidationError, match="must not declare a safe_state"):
+            registration(
+                control_authority="observe_only",
+                failsafe_capable=False,
+                transport="network",
+                safe_state=OFF,
+            )
+
 
 class TestRequiredness:
     @pytest.mark.parametrize("field", ["control_authority", "failsafe_capable", "transport"])

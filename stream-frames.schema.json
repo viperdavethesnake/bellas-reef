@@ -9,10 +9,35 @@
           "title": "Actuator Id",
           "type": "string"
         },
+        "command_acked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command Acked"
+        },
         "emitted_at": {
           "format": "date-time",
           "title": "Emitted At",
           "type": "string"
+        },
+        "last_exchange_age_s": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Exchange Age S"
         },
         "latched": {
           "default": false,

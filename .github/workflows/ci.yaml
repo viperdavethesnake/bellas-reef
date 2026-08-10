@@ -23,6 +23,15 @@ jobs:
     # SQLite or a mock. A test that did not use Postgres would have happily
     # passed the NULL-cadence bug this suite now guards.
     services:
+      # The telemetry writer's read-back test needs a real store: formatting a
+      # correct-looking line and never landing it is the exact failure it exists
+      # to catch. A `services:` container is enough here — unlike NATS, no CMD
+      # arguments are required.
+      victoria-metrics:
+        image: victoriametrics/victoria-metrics:v1.149.0
+        ports:
+          - 8428:8428
+
       postgres:
         image: postgres:17-alpine
         env:
@@ -41,6 +50,7 @@ jobs:
       BELLASREEF_DATABASE_URL: postgresql+asyncpg://bellasreef:bellasreef@localhost:5432/bellasreef
       BELLASREEF_TEST_DATABASE_URL: postgresql+asyncpg://bellasreef:bellasreef@localhost:5432/bellasreef
       BELLASREEF_TEST_NATS_URL: nats://localhost:4222
+      BELLASREEF_TEST_VM_URL: http://localhost:8428
       # Runner clock state is not ours to depend on, and override creation is
       # clock-gated. Explicit rather than whatever timedatectl happens to say.
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"

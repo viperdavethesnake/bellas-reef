@@ -415,15 +415,17 @@ class TestControlAuthority:
             )
         )
 
-    def test_advisory_may_not_carry_a_safe_state(self) -> None:
+    @pytest.mark.parametrize("authority", ["advisory", "observe_only"])
+    def test_an_uncommandable_device_may_not_carry_a_safe_state(self, authority: str) -> None:
         """Rejected, not ignored. A stored safe_state is indistinguishable from
-        an enforced one to every reader of this table."""
-        with pytest.raises(IntegrityError, match="advisory_declares_no_safe_state"):
+        an enforced one to every reader of this table — and for observe_only
+        there is no command path that could ever apply it."""
+        with pytest.raises(IntegrityError, match="unenforceable_authority_declares_no_safe_state"):
             run(
                 lambda: _insert(
                     _device_sql(),
                     **_actuator(
-                        control_authority="advisory",
+                        control_authority=authority,
                         failsafe_capable=False,
                         transport="network",
                         max_runtime_s=None,

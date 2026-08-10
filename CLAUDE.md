@@ -73,7 +73,7 @@ Five services + spine, all containers. Hub-and-spoke ready; phase 1 is single Pi
 - Write API clients by hand (they are generated).
 - Put control logic in the API service or hardware knowledge in the control engine.
 - Use sysfs GPIO, RPi.GPIO, or any deprecated kernel interface.
-- Register an actuator without safe state + max runtime + heartbeat timeout.
+- Register an `authoritative` actuator without safe state + max runtime + heartbeat timeout — or accept a declared safe state on an `advisory` or `observe_only` one. A safe state we cannot enforce must be rejected, never stored and ignored. See `docs/device-classes.md` §2.
 - Invent register maps, pinouts, or library behavior. Verify or ask.
 
 ---

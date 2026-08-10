@@ -7,6 +7,14 @@
 # hides the remaining failures and makes a partial run look like a pass if you
 # read the wrong line of output. That mistake shipped a red build once already.
 #
+# A test skipped for a missing environment FAILS this gate — see conftest.py.
+# The integration suites need Postgres, NATS with JetStream, and
+# VictoriaMetrics; without them "all checks passed" means something narrower
+# than it says, which is how a broken seed reached CI once already. To run
+# anyway, and accept that those tests are not being checked:
+#
+#     BELLASREEF_ALLOW_ENV_SKIPS=1 ./scripts/check.sh
+#
 # Usage:  ./scripts/check.sh            # everything
 #         ./scripts/check.sh --quick    # skip the slow ones
 

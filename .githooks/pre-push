@@ -14,6 +14,19 @@ set -uo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 gate="${repo_root}/scripts/check.sh"
 
+# Integration endpoints live in .env.local, which is gitignored and
+# machine-specific. Sourced here so the gate a developer runs before pushing is
+# the same one CI runs, rather than a narrower one that skips every test needing
+# Postgres, NATS or VictoriaMetrics. Without it those tests skip, and a skip for
+# a missing environment now fails the gate — deliberately, since "passed" would
+# otherwise mean something different on every machine.
+if [[ -f "${repo_root}/.env.local" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${repo_root}/.env.local"
+    set +a
+fi
+
 if [[ ! -x "$gate" ]]; then
     echo "pre-push: ${gate} missing or not executable — refusing to push blind." >&2
     exit 1
@@ -31,5 +44,11 @@ pre-push: BLOCKED — the gate failed.
 
 Fix the failures above, or use `git push --no-verify` if you genuinely intend
 to push a red build (CI will still fail it).
+
+If the failure is skipped integration tests, the gate is telling you it could
+not check them. Put the endpoints in .env.local (see .env.local.example), or
+accept the gap for this push:
+
+    BELLASREEF_ALLOW_ENV_SKIPS=1 git push
 MSG
 exit 1
