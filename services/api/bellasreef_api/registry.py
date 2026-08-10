@@ -14,6 +14,7 @@ happens to be announced next.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import Any
 
@@ -23,6 +24,7 @@ from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
 from nats.js.api import ConsumerConfig, DeliverPolicy
+from nats.js.errors import NotFoundError
 from pydantic import ValidationError
 
 from bellasreef_api.store import Store
@@ -33,13 +35,45 @@ log = get_logger(__name__)
 class RegistryConsumer:
     """Subscribes to registrations and upserts the devices they describe."""
 
+    #: How long to wait between attempts while the stream does not yet exist.
+    RETRY_S = 5.0
+
     def __init__(self, url: str, store: Store) -> None:
         self._url = url
         self._store = store
         self._nc: Client | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        self._nc = await nats.connect(self._url)
+        """Begin subscribing, retrying until the stream exists.
+
+        hardware-io provisions the streams, and nothing orders the two services
+        — under compose either can come up first, and on a bench either gets
+        restarted alone. Subscribing once and giving up meant the API only ever
+        saw registrations if it happened to start second, which is how the
+        devices table stayed empty while hardware-io logged a clean announcement.
+        """
+        self._task = asyncio.create_task(self._subscribe_forever())
+
+    async def _subscribe_forever(self) -> None:
+        while True:
+            try:
+                await self._subscribe()
+                return
+            except asyncio.CancelledError:
+                raise
+            except NotFoundError:
+                log.info(
+                    "registry stream not provisioned yet; waiting",
+                    extra={"retry_in_s": self.RETRY_S},
+                )
+            except Exception:
+                log.exception("registry consumer could not subscribe; retrying")
+            await asyncio.sleep(self.RETRY_S)
+
+    async def _subscribe(self) -> None:
+        if self._nc is None or not self._nc.is_connected:
+            self._nc = await nats.connect(self._url)
         js = self._nc.jetstream()
         # LAST_PER_SUBJECT: replay the current registration for every device,
         # then follow along. A plain subscription would only see hardware that
@@ -53,6 +87,11 @@ class RegistryConsumer:
         log.info("registry consumer subscribed", extra={"subject": subjects.ALL_REGISTRY})
 
     async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
         if self._nc is not None:
             with contextlib.suppress(Exception):
                 await self._nc.close()

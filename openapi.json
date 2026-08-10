@@ -418,6 +418,115 @@
         "title": "DeviceNameView",
         "type": "object"
       },
+      "DeviceView": {
+        "additionalProperties": false,
+        "description": "A registered device, as clients render it.\n\nTyped rather than a bare dict. The endpoints used to return\n``list[dict[str, Any]]``, which generates as an opaque object container in\nSwift and forces the client to reach in by string key \u2014 precisely the\nhand-written binding the generated-client rule exists to prevent.",
+        "properties": {
+          "actuator_class": {
+            "title": "Actuator Class",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "alert_clear_margin": {
+            "title": "Alert Clear Margin",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "alert_max": {
+            "title": "Alert Max",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "alert_min": {
+            "title": "Alert Min",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "driver_id": {
+            "title": "Driver Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "heartbeat_timeout_s": {
+            "title": "Heartbeat Timeout S",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_runtime_s": {
+            "title": "Max Runtime S",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "poll_interval_s": {
+            "title": "Poll Interval S",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "role": {
+            "title": "Role",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "safe_state": {
+            "additionalProperties": true,
+            "title": "Safe State",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "sensor_type": {
+            "title": "Sensor Type",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device_id",
+          "display_name",
+          "kind",
+          "driver_id",
+          "enabled"
+        ],
+        "title": "DeviceView",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1259,8 +1368,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/DeviceView"
                   },
                   "title": "Response Listdevices",
                   "type": "array"
@@ -1955,8 +2063,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/DeviceView"
                   },
                   "title": "Response Listsensors",
                   "type": "array"

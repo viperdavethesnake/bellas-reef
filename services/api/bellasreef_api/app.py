@@ -99,6 +99,44 @@ class Info(BaseModel):
     approvers_available: bool
 
 
+class DeviceView(BaseModel):
+    """A registered device, as clients render it.
+
+    Typed rather than a bare dict. The endpoints used to return
+    ``list[dict[str, Any]]``, which generates as an opaque object container in
+    Swift and forces the client to reach in by string key — precisely the
+    hand-written binding the generated-client rule exists to prevent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    #: ``None`` means the operator has not named it; clients fall back to
+    #: ``device_id``. Never defaulted server-side — see migration 0007.
+    display_name: str | None
+    kind: str
+    driver_id: str
+    enabled: bool
+
+    sensor_type: str | None = None
+    poll_interval_s: float | None = None
+    actuator_class: str | None = None
+    role: str | None = None
+    #: The safety contract, surfaced rather than hidden. A client showing an
+    #: actuator should be able to say what it does when everything fails.
+    safe_state: dict[str, Any] | None = None
+    max_runtime_s: float | None = None
+    heartbeat_timeout_s: float | None = None
+
+    alert_min: float | None = None
+    alert_max: float | None = None
+    alert_clear_margin: float | None = None
+
+    @property
+    def name(self) -> str:
+        return self.display_name or self.device_id
+
+
 class DeviceName(BaseModel):
     """A new display name, or ``null`` to go back to the raw id."""
 
@@ -666,22 +704,24 @@ def build_app(
 
     @app.get(
         "/api/v1/devices",
+        response_model=list[DeviceView],
         tags=["hardware"],
         operation_id="listDevices",
         responses={401: AUTH_401},
     )
-    async def devices(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
+    async def devices(_: Annotated[UUID, Depends(current_client)]) -> list[DeviceView]:
         """Registered hardware. *Devices* are the tank's; clients are people's."""
-        return await store.list_devices()
+        return [DeviceView.model_validate(row) for row in await store.list_devices()]
 
     @app.get(
         "/api/v1/sensors",
+        response_model=list[DeviceView],
         tags=["hardware"],
         operation_id="listSensors",
         responses={401: AUTH_401},
     )
-    async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
-        return await store.list_devices(kind="sensor")
+    async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[DeviceView]:
+        return [DeviceView.model_validate(row) for row in await store.list_devices(kind="sensor")]
 
     @app.patch(
         "/api/v1/devices/{device_id}",
