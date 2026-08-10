@@ -23,12 +23,12 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 17:22 | S4.0 licensing: AGPL-3.0 root, Apache-2.0 contracts, README, CONTRIBUTING (CLA), iOS pointer, SPDX headers (8 Apache / 23 AGPL) | `6f92eb3` | green |
 | 2026-08-09 17:34 | S4.1 migration 0002: audit_log.message_id unique; writer ON CONFLICT DO NOTHING; redelivery test flipped to exactly-once | `16a195a` | green |
 | 2026-08-09 17:34 | Note: verification against docs is not verification against the installed package (nats.jetstream did not exist in nats-py 2.15) | — | — |
-| 2026-08-09 17:58 | S5.1 shared service package extracted (logs/health/liveness) so control-engine need not depend on hardware-io | pending | green |
-| 2026-08-09 17:58 | S5.2 control-engine: skeleton, sole command publisher, lighting scheduler R7, clock-trust gate, NATS integration | pending | green |
-| 2026-08-09 18:02 | S5.3 auth.md reviewed against contracts and committed; 5 conflicts flagged for ruling | pending | n/a |
-| 2026-08-09 18:06 | S5.4 ios-design-brief.md committed; §5 `role` contract change proposed (2.0.0, no dual-publish, exception with expiry) — awaiting approval | pending | n/a |
-| 2026-08-09 18:02 | S6.1 contracts 2.0.0: role required Literal, schema_version->2, pre-release exception documented with first-tag expiry | pending | green |
-| 2026-08-09 18:02 | S6.2 PRD v1.2: auth row + no-local-trust wording amended; clients rename | pending | n/a |
-| 2026-08-09 18:02 | S6.3 migration 0003: paired_clients, signing_keys, pairing_requests, devices.role CHECK | pending | green |
-| 2026-08-09 18:02 | S6.4 _bellasreef._tcp registered on host, verified from the Mac | pending | n/a |
-| 2026-08-09 18:14 | S6.5 api service: /info, /pair TOFU + 202-poll-approve, /token, /clients + revoke, /healthz; 14 lifecycle tests | pending | green |
+| 2026-08-09 17:58 | S5.1 shared service package extracted (logs/health/liveness) so control-engine need not depend on hardware-io | `0015a32` | green |
+| 2026-08-09 17:58 | S5.2 control-engine: skeleton, sole command publisher, lighting scheduler R7, clock-trust gate, NATS integration | `0015a32` | green |
+| 2026-08-09 18:02 | S5.3 auth.md reviewed against contracts and committed; 5 conflicts flagged for ruling | `0015a32` | n/a |
+| 2026-08-09 18:06 | S5.4 ios-design-brief.md committed; §5 `role` contract change proposed (2.0.0, no dual-publish, exception with expiry) — awaiting approval | `0015a32` | n/a |
+| 2026-08-09 18:02 | S6.1 contracts 2.0.0: role required Literal, schema_version->2, pre-release exception documented with first-tag expiry | `0015a32` | green |
+| 2026-08-09 18:02 | S6.2 PRD v1.2: auth row + no-local-trust wording amended; clients rename | `0015a32` | n/a |
+| 2026-08-09 18:02 | S6.3 migration 0003: paired_clients, signing_keys, pairing_requests, devices.role CHECK | `0015a32` | green |
+| 2026-08-09 18:02 | S6.4 _bellasreef._tcp registered on host, verified from the Mac | `0015a32` | n/a |
+| 2026-08-09 18:14 | S6.5 api service: /info, /pair TOFU + 202-poll-approve, /token, /clients + revoke, /healthz; 14 lifecycle tests | `73a454b` | green |
