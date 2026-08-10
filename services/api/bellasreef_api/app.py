@@ -245,6 +245,15 @@ def build_app(
         tags=["pairing"],
         status_code=status.HTTP_200_OK,
         operation_id="pair",
+        response_model=None,
+        # Declared so generated clients can MODEL these outcomes rather than
+        # inspecting raw status codes. An undeclared response forces every
+        # client to hand-roll the branch — the drift G3 exists to prevent.
+        responses={
+            200: {"model": PairGranted, "description": "Paired; credential issued."},
+            202: {"model": PairPending, "description": "Awaiting approval; poll."},
+            403: {"description": "Nobody can approve; run `bellasreef pair`."},
+        },
     )
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
         """Pair a client. Four outcomes, in this order.
@@ -306,7 +315,19 @@ def build_app(
         response.status_code = status.HTTP_202_ACCEPTED
         return PairPending(request_id=request_id, poll_after_s=5, expires_in_s=PAIRING_TTL_S)
 
-    @app.get("/api/v1/pair/{request_id}", tags=["pairing"], operation_id="pollPairing")
+    @app.get(
+        "/api/v1/pair/{request_id}",
+        tags=["pairing"],
+        operation_id="pollPairing",
+        response_model=None,
+        responses={
+            200: {"model": PairGranted, "description": "Approved; credential issued."},
+            202: {"description": "Still pending."},
+            403: {"description": "Denied."},
+            404: {"description": "No such request."},
+            410: {"description": "Expired, or the credential was already collected."},
+        },
+    )
     async def poll_pair(request_id: UUID, response: Response) -> PairGranted | dict[str, str]:
         state, _, _ = await store.pairing_state(request_id)
 
@@ -372,6 +393,7 @@ def build_app(
         response_model=AccessToken,
         tags=["auth"],
         operation_id="mintToken",
+        responses={401: {"description": "Unknown or revoked refresh token."}},
     )
     async def token(body: TokenRequest) -> AccessToken:
         client_id = await store.client_for_refresh_token(body.refresh_token)
@@ -461,6 +483,7 @@ def build_app(
         response_model=OverrideView,
         tags=["overrides"],
         operation_id="createOverride",
+        responses={503: {"description": "Clock not synchronised; deadline would be wrong."}},
     )
     async def create_override(
         body: OverrideRequest, actor: Annotated[UUID, Depends(current_client)]
@@ -501,6 +524,7 @@ def build_app(
         "/api/v1/overrides/{override_id}",
         tags=["overrides"],
         operation_id="releaseOverride",
+        responses={404: {"description": "Unknown or already released."}},
     )
     async def release_override(
         override_id: UUID, actor: Annotated[UUID, Depends(current_client)]
