@@ -23,10 +23,10 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from bellasreef_db import ClockUntrustedError, OverrideStore
+from bellasreef_db import AlertRecord, ClockUntrustedError, OverrideStore, PostgresAlertStore
 from bellasreef_service import configure_logging, get_logger
 from fastapi import (
     Depends,
@@ -38,7 +38,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from bellasreef_api.audit import NatsAuditSink
@@ -58,7 +58,7 @@ log = get_logger(__name__)
 
 SERVICE: Final = "api"
 API_VERSION: Final = "v1"
-CONTRACTS_VERSION: Final = "2.0.0"
+CONTRACTS_VERSION: Final = "2.1.0"
 
 #: Every authenticated route can return 401 via the current_client
 #: dependency. Declared and shared so a client can MODEL "your credential
@@ -85,6 +85,86 @@ class Info(BaseModel):
     contracts_version: str
     paired_client_count: int
     pairing_open: bool
+
+
+class AlertThresholds(BaseModel):
+    """The band a sensor is expected to stay inside (PRD R12).
+
+    All three are nullable together: clearing every field turns alerting off for
+    the device, which is the only way to say "stop watching this" without a
+    separate verb.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum: float | None = None
+    maximum: float | None = None
+    #: How far back inside the band a reading must come before a breach clears.
+    clear_margin: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _mirror_the_database_constraints(self) -> "AlertThresholds":
+        """Reject here what Postgres would reject anyway.
+
+        Not redundant: without this the operator gets a 500 naming a constraint,
+        and with it a 422 naming a field. The database remains the authority —
+        this is the error message, not the enforcement.
+        """
+        if self.minimum is None and self.maximum is None:
+            return self
+        if self.clear_margin is None:
+            raise ValueError("clear_margin is required when a threshold is set")
+        if self.minimum is not None and self.maximum is not None:
+            if self.minimum >= self.maximum:
+                raise ValueError("minimum must be below maximum")
+            if self.minimum + self.clear_margin >= self.maximum - self.clear_margin:
+                raise ValueError(
+                    "clear_margin is wider than half the band, so no reading could clear it"
+                )
+        return self
+
+
+class AlertThresholdsView(AlertThresholds):
+    """Thresholds as stored, with the device they belong to."""
+
+    device_id: str
+
+
+class AlertView(BaseModel):
+    """One alert episode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    device_id: str
+    sensor_type: str
+    bound: Literal["min", "max"]
+    threshold: float
+    clear_margin: float
+    unit: str
+    raised_at: datetime
+    raised_value: float
+    cleared_at: datetime | None
+    cleared_value: float | None
+
+    @property
+    def active(self) -> bool:
+        return self.cleared_at is None
+
+
+class AlertsView(BaseModel):
+    """What is wrong now, and what has been wrong lately.
+
+    Both in one response because a client showing an alerts screen needs both,
+    and two round trips would let them disagree — an episode can clear between
+    the first call and the second, and the UI would show it as simultaneously
+    active and resolved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    active: list[AlertView]
+    recent: list[AlertView]
 
 
 class PairRequest(BaseModel):
@@ -169,6 +249,28 @@ class _PendingTokens:
 # ------------------------------------------------------------------------ app
 
 
+def _alert_view(row: AlertRecord) -> "AlertView":
+    """Widen the store's `bound` string to the literal the API promises.
+
+    The database CHECK already guarantees 'min' or 'max'; this is where the type
+    system is told, once, rather than at every call site.
+    """
+    bound: Literal["min", "max"] = "min" if row.bound == "min" else "max"
+    return AlertView(
+        id=row.id,
+        device_id=row.device_id,
+        sensor_type=row.sensor_type,
+        bound=bound,
+        threshold=row.threshold,
+        clear_margin=row.clear_margin,
+        unit=row.unit,
+        raised_at=row.raised_at,
+        raised_value=row.raised_value,
+        cleared_at=row.cleared_at,
+        cleared_value=row.cleared_value,
+    )
+
+
 def build_app(
     engine: AsyncEngine,
     *,
@@ -179,6 +281,7 @@ def build_app(
 ) -> FastAPI:
     store = Store(engine)
     overrides = OverrideStore(engine, clock_trusted=clock_trusted)
+    alerts = PostgresAlertStore(engine)
     bridge = StreamBridge(nats_url, overrides) if nats_url else None
     sink: AuditSink = audit or _noop_audit
     pending = _PendingTokens(tokens={})
@@ -492,6 +595,103 @@ def build_app(
     )
     async def sensors(_: Annotated[UUID, Depends(current_client)]) -> list[dict[str, Any]]:
         return await store.list_devices(kind="sensor")
+
+    # ------------------------------------------------------------- alerts
+
+    @app.get(
+        "/api/v1/devices/{device_id}/thresholds",
+        response_model=AlertThresholdsView,
+        tags=["alerts"],
+        operation_id="getThresholds",
+        responses={401: AUTH_401, 404: {"description": "No such device."}},
+    )
+    async def get_thresholds(
+        device_id: str, _: Annotated[UUID, Depends(current_client)]
+    ) -> AlertThresholdsView:
+        row = await store.thresholds_for(device_id)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+        return AlertThresholdsView(
+            device_id=row["device_id"],
+            minimum=row["alert_min"],
+            maximum=row["alert_max"],
+            clear_margin=row["alert_clear_margin"],
+        )
+
+    @app.put(
+        "/api/v1/devices/{device_id}/thresholds",
+        response_model=AlertThresholdsView,
+        tags=["alerts"],
+        operation_id="setThresholds",
+        responses={
+            401: AUTH_401,
+            404: {"description": "No such device."},
+            409: {"description": "Thresholds are a sensor concept."},
+        },
+    )
+    async def put_thresholds(
+        device_id: str,
+        body: AlertThresholds,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> AlertThresholdsView:
+        """Set or clear the band. The engine picks up the change within seconds.
+
+        A PUT rather than a PATCH: the band is one setting with interdependent
+        parts, and a partial update would let a client raise the minimum above
+        the maximum in two legal-looking requests.
+        """
+        existing = await store.thresholds_for(device_id)
+        if existing is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+        if existing["kind"] != "sensor" and (body.minimum is not None or body.maximum is not None):
+            raise HTTPException(status.HTTP_409_CONFLICT, "thresholds can only be set on a sensor")
+
+        row = await store.set_thresholds(
+            device_id,
+            minimum=body.minimum,
+            maximum=body.maximum,
+            clear_margin=body.clear_margin,
+        )
+        if row is None:  # pragma: no cover - the row existed a statement ago
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
+
+        await sink(
+            "thresholds.set",
+            {
+                "device_id": device_id,
+                "minimum": body.minimum,
+                "maximum": body.maximum,
+                "clear_margin": body.clear_margin,
+            },
+        )
+        return AlertThresholdsView(
+            device_id=row["device_id"],
+            minimum=row["alert_min"],
+            maximum=row["alert_max"],
+            clear_margin=row["alert_clear_margin"],
+        )
+
+    @app.get(
+        "/api/v1/alerts",
+        response_model=AlertsView,
+        tags=["alerts"],
+        operation_id="listAlerts",
+        responses={401: AUTH_401},
+    )
+    async def list_alerts(
+        _: Annotated[UUID, Depends(current_client)],
+        limit: int = 50,
+    ) -> AlertsView:
+        """What is wrong now, and what has been wrong lately.
+
+        This is also the reconnect path. Alerts are published on core pub/sub
+        with no replay, so a client that was asleep during a breach learns about
+        it here rather than from the stream.
+        """
+        return AlertsView(
+            active=[_alert_view(row) for row in await alerts.active()],
+            recent=[_alert_view(row) for row in await alerts.recent(limit=limit)],
+        )
 
     # ---------------------------------------------------------- overrides
 

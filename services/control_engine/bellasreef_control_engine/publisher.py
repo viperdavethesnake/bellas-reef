@@ -18,14 +18,24 @@ possible in one place instead of many:
 
 from __future__ import annotations
 
+import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import nats
-from bellasreef_contracts import ActuatorCommand, PwmLevel, subjects
+from bellasreef_contracts import (
+    ActuatorCommand,
+    PwmLevel,
+    SensorAlert,
+    SensorReading,
+    subjects,
+)
 from bellasreef_service import get_logger
 from nats.aio.client import Client
+from nats.aio.msg import Msg
 from nats.js import JetStreamContext
+from pydantic import ValidationError
 
 __all__ = ["DEFAULT_COMMAND_TTL_S", "CommandPublisher"]
 
@@ -114,6 +124,57 @@ class CommandPublisher:
                 "expires_at": command.expires_at.isoformat(),
             },
         )
+
+    async def publish_alert(self, subject: str, alert: SensorAlert) -> None:
+        """Alerts go out on core pub/sub, not JetStream.
+
+        Same reasoning as telemetry: an alert describes the tank *now*. A
+        durable queue would hand a client that was offline overnight a backlog
+        of breaches that have long since cleared, and the audit log — which is
+        durable — is where the history actually belongs.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+        await self._nc.publish(subject, alert.model_dump_json().encode())
+
+    async def publish_audit(self, category: str, event: dict[str, object]) -> None:
+        """Durable audit event, deduped on the same id in the header and payload."""
+        if self._js is None:
+            raise RuntimeError("publisher not connected")
+        message_id = event.get("message_id") or str(uuid4())
+        payload = {**event, "message_id": str(message_id)}
+        await self._js.publish(
+            subjects.audit(category),
+            json.dumps(payload).encode(),
+            headers={"Nats-Msg-Id": str(message_id)},
+        )
+
+    async def subscribe_sensors(self, handler: Callable[[SensorReading], Awaitable[None]]) -> None:
+        """Feed every sensor reading to ``handler``.
+
+        A malformed payload is logged and dropped rather than raised: this
+        callback runs on the NATS client's own task, and letting an exception
+        escape it kills the subscription silently — the engine would keep
+        running, keep reporting healthy, and never evaluate another threshold.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+
+        async def _on_message(msg: Msg) -> None:
+            try:
+                reading = SensorReading.model_validate_json(msg.data)
+            except ValidationError:
+                log.warning(
+                    "dropping an undecodable sensor reading", extra={"subject": msg.subject}
+                )
+                return
+            try:
+                await handler(reading)
+            except Exception:  # broad by design - see docstring
+                log.exception("alert evaluation failed", extra={"subject": msg.subject})
+
+        await self._nc.subscribe(subjects.ALL_SENSORS, cb=_on_message)
+        log.info("subscribed to sensor telemetry", extra={"subject": subjects.ALL_SENSORS})
 
     async def heartbeat(self, interval_s: float) -> None:
         """Core pub/sub, never JetStream.

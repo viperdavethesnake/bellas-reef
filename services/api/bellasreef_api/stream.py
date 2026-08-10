@@ -29,14 +29,14 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import nats
-from bellasreef_contracts import ActuatorState, SensorReading, subjects
+from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading, subjects
 from bellasreef_db import OverrideStore
 from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
 from pydantic import ValidationError
 
-from bellasreef_api.frames import OverrideContext, SensorFrame, StateFrame
+from bellasreef_api.frames import AlertFrame, OverrideContext, SensorFrame, StateFrame
 
 __all__ = ["AUTH_TIMEOUT_S", "StreamBridge"]
 
@@ -67,6 +67,7 @@ class StreamBridge:
             self._nc = await nats.connect(self._url)
             await self._nc.subscribe(subjects.ALL_STATE, cb=self._on_message)
             await self._nc.subscribe(subjects.ALL_SENSORS, cb=self._on_message)
+            await self._nc.subscribe(subjects.ALL_ALERTS, cb=self._on_message)
             log.info("stream bridge subscribed", extra={"url": self._url})
 
     async def _on_message(self, msg: Msg) -> None:
@@ -81,11 +82,17 @@ class StreamBridge:
         try:
             if msg.subject.startswith(f"{subjects.ROOT}.state."):
                 state = ActuatorState.model_validate_json(msg.data)
-                frame: StateFrame | SensorFrame = StateFrame(
+                frame: StateFrame | SensorFrame | AlertFrame = StateFrame(
                     received_at=received_at,
                     subject=msg.subject,
                     payload=state,
                     override=await self._override_for(state.actuator_id),
+                )
+            elif msg.subject.startswith(f"{subjects.ROOT}.alert."):
+                frame = AlertFrame(
+                    received_at=received_at,
+                    subject=msg.subject,
+                    payload=SensorAlert.model_validate_json(msg.data),
                 )
             else:
                 frame = SensorFrame(

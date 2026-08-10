@@ -18,6 +18,7 @@ from typing import Final
 __all__ = [
     "ROOT",
     "SubjectError",
+    "alert",
     "audit",
     "cmd",
     "heartbeat",
@@ -59,6 +60,18 @@ def sensor(sensor_type: str, sensor_id: str) -> str:
     validate_token(sensor_type, field="sensor_type")
     validate_token(sensor_id, field="sensor_id")
     return f"{ROOT}.sensor.{sensor_type}.{sensor_id}"
+
+
+def alert(device_id: str) -> str:
+    """A threshold breach or clear for one device.
+
+    Core pub/sub, like sensor telemetry: an alert is a statement about *now*,
+    and a consumer that reconnects to a queue of hours-old breaches would raise
+    alarms about a tank that has long since recovered. Durability is the audit
+    log's job, and that is written from the same event.
+    """
+    validate_token(device_id, field="device_id")
+    return f"{ROOT}.alert.{device_id}"
 
 
 def cmd(actuator_class: str, actuator_id: str) -> str:
@@ -109,6 +122,7 @@ def parse_device_id(subject: str) -> str:
 
 
 # Wildcard subscriptions. Consumers filter with these; they are contract too.
+ALL_ALERTS: Final = f"{ROOT}.alert.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"
 ALL_COMMANDS: Final = f"{ROOT}.cmd.>"
 ALL_STATE: Final = f"{ROOT}.state.>"

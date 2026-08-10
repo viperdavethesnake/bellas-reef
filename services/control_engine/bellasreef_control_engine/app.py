@@ -30,6 +30,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
+from bellasreef_contracts import SensorReading
+from bellasreef_db.alerts import PostgresAlertStore
 from bellasreef_db.overrides import ActiveOverride, OverrideStore
 from bellasreef_service import (
     Health,
@@ -44,6 +46,7 @@ from bellasreef_service import (
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from bellasreef_control_engine.alerts import AlertSupervisor, Thresholds
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import Intent, LightingScheduler
@@ -81,6 +84,12 @@ class _Metrics:
             "1 when the host clock is NTP-synchronised",
             registry=registry,
         )
+        self.alerts = Counter(
+            "bellasreef_alerts_total",
+            "Threshold alert transitions",
+            ["device_id", "bound", "state"],
+            registry=registry,
+        )
         self.commands = Counter(
             "bellasreef_commands_published_total",
             "Commands published by reason",
@@ -112,6 +121,8 @@ class ControlEngine:
         metrics_port: int = 9102,
         max_duty_delta_per_s: float | None = None,
         override_store: OverrideStore | None = None,
+        alert_store: PostgresAlertStore | None = None,
+        threshold_refresh_s: float = 30.0,
     ) -> None:
         self.registry = CollectorRegistry()
         self.metrics = _Metrics(self.registry)
@@ -125,6 +136,12 @@ class ControlEngine:
         self._liveness_timeout_s = liveness_timeout_s
         self._clock_trusted = clock_is_trusted()
         self._clock_was_trusted = self._clock_trusted
+
+        self.alerts: AlertSupervisor | None = None
+        self._alert_store = alert_store
+        self._thresholds: dict[str, Thresholds] = {}
+        self._threshold_refresh_s = threshold_refresh_s
+        self._thresholds_read_at = 0.0
 
         self.notifier = SdNotifier()
         self.liveness = LivenessGuard(timeout_s=liveness_timeout_s)
@@ -146,6 +163,7 @@ class ControlEngine:
             await self.publisher.connect()
 
         await self._rearm_overrides()
+        await self._start_alerting()
 
         await self.httpd.start()
         self.liveness.start()
@@ -190,6 +208,85 @@ class ControlEngine:
                 await asyncio.wait_for(self._stopping.wait(), timeout=self._loop_interval_s)
             except TimeoutError:
                 pass
+
+    # -------------------------------------------------------------- alerting
+
+    async def _start_alerting(self) -> None:
+        """Bring up threshold evaluation, if both halves are present.
+
+        Needs a database (to know the bands and to record episodes) and a spine
+        (to hear readings and announce breaches). With either missing the engine
+        still schedules lighting — alerting is additive, and a controller that
+        refuses to dim the lights because it cannot alert would be trading a
+        working feature for a broken one.
+        """
+        if self._alert_store is None or self.publisher is None:
+            log.info(
+                "threshold alerting disabled",
+                extra={
+                    "has_store": self._alert_store is not None,
+                    "has_spine": self.publisher is not None,
+                },
+            )
+            return
+
+        publisher = self.publisher
+        self.alerts = AlertSupervisor(self._alert_store, publisher.publish_alert)
+        await self.alerts.prime()
+        await self._refresh_thresholds(force=True)
+        await publisher.subscribe_sensors(self._on_reading)
+
+    async def _refresh_thresholds(self, *, force: bool = False) -> None:
+        """Re-read the bands periodically rather than per reading.
+
+        Thresholds are edited by a human through the API, so seconds of lag is
+        irrelevant; a database round trip on every sample from every probe is
+        not. Polling rather than a change feed because the alternative is a
+        second NATS subject whose only subscriber is this cache.
+        """
+        if self._alert_store is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._thresholds_read_at < self._threshold_refresh_s:
+            return
+        self._thresholds_read_at = now
+
+        bands: dict[str, Thresholds] = {}
+        for device_id, (low, high, margin) in (await self._alert_store.thresholds()).items():
+            try:
+                bands[device_id] = Thresholds(minimum=low, maximum=high, clear_margin=margin)
+            except ValueError:
+                # The CHECK constraints make this unreachable from the API, but
+                # a hand-edited row must not take the evaluator down with it.
+                log.exception("ignoring unusable thresholds", extra={"device_id": device_id})
+        self._thresholds = bands
+
+    async def _on_reading(self, reading: SensorReading) -> None:
+        if self.alerts is None:
+            return
+        await self._refresh_thresholds()
+        thresholds = self._thresholds.get(reading.sensor_id)
+        if thresholds is None:
+            return
+
+        published = await self.alerts.on_reading(reading, thresholds)
+        for alert in published:
+            self.metrics.alerts.labels(alert.device_id, alert.bound, alert.state).inc()
+            if self.publisher is not None:
+                await self.publisher.publish_audit(
+                    "alert",
+                    {
+                        "message_id": str(alert.message_id),
+                        "event": f"alert.{alert.state}",
+                        "device_id": alert.device_id,
+                        "bound": alert.bound,
+                        "value": alert.value,
+                        "threshold": alert.threshold,
+                        "clear_margin": alert.clear_margin,
+                        "unit": alert.unit,
+                        "emitted_at": alert.emitted_at.isoformat(),
+                    },
+                )
 
     async def _rearm_overrides(self) -> None:
         """Lapse-on-wake, then re-arm what is still owed.
@@ -304,6 +401,9 @@ async def _amain() -> int:
 
     slew_raw = os.environ.get("BELLASREEF_MAX_DUTY_DELTA_PER_S")
     dsn = os.environ.get("BELLASREEF_DATABASE_URL")
+    # One engine, two stores. Building two would open two connection pools to
+    # the same database for no reason.
+    db = create_async_engine(dsn, future=True) if dsn else None
 
     engine = ControlEngine(
         profiles,
@@ -311,7 +411,8 @@ async def _amain() -> int:
         liveness_timeout_s=float(os.environ.get("BELLASREEF_LIVENESS_TIMEOUT_S", "15")),
         metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9102")),
         max_duty_delta_per_s=float(slew_raw) if slew_raw else None,
-        override_store=OverrideStore(create_async_engine(dsn, future=True)) if dsn else None,
+        override_store=OverrideStore(db) if db is not None else None,
+        alert_store=PostgresAlertStore(db) if db is not None else None,
     )
 
     loop = asyncio.get_running_loop()

@@ -34,10 +34,13 @@ __all__ = [
     "ActuatorRegistration",
     "ActuatorRole",
     "ActuatorState",
+    "AlertBound",
+    "AlertState",
     "BinaryLevel",
     "DeviceId",
     "Heartbeat",
     "PwmLevel",
+    "SensorAlert",
     "SensorReading",
     "StateReason",
 ]
@@ -142,6 +145,61 @@ class SensorReading(_Message):
     def _value_required_when_ok(self) -> Self:
         if self.quality == "ok" and self.value is None:
             raise ValueError("quality='ok' requires a value; use 'fault' to report a failed read")
+        return self
+
+
+AlertState = Literal["breach", "clear"]
+
+#: Which side of the band was crossed. Carried explicitly rather than inferred
+#: from ``value`` vs ``threshold``, because on a *clear* the value is by
+#: definition back inside the band and the comparison no longer identifies it.
+AlertBound = Literal["min", "max"]
+
+
+class SensorAlert(_Message):
+    """A sensor reading crossed a configured threshold, or came back inside it.
+
+    Published on ``bellasreef.alert.<device_id>``. One alert describes one bound
+    on one sensor: a probe with both a min and a max can be in breach of either
+    independently, and collapsing them would make "the tank is too cold" and
+    "the tank is too hot" indistinguishable to a client.
+
+    ``clear_margin`` travels with the event because the clear threshold is not
+    derivable from the breach one without it, and a client that wants to explain
+    *why* a reading of 25.4 has not yet cleared a max of 25.0 needs the margin to
+    say so.
+    """
+
+    device_id: DeviceId
+    sensor_type: DeviceId
+    state: AlertState
+    bound: AlertBound
+    #: The reading that triggered this transition. Never ``None``: a faulted read
+    #: does not evaluate thresholds at all, so an alert always has a number
+    #: behind it.
+    value: float
+    threshold: float
+    clear_margin: float = Field(gt=0)
+    unit: str = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _breach_is_actually_outside_the_band(self) -> Self:
+        """A breach must be on the far side of its own threshold.
+
+        This catches an evaluator that has its comparison inverted — the kind of
+        bug that reports "too cold" while the heater is cooking the tank, and
+        which no amount of downstream rendering can detect.
+        """
+        if self.state != "breach":
+            return self
+        if self.bound == "min" and self.value >= self.threshold:
+            raise ValueError(
+                f"min breach requires value < threshold ({self.value} >= {self.threshold})"
+            )
+        if self.bound == "max" and self.value <= self.threshold:
+            raise ValueError(
+                f"max breach requires value > threshold ({self.value} <= {self.threshold})"
+            )
         return self
 
 

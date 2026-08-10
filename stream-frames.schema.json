@@ -1,0 +1,523 @@
+{
+  "$defs": {
+    "ActuatorState": {
+      "additionalProperties": false,
+      "description": "Last-known state of one actuator, published after every transition.",
+      "properties": {
+        "actuator_id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Actuator Id",
+          "type": "string"
+        },
+        "emitted_at": {
+          "format": "date-time",
+          "title": "Emitted At",
+          "type": "string"
+        },
+        "latched": {
+          "default": false,
+          "title": "Latched",
+          "type": "boolean"
+        },
+        "level": {
+          "discriminator": {
+            "mapping": {
+              "binary": "#/$defs/BinaryLevel",
+              "pwm": "#/$defs/PwmLevel"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/BinaryLevel"
+            },
+            {
+              "$ref": "#/$defs/PwmLevel"
+            }
+          ],
+          "title": "Level"
+        },
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "commanded",
+            "safe_state",
+            "interlock_latch",
+            "manual_override",
+            "startup"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "since": {
+          "format": "date-time",
+          "title": "Since",
+          "type": "string"
+        },
+        "source": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "emitted_at",
+        "source",
+        "actuator_id",
+        "level",
+        "reason",
+        "since"
+      ],
+      "title": "ActuatorState",
+      "type": "object"
+    },
+    "AlertFrame": {
+      "additionalProperties": false,
+      "description": "A threshold breach or clear, forwarded unchanged (PRD R12).\n\nA *new frame kind* rather than a field on the sensor frame. Adding a field\nto `SensorFrame` would be a MAJOR contract change under the `extra=\"forbid\"`\nrule and would put alert state on every sample; a separate kind is additive\nand fires only on transitions.\n\nClients must treat an unrecognised ``kind`` as skippable rather than fatal.\nOn the spine, loud rejection of an unknown message is right \u2014 a misread dose\nis dangerous. On this stream it is not: refusing to render a temperature\nbecause the hub also sent a frame type this build predates is a worse\noutcome than ignoring it.",
+      "properties": {
+        "frame_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Frame Version",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "alert",
+          "default": "alert",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SensorAlert"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "received_at",
+        "subject",
+        "payload"
+      ],
+      "title": "AlertFrame",
+      "type": "object"
+    },
+    "BinaryLevel": {
+      "additionalProperties": false,
+      "description": "An on/off actuator level \u2014 relays, outlets, solenoids.",
+      "properties": {
+        "kind": {
+          "const": "binary",
+          "default": "binary",
+          "title": "Kind",
+          "type": "string"
+        },
+        "on": {
+          "title": "On",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "on"
+      ],
+      "title": "BinaryLevel",
+      "type": "object"
+    },
+    "OverrideContext": {
+      "additionalProperties": false,
+      "description": "The active manual hold on an actuator, if any.\n\nCarried on every state frame because the time-and-scheduling contract\nrequires override state to be loudly visible: a client showing a channel at\n0% must be able to say whether that is the schedule or a hold, and when the\nhold ends.",
+      "properties": {
+        "duty": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Duty",
+          "type": "number"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "expires_in_s": {
+          "minimum": 0.0,
+          "title": "Expires In S",
+          "type": "number"
+        },
+        "id": {
+          "format": "uuid",
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "duty",
+        "expires_at",
+        "expires_in_s"
+      ],
+      "title": "OverrideContext",
+      "type": "object"
+    },
+    "PwmLevel": {
+      "additionalProperties": false,
+      "description": "A proportional level, normalised 0.0\u20131.0 \u2014 LED channels, variable pumps.\n\nNormalised deliberately: the contract must not leak a driver's native\nresolution (PCA9685 is 12-bit) to the control engine.",
+      "properties": {
+        "duty": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Duty",
+          "type": "number"
+        },
+        "kind": {
+          "const": "pwm",
+          "default": "pwm",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "duty"
+      ],
+      "title": "PwmLevel",
+      "type": "object"
+    },
+    "ReadyFrame": {
+      "additionalProperties": false,
+      "description": "Sent once, after the socket authenticates. Nothing precedes it.",
+      "properties": {
+        "client_id": {
+          "format": "uuid",
+          "title": "Client Id",
+          "type": "string"
+        },
+        "frame_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Frame Version",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "ready",
+          "default": "ready",
+          "title": "Kind",
+          "type": "string"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "received_at",
+        "client_id"
+      ],
+      "title": "ReadyFrame",
+      "type": "object"
+    },
+    "SensorAlert": {
+      "additionalProperties": false,
+      "description": "A sensor reading crossed a configured threshold, or came back inside it.\n\nPublished on ``bellasreef.alert.<device_id>``. One alert describes one bound\non one sensor: a probe with both a min and a max can be in breach of either\nindependently, and collapsing them would make \"the tank is too cold\" and\n\"the tank is too hot\" indistinguishable to a client.\n\n``clear_margin`` travels with the event because the clear threshold is not\nderivable from the breach one without it, and a client that wants to explain\n*why* a reading of 25.4 has not yet cleared a max of 25.0 needs the margin to\nsay so.",
+      "properties": {
+        "bound": {
+          "enum": [
+            "min",
+            "max"
+          ],
+          "title": "Bound",
+          "type": "string"
+        },
+        "clear_margin": {
+          "exclusiveMinimum": 0,
+          "title": "Clear Margin",
+          "type": "number"
+        },
+        "device_id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Device Id",
+          "type": "string"
+        },
+        "emitted_at": {
+          "format": "date-time",
+          "title": "Emitted At",
+          "type": "string"
+        },
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sensor_type": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Sensor Type",
+          "type": "string"
+        },
+        "source": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "breach",
+            "clear"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "threshold": {
+          "title": "Threshold",
+          "type": "number"
+        },
+        "unit": {
+          "maxLength": 16,
+          "minLength": 1,
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "message_id",
+        "emitted_at",
+        "source",
+        "device_id",
+        "sensor_type",
+        "state",
+        "bound",
+        "value",
+        "threshold",
+        "clear_margin",
+        "unit"
+      ],
+      "title": "SensorAlert",
+      "type": "object"
+    },
+    "SensorFrame": {
+      "additionalProperties": false,
+      "description": "A sensor reading, forwarded unchanged.",
+      "properties": {
+        "frame_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Frame Version",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "sensor",
+          "default": "sensor",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SensorReading"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "received_at",
+        "subject",
+        "payload"
+      ],
+      "title": "SensorFrame",
+      "type": "object"
+    },
+    "SensorReading": {
+      "additionalProperties": false,
+      "description": "One sample from one sensor.\n\nPublished on ``bellasreef.sensor.<type>.<id>`` as core pub/sub. History\nlives in VictoriaMetrics, so these are deliberately not persisted on the\nspine.",
+      "properties": {
+        "calibration_id": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calibration Id"
+        },
+        "emitted_at": {
+          "format": "date-time",
+          "title": "Emitted At",
+          "type": "string"
+        },
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "quality": {
+          "default": "ok",
+          "enum": [
+            "ok",
+            "stale",
+            "fault"
+          ],
+          "title": "Quality",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sensor_id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Sensor Id",
+          "type": "string"
+        },
+        "sensor_type": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Sensor Type",
+          "type": "string"
+        },
+        "source": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "unit": {
+          "maxLength": 16,
+          "minLength": 1,
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "message_id",
+        "emitted_at",
+        "source",
+        "sensor_id",
+        "sensor_type",
+        "value",
+        "unit"
+      ],
+      "title": "SensorReading",
+      "type": "object"
+    },
+    "StateFrame": {
+      "additionalProperties": false,
+      "description": "An actuator state, plus the override context the spine cannot supply.",
+      "properties": {
+        "frame_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Frame Version",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "state",
+          "default": "state",
+          "title": "Kind",
+          "type": "string"
+        },
+        "override": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OverrideContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "payload": {
+          "$ref": "#/$defs/ActuatorState"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "received_at",
+        "subject",
+        "payload"
+      ],
+      "title": "StateFrame",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Frames delivered over the /api/v1/stream WebSocket. Generate client types from this; do not hand-write frame structs.",
+  "discriminator": {
+    "mapping": {
+      "alert": "#/$defs/AlertFrame",
+      "ready": "#/$defs/ReadyFrame",
+      "sensor": "#/$defs/SensorFrame",
+      "state": "#/$defs/StateFrame"
+    },
+    "propertyName": "kind"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/ReadyFrame"
+    },
+    {
+      "$ref": "#/$defs/StateFrame"
+    },
+    {
+      "$ref": "#/$defs/SensorFrame"
+    },
+    {
+      "$ref": "#/$defs/AlertFrame"
+    }
+  ],
+  "title": "Bella's Reef stream frames",
+  "x-frame-schema-version": 1
+}

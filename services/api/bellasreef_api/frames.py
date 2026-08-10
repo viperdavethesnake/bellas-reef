@@ -23,11 +23,12 @@ from datetime import datetime
 from typing import Annotated, Final, Literal
 from uuid import UUID
 
-from bellasreef_contracts import ActuatorState, SensorReading
+from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 __all__ = [
     "FRAME_SCHEMA_VERSION",
+    "AlertFrame",
     "AnyFrame",
     "OverrideContext",
     "ReadyFrame",
@@ -90,9 +91,31 @@ class SensorFrame(_Frame):
     payload: SensorReading
 
 
-AnyFrame = Annotated[ReadyFrame | StateFrame | SensorFrame, Field(discriminator="kind")]
+class AlertFrame(_Frame):
+    """A threshold breach or clear, forwarded unchanged (PRD R12).
 
-_ADAPTER: TypeAdapter[ReadyFrame | StateFrame | SensorFrame] = TypeAdapter(AnyFrame)
+    A *new frame kind* rather than a field on the sensor frame. Adding a field
+    to `SensorFrame` would be a MAJOR contract change under the `extra="forbid"`
+    rule and would put alert state on every sample; a separate kind is additive
+    and fires only on transitions.
+
+    Clients must treat an unrecognised ``kind`` as skippable rather than fatal.
+    On the spine, loud rejection of an unknown message is right — a misread dose
+    is dangerous. On this stream it is not: refusing to render a temperature
+    because the hub also sent a frame type this build predates is a worse
+    outcome than ignoring it.
+    """
+
+    kind: Literal["alert"] = "alert"
+    subject: str
+    payload: SensorAlert
+
+
+AnyFrame = Annotated[
+    ReadyFrame | StateFrame | SensorFrame | AlertFrame, Field(discriminator="kind")
+]
+
+_ADAPTER: TypeAdapter[ReadyFrame | StateFrame | SensorFrame | AlertFrame] = TypeAdapter(AnyFrame)
 
 
 def frame_json_schema(ref_template: str = "#/$defs/{model}") -> dict[str, object]:

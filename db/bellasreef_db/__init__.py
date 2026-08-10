@@ -2,11 +2,22 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """Bella's Reef PostgreSQL schema."""
 
-from bellasreef_db.models import AuditLog, Base, CalibrationRecord, Device, DosingTransaction
+from bellasreef_db.alerts import AlertRecord, AlertStoreError, PostgresAlertStore
+from bellasreef_db.models import (
+    AlertEpisode,
+    AuditLog,
+    Base,
+    CalibrationRecord,
+    Device,
+    DosingTransaction,
+)
 from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore
 
 __all__ = [
     "ActiveOverride",
+    "AlertEpisode",
+    "AlertRecord",
+    "AlertStoreError",
     "AuditLog",
     "Base",
     "CalibrationRecord",
@@ -14,4 +25,5 @@ __all__ = [
     "Device",
     "DosingTransaction",
     "OverrideStore",
+    "PostgresAlertStore",
 ]

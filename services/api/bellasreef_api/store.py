@@ -207,6 +207,61 @@ class Store:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [dict(r) for r in rows]
 
+    async def thresholds_for(self, device_id: str) -> dict[str, Any] | None:
+        """Alert configuration for one sensor, or ``None`` if no such device."""
+        async with self._engine.connect() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT device_id, kind, alert_min, alert_max, alert_clear_margin "
+                            "FROM devices WHERE device_id = :device_id"
+                        ),
+                        {"device_id": device_id},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
+
+    async def set_thresholds(
+        self,
+        device_id: str,
+        *,
+        minimum: float | None,
+        maximum: float | None,
+        clear_margin: float | None,
+    ) -> dict[str, Any] | None:
+        """Write the band. Returns the stored row, or ``None`` for an unknown device.
+
+        The CHECK constraints are the real validator. The API mirrors them so a
+        bad request gets a 422 with a field name rather than a 500 with a
+        constraint name, but the database is what makes them true — a future
+        writer that is not this endpoint cannot bypass them.
+        """
+        async with self._engine.begin() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE devices SET alert_min = :minimum, alert_max = :maximum, "
+                            "alert_clear_margin = :margin WHERE device_id = :device_id "
+                            "RETURNING device_id, kind, alert_min, alert_max, alert_clear_margin"
+                        ),
+                        {
+                            "device_id": device_id,
+                            "minimum": minimum,
+                            "maximum": maximum,
+                            "margin": clear_margin,
+                        },
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row is not None else None
+
     # ------------------------------------------------------- recovery window
 
     async def open_pairing_window(

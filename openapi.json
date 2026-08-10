@@ -1,0 +1,1891 @@
+{
+  "components": {
+    "schemas": {
+      "AccessToken": {
+        "additionalProperties": false,
+        "properties": {
+          "access_token": {
+            "title": "Access Token",
+            "type": "string"
+          },
+          "expires_in": {
+            "title": "Expires In",
+            "type": "integer"
+          },
+          "token_type": {
+            "default": "Bearer",
+            "title": "Token Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_token",
+          "expires_in"
+        ],
+        "title": "AccessToken",
+        "type": "object"
+      },
+      "ActuatorState": {
+        "additionalProperties": false,
+        "description": "Last-known state of one actuator, published after every transition.",
+        "properties": {
+          "actuator_id": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Actuator Id",
+            "type": "string"
+          },
+          "emitted_at": {
+            "format": "date-time",
+            "title": "Emitted At",
+            "type": "string"
+          },
+          "latched": {
+            "default": false,
+            "title": "Latched",
+            "type": "boolean"
+          },
+          "level": {
+            "discriminator": {
+              "mapping": {
+                "binary": "#/components/schemas/BinaryLevel",
+                "pwm": "#/components/schemas/PwmLevel"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BinaryLevel"
+              },
+              {
+                "$ref": "#/components/schemas/PwmLevel"
+              }
+            ],
+            "title": "Level"
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "commanded",
+              "safe_state",
+              "interlock_latch",
+              "manual_override",
+              "startup"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "since": {
+            "format": "date-time",
+            "title": "Since",
+            "type": "string"
+          },
+          "source": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id",
+          "emitted_at",
+          "source",
+          "actuator_id",
+          "level",
+          "reason",
+          "since"
+        ],
+        "title": "ActuatorState",
+        "type": "object"
+      },
+      "AlertFrame": {
+        "additionalProperties": false,
+        "description": "A threshold breach or clear, forwarded unchanged (PRD R12).\n\nA *new frame kind* rather than a field on the sensor frame. Adding a field\nto `SensorFrame` would be a MAJOR contract change under the `extra=\"forbid\"`\nrule and would put alert state on every sample; a separate kind is additive\nand fires only on transitions.\n\nClients must treat an unrecognised ``kind`` as skippable rather than fatal.\nOn the spine, loud rejection of an unknown message is right \u2014 a misread dose\nis dangerous. On this stream it is not: refusing to render a temperature\nbecause the hub also sent a frame type this build predates is a worse\noutcome than ignoring it.",
+        "properties": {
+          "frame_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Frame Version",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "alert",
+            "default": "alert",
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SensorAlert"
+          },
+          "received_at": {
+            "format": "date-time",
+            "title": "Received At",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "received_at",
+          "subject",
+          "payload"
+        ],
+        "title": "AlertFrame",
+        "type": "object"
+      },
+      "AlertThresholds": {
+        "additionalProperties": false,
+        "description": "The band a sensor is expected to stay inside (PRD R12).\n\nAll three are nullable together: clearing every field turns alerting off for\nthe device, which is the only way to say \"stop watching this\" without a\nseparate verb.",
+        "properties": {
+          "clear_margin": {
+            "exclusiveMinimum": 0.0,
+            "title": "Clear Margin",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "maximum": {
+            "title": "Maximum",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "minimum": {
+            "title": "Minimum",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "title": "AlertThresholds",
+        "type": "object"
+      },
+      "AlertThresholdsView": {
+        "additionalProperties": false,
+        "description": "Thresholds as stored, with the device they belong to.",
+        "properties": {
+          "clear_margin": {
+            "exclusiveMinimum": 0.0,
+            "title": "Clear Margin",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "maximum": {
+            "title": "Maximum",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "minimum": {
+            "title": "Minimum",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device_id"
+        ],
+        "title": "AlertThresholdsView",
+        "type": "object"
+      },
+      "AlertView": {
+        "additionalProperties": false,
+        "description": "One alert episode.",
+        "properties": {
+          "bound": {
+            "enum": [
+              "min",
+              "max"
+            ],
+            "title": "Bound",
+            "type": "string"
+          },
+          "clear_margin": {
+            "title": "Clear Margin",
+            "type": "number"
+          },
+          "cleared_at": {
+            "format": "date-time",
+            "title": "Cleared At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleared_value": {
+            "title": "Cleared Value",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "raised_at": {
+            "format": "date-time",
+            "title": "Raised At",
+            "type": "string"
+          },
+          "raised_value": {
+            "title": "Raised Value",
+            "type": "number"
+          },
+          "sensor_type": {
+            "title": "Sensor Type",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "number"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "device_id",
+          "sensor_type",
+          "bound",
+          "threshold",
+          "clear_margin",
+          "unit",
+          "raised_at",
+          "raised_value",
+          "cleared_at",
+          "cleared_value"
+        ],
+        "title": "AlertView",
+        "type": "object"
+      },
+      "AlertsView": {
+        "additionalProperties": false,
+        "description": "What is wrong now, and what has been wrong lately.\n\nBoth in one response because a client showing an alerts screen needs both,\nand two round trips would let them disagree \u2014 an episode can clear between\nthe first call and the second, and the UI would show it as simultaneously\nactive and resolved.",
+        "properties": {
+          "active": {
+            "items": {
+              "$ref": "#/components/schemas/AlertView"
+            },
+            "title": "Active",
+            "type": "array"
+          },
+          "recent": {
+            "items": {
+              "$ref": "#/components/schemas/AlertView"
+            },
+            "title": "Recent",
+            "type": "array"
+          }
+        },
+        "required": [
+          "active",
+          "recent"
+        ],
+        "title": "AlertsView",
+        "type": "object"
+      },
+      "BinaryLevel": {
+        "additionalProperties": false,
+        "description": "An on/off actuator level \u2014 relays, outlets, solenoids.",
+        "properties": {
+          "kind": {
+            "const": "binary",
+            "default": "binary",
+            "title": "Kind",
+            "type": "string"
+          },
+          "on": {
+            "title": "On",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "on"
+        ],
+        "title": "BinaryLevel",
+        "type": "object"
+      },
+      "Client": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "format": "date-time",
+            "title": "Last Seen At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "title": "Revoked At",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "last_seen_at",
+          "revoked_at"
+        ],
+        "title": "Client",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "Info": {
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "title": "Api Version",
+            "type": "string"
+          },
+          "contracts_version": {
+            "title": "Contracts Version",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "paired_client_count": {
+            "title": "Paired Client Count",
+            "type": "integer"
+          },
+          "pairing_open": {
+            "title": "Pairing Open",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "api_version",
+          "contracts_version",
+          "paired_client_count",
+          "pairing_open"
+        ],
+        "title": "Info",
+        "type": "object"
+      },
+      "OverrideContext": {
+        "additionalProperties": false,
+        "description": "The active manual hold on an actuator, if any.\n\nCarried on every state frame because the time-and-scheduling contract\nrequires override state to be loudly visible: a client showing a channel at\n0% must be able to say whether that is the schedule or a hold, and when the\nhold ends.",
+        "properties": {
+          "duty": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Duty",
+            "type": "number"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "expires_in_s": {
+            "minimum": 0.0,
+            "title": "Expires In S",
+            "type": "number"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "duty",
+          "expires_at",
+          "expires_in_s"
+        ],
+        "title": "OverrideContext",
+        "type": "object"
+      },
+      "OverrideRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_s": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 86400.0,
+            "title": "Duration S",
+            "type": "number"
+          },
+          "duty": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Duty",
+            "type": "number"
+          },
+          "reason": {
+            "maxLength": 256,
+            "title": "Reason",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "duty",
+          "duration_s"
+        ],
+        "title": "OverrideRequest",
+        "type": "object"
+      },
+      "OverrideView": {
+        "additionalProperties": false,
+        "properties": {
+          "duty": {
+            "title": "Duty",
+            "type": "number"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "expires_in_s": {
+            "title": "Expires In S",
+            "type": "number"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "target",
+          "duty",
+          "expires_at",
+          "expires_in_s"
+        ],
+        "title": "OverrideView",
+        "type": "object"
+      },
+      "PairGranted": {
+        "additionalProperties": false,
+        "properties": {
+          "client_id": {
+            "format": "uuid",
+            "title": "Client Id",
+            "type": "string"
+          },
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token",
+          "client_id"
+        ],
+        "title": "PairGranted",
+        "type": "object"
+      },
+      "PairPending": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_in_s": {
+            "title": "Expires In S",
+            "type": "integer"
+          },
+          "poll_after_s": {
+            "title": "Poll After S",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "poll_after_s",
+          "expires_in_s"
+        ],
+        "title": "PairPending",
+        "type": "object"
+      },
+      "PairRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "client_name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Client Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_name"
+        ],
+        "title": "PairRequest",
+        "type": "object"
+      },
+      "PwmLevel": {
+        "additionalProperties": false,
+        "description": "A proportional level, normalised 0.0\u20131.0 \u2014 LED channels, variable pumps.\n\nNormalised deliberately: the contract must not leak a driver's native\nresolution (PCA9685 is 12-bit) to the control engine.",
+        "properties": {
+          "duty": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Duty",
+            "type": "number"
+          },
+          "kind": {
+            "const": "pwm",
+            "default": "pwm",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "duty"
+        ],
+        "title": "PwmLevel",
+        "type": "object"
+      },
+      "ReadyFrame": {
+        "additionalProperties": false,
+        "description": "Sent once, after the socket authenticates. Nothing precedes it.",
+        "properties": {
+          "client_id": {
+            "format": "uuid",
+            "title": "Client Id",
+            "type": "string"
+          },
+          "frame_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Frame Version",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "ready",
+            "default": "ready",
+            "title": "Kind",
+            "type": "string"
+          },
+          "received_at": {
+            "format": "date-time",
+            "title": "Received At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "received_at",
+          "client_id"
+        ],
+        "title": "ReadyFrame",
+        "type": "object"
+      },
+      "SensorAlert": {
+        "additionalProperties": false,
+        "description": "A sensor reading crossed a configured threshold, or came back inside it.\n\nPublished on ``bellasreef.alert.<device_id>``. One alert describes one bound\non one sensor: a probe with both a min and a max can be in breach of either\nindependently, and collapsing them would make \"the tank is too cold\" and\n\"the tank is too hot\" indistinguishable to a client.\n\n``clear_margin`` travels with the event because the clear threshold is not\nderivable from the breach one without it, and a client that wants to explain\n*why* a reading of 25.4 has not yet cleared a max of 25.0 needs the margin to\nsay so.",
+        "properties": {
+          "bound": {
+            "enum": [
+              "min",
+              "max"
+            ],
+            "title": "Bound",
+            "type": "string"
+          },
+          "clear_margin": {
+            "exclusiveMinimum": 0,
+            "title": "Clear Margin",
+            "type": "number"
+          },
+          "device_id": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Device Id",
+            "type": "string"
+          },
+          "emitted_at": {
+            "format": "date-time",
+            "title": "Emitted At",
+            "type": "string"
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "sensor_type": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Sensor Type",
+            "type": "string"
+          },
+          "source": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "breach",
+              "clear"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "number"
+          },
+          "unit": {
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Unit",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "message_id",
+          "emitted_at",
+          "source",
+          "device_id",
+          "sensor_type",
+          "state",
+          "bound",
+          "value",
+          "threshold",
+          "clear_margin",
+          "unit"
+        ],
+        "title": "SensorAlert",
+        "type": "object"
+      },
+      "SensorFrame": {
+        "additionalProperties": false,
+        "description": "A sensor reading, forwarded unchanged.",
+        "properties": {
+          "frame_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Frame Version",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "sensor",
+            "default": "sensor",
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SensorReading"
+          },
+          "received_at": {
+            "format": "date-time",
+            "title": "Received At",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "received_at",
+          "subject",
+          "payload"
+        ],
+        "title": "SensorFrame",
+        "type": "object"
+      },
+      "SensorReading": {
+        "additionalProperties": false,
+        "description": "One sample from one sensor.\n\nPublished on ``bellasreef.sensor.<type>.<id>`` as core pub/sub. History\nlives in VictoriaMetrics, so these are deliberately not persisted on the\nspine.",
+        "properties": {
+          "calibration_id": {
+            "default": null,
+            "format": "uuid",
+            "title": "Calibration Id",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "emitted_at": {
+            "format": "date-time",
+            "title": "Emitted At",
+            "type": "string"
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          },
+          "quality": {
+            "default": "ok",
+            "enum": [
+              "ok",
+              "stale",
+              "fault"
+            ],
+            "title": "Quality",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "sensor_id": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Sensor Id",
+            "type": "string"
+          },
+          "sensor_type": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Sensor Type",
+            "type": "string"
+          },
+          "source": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "title": "Source",
+            "type": "string"
+          },
+          "unit": {
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Unit",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "message_id",
+          "emitted_at",
+          "source",
+          "sensor_id",
+          "sensor_type",
+          "value",
+          "unit"
+        ],
+        "title": "SensorReading",
+        "type": "object"
+      },
+      "StateFrame": {
+        "additionalProperties": false,
+        "description": "An actuator state, plus the override context the spine cannot supply.",
+        "properties": {
+          "frame_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Frame Version",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "state",
+            "default": "state",
+            "title": "Kind",
+            "type": "string"
+          },
+          "override": {
+            "$ref": "#/components/schemas/OverrideContext",
+            "default": null
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ActuatorState"
+          },
+          "received_at": {
+            "format": "date-time",
+            "title": "Received At",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "received_at",
+          "subject",
+          "payload"
+        ],
+        "title": "StateFrame",
+        "type": "object"
+      },
+      "TokenRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "title": "TokenRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "summary": "Reef controller: pairing, auth, and device control.",
+    "title": "Bella's Reef API",
+    "version": "2.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/alerts": {
+      "get": {
+        "description": "What is wrong now, and what has been wrong lately.\n\nThis is also the reconnect path. Alerts are published on core pub/sub\nwith no replay, so a client that was asleep during a breach learns about\nit here rather than from the stream.",
+        "operationId": "listAlerts",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlertsView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Alerts",
+        "tags": [
+          "alerts"
+        ]
+      }
+    },
+    "/api/v1/clients": {
+      "get": {
+        "operationId": "listClients",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Client"
+                  },
+                  "title": "Response Listclients",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Clients",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/api/v1/clients/{client_id}": {
+      "delete": {
+        "description": "Revoke. Any paired client may revoke any other, including itself.\n\nauth.md \u00a71: revocation is the only privilege operation and a paired\ndevice has full operator rights. A lost phone is revoked from the one\nyou still have.",
+        "operationId": "revokeClient",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Client Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Revokeclient",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown or already revoked."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Client",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/api/v1/devices": {
+      "get": {
+        "description": "Registered hardware. *Devices* are the tank's; clients are people's.",
+        "operationId": "listDevices",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Listdevices",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Devices",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/thresholds": {
+      "get": {
+        "operationId": "getThresholds",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlertThresholdsView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Thresholds",
+        "tags": [
+          "alerts"
+        ]
+      },
+      "put": {
+        "description": "Set or clear the band. The engine picks up the change within seconds.\n\nA PUT rather than a PATCH: the band is one setting with interdependent\nparts, and a partial update would let a client raise the minimum above\nthe maximum in two legal-looking requests.",
+        "operationId": "setThresholds",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlertThresholds"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlertThresholdsView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "409": {
+            "description": "Thresholds are a sensor concept."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Thresholds",
+        "tags": [
+          "alerts"
+        ]
+      }
+    },
+    "/api/v1/info": {
+      "get": {
+        "description": "Renders the connect screen before any commitment.\n\nUnauthenticated by design, and returns nothing sensitive: a name, two\nversion strings, and whether pairing is open.",
+        "operationId": "info",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Info"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Info",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/api/v1/overrides": {
+      "get": {
+        "operationId": "listOverrides",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/OverrideView"
+                  },
+                  "title": "Response Listoverrides",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Overrides",
+        "tags": [
+          "overrides"
+        ]
+      },
+      "post": {
+        "description": "Hold a target at a level for a duration.\n\nClock-gated: an override IS a deadline, and one computed from a clock\nchrony is about to step is not the duration the operator asked for.",
+        "operationId": "createOverride",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OverrideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverrideView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "Clock not synchronised; deadline would be wrong."
+          }
+        },
+        "summary": "Create Override",
+        "tags": [
+          "overrides"
+        ]
+      }
+    },
+    "/api/v1/overrides/{override_id}": {
+      "delete": {
+        "operationId": "releaseOverride",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "override_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Override Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Releaseoverride",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown or already released."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Override",
+        "tags": [
+          "overrides"
+        ]
+      }
+    },
+    "/api/v1/pair": {
+      "post": {
+        "description": "Pair a client. Four outcomes, in this order.\n\n1. No client has ever paired -> TOFU grant, and the window shuts.\n2. A recovery window is open -> grant and spend it.\n3. Someone is alive to approve -> 202, poll for a decision.\n4. Clients exist but every one is revoked -> 403. There is nobody to\n   approve, so the honest answer is to tell the operator to run\n   `bellasreef pair` on the hub rather than leave them polling a\n   request no one will ever see.",
+        "operationId": "pair",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairGranted"
+                }
+              }
+            },
+            "description": "Paired; credential issued."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairPending"
+                }
+              }
+            },
+            "description": "Awaiting approval; poll."
+          },
+          "403": {
+            "description": "Nobody can approve; run `bellasreef pair`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pair",
+        "tags": [
+          "pairing"
+        ]
+      }
+    },
+    "/api/v1/pair/{request_id}": {
+      "get": {
+        "operationId": "pollPairing",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairGranted"
+                }
+              }
+            },
+            "description": "Approved; credential issued."
+          },
+          "202": {
+            "description": "Still pending."
+          },
+          "403": {
+            "description": "Denied."
+          },
+          "404": {
+            "description": "No such request."
+          },
+          "410": {
+            "description": "Expired, or the credential was already collected."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Poll Pair",
+        "tags": [
+          "pairing"
+        ]
+      }
+    },
+    "/api/v1/pair/{request_id}/approve": {
+      "post": {
+        "description": "Approve from an already-paired client. The trust anchor is the tap.",
+        "operationId": "approvePairing",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Approvepairing",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "409": {
+            "description": "The pairing request is not pending."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve",
+        "tags": [
+          "pairing"
+        ]
+      }
+    },
+    "/api/v1/pair/{request_id}/deny": {
+      "post": {
+        "operationId": "denyPairing",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Denypairing",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "409": {
+            "description": "The pairing request is not pending."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deny",
+        "tags": [
+          "pairing"
+        ]
+      }
+    },
+    "/api/v1/sensors": {
+      "get": {
+        "operationId": "listSensors",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Listsensors",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sensors",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/token": {
+      "post": {
+        "operationId": "mintToken",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessToken"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Unknown or revoked refresh token."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Token",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz",
+        "tags": [
+          "ops"
+        ]
+      }
+    }
+  }
+}

@@ -22,3 +22,11 @@ config.local.*
 .DS_Store
 .vscode/
 .idea/
+
+# Scratch inputs and generated work products. Reference images, exports and
+# one-off captures live here and must never enter history — this repo is
+# AGPL-licensed and intended to be published, so anything committed is
+# published with it, permanently.
+#
+# Note: this rule does not untrack files already committed. See below.
+artifacts/

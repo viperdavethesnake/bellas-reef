@@ -84,6 +84,15 @@ class Device(Base):
     max_runtime_s: Mapped[float | None] = mapped_column(Float, nullable=True)
     heartbeat_timeout_s: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Sensor-only alert thresholds (PRD R12). All nullable: a sensor with no
+    # thresholds is simply not evaluated, which is the default state.
+    alert_min: Mapped[float | None] = mapped_column(Float, nullable=True)
+    alert_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: How far back inside the band a reading must come before a breach clears.
+    #: Separate from the threshold so a reading sitting exactly on the boundary
+    #: cannot strobe breach/clear/breach on sensor noise.
+    alert_clear_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
@@ -135,6 +144,49 @@ class Device(Base):
             )
             """,
             name="actuator_declares_role",
+        ),
+        # Thresholds are a sensor concept. An actuator carrying them would be
+        # configuration nothing reads.
+        CheckConstraint(
+            """
+            kind = 'sensor' OR (
+                alert_min          IS NULL
+            AND alert_max          IS NULL
+            AND alert_clear_margin IS NULL
+            )
+            """,
+            name="thresholds_are_sensor_only",
+        ),
+        # IS NULL first throughout, for the reason spelled out above: a CHECK
+        # that evaluates to NULL passes.
+        CheckConstraint(
+            "alert_clear_margin IS NULL OR alert_clear_margin > 0",
+            name="clear_margin_positive",
+        ),
+        CheckConstraint(
+            "alert_min IS NULL OR alert_max IS NULL OR alert_min < alert_max",
+            name="alert_band_ordered",
+        ),
+        # A threshold without a margin has no defined clear point, so the breach
+        # it raises could never end.
+        CheckConstraint(
+            """
+            (alert_min IS NULL AND alert_max IS NULL)
+            OR alert_clear_margin IS NOT NULL
+            """,
+            name="thresholds_require_clear_margin",
+        ),
+        # The trap this closes: with both bounds set, the clear zone is
+        # [min + margin, max - margin]. Make the margin wider than half the band
+        # and that interval is empty — every reading is either in breach or
+        # still not cleared, and the alert latches forever. Rejected at rest
+        # rather than discovered at 3am.
+        CheckConstraint(
+            """
+            alert_min IS NULL OR alert_max IS NULL OR alert_clear_margin IS NULL
+            OR (alert_min + alert_clear_margin) < (alert_max - alert_clear_margin)
+            """,
+            name="clear_zone_is_reachable",
         ),
     )
 
@@ -420,4 +472,66 @@ class PairingWindow(Base):
     __table_args__ = (
         CheckConstraint("expires_at > opened_at", name="expiry_after_opening"),
         CheckConstraint("(used_at IS NULL) = (used_by IS NULL)", name="used_pair_together"),
+    )
+
+
+class AlertEpisode(Base):
+    """One threshold breach, from the reading that raised it to the one that
+    cleared it.
+
+    Named for the episode rather than the event, and deliberately not
+    ``SensorAlert``: that name belongs to the wire model in
+    ``bellasreef_contracts``, and the control engine imports both. One is a
+    transition, the other is the span between two of them.
+
+    A row is the *episode*, not the event: raised once, cleared once, never
+    reopened. That makes "what is wrong right now" a `cleared_at IS NULL` scan
+    instead of a fold over an event log, and it makes the duration of a breach a
+    subtraction rather than a correlation.
+
+    ``device_id`` is the subject token as a plain string, matching
+    :class:`Override`. Deliberately no foreign key: an alert is a historical
+    record of something that happened, and deleting the device should not erase
+    the evidence that it misbehaved.
+    """
+
+    __tablename__ = "sensor_alerts"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    device_id: Mapped[str] = mapped_column(String(64), index=True)
+    sensor_type: Mapped[str] = mapped_column(String(64))
+    bound: Mapped[str] = mapped_column(String(3))
+
+    threshold: Mapped[float] = mapped_column(Float)
+    clear_margin: Mapped[float] = mapped_column(Float)
+    unit: Mapped[str] = mapped_column(String(16))
+
+    raised_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    raised_value: Mapped[float] = mapped_column(Float)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cleared_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("bound IN ('min', 'max')", name="alert_bound_valid"),
+        # Cleared means both halves recorded. A row with a clear time and no
+        # clearing reading would render as "recovered to —".
+        CheckConstraint(
+            "(cleared_at IS NULL) = (cleared_value IS NULL)", name="cleared_pair_together"
+        ),
+        CheckConstraint(
+            "cleared_at IS NULL OR cleared_at >= raised_at", name="cleared_after_raised"
+        ),
+        # At most one open episode per bound per device. The engine also holds
+        # this in memory, but the engine restarts and the database does not:
+        # without this index a restart mid-breach would open a second episode
+        # and the tank would appear to be in breach twice.
+        Index(
+            "uq_sensor_alerts_one_active_per_bound",
+            "device_id",
+            "bound",
+            unique=True,
+            postgresql_where=text("cleared_at IS NULL"),
+        ),
     )

@@ -48,3 +48,10 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-09 23:20 | S10.2 spine tests subscribe to the wire (ok + faulted readings). Metrics are not the telemetry path; a gauge-based assertion stays green through a total publish outage | pending | green |
 | 2026-08-09 23:47 | S10.3 scripts/dev/run-{api,hwio}.sh: hardware-io started without BELLASREEF_NATS_URL logs a clean startup and silently runs spineless | pending | n/a |
 | 2026-08-09 23:47 | Note: `pkill -f` over SSH matches the remote shell's own cmdline — stop and start must be separate ssh calls (recorded in CLAUDE.md) | — | — |
+| 2026-08-10 00:20 | S11.1 contracts 2.1.0: `bellasreef.alert.<device_id>` + SensorAlert (MINOR — new subject on a new message type, per the versioning table; no migration) | pending | green |
+| 2026-08-10 00:20 | S11.2 migration 0006: devices.alert_{min,max,clear_margin} + sensor_alerts episodes; CHECK refuses a margin wider than half the band, which would latch a breach forever | pending | green |
+| 2026-08-10 00:20 | S11.3 control-engine threshold evaluation with hysteresis; faulted AND stale readings do not evaluate — a dead probe is its own alert class | pending | green |
+| 2026-08-10 00:20 | S11.4 api: threshold CRUD, GET /api/v1/alerts (active + recent), AlertFrame on the stream | pending | green |
+| 2026-08-10 00:20 | Ruling: an unknown *stream frame kind* is skipped by clients, not fatal. Loud rejection stays the rule on the spine; refusing to render a temperature because the hub sent a newer frame type is worse than ignoring it | — | — |
+| 2026-08-10 00:31 | S11.5 verified on hardware: band set via API, breach raised at 23.687 °C over a 20.0 max, cleared at 23.875 °C after the band widened | — | green |
+| 2026-08-10 00:31 | Gap found, not closed: hardware-io publishes readings but never registers the sensor into Postgres, so thresholds cannot bind to a real probe without a manual devices row | — | — |
