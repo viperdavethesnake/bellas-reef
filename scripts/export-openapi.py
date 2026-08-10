@@ -36,6 +36,45 @@ from sqlalchemy.ext.asyncio import create_async_engine
 UNUSED_DSN = "postgresql+asyncpg://openapi-export/never-connected"
 
 
+def _normalise_nullable(node: object) -> object:
+    """Rewrite Pydantic's `anyOf: [X, null]` into OpenAPI 3.1 nullability.
+
+    This is not cosmetic. swift-openapi-generator **silently drops** properties
+    shaped as `anyOf: [{...}, {type: null}]` — no warning, no error, the field
+    simply does not exist in the generated type. That cost us a client that
+    could not read `SensorReading.value` or `StateFrame.override`: the
+    temperature and the whole "override state is loudly visible" requirement,
+    absent, with nothing to say so.
+
+    Two shapes, handled differently:
+
+    * `anyOf: [{type: number}, {type: null}]` becomes `type: [number, null]`,
+      which is how OpenAPI 3.1 spells nullable and what generators expect.
+    * `anyOf: [{$ref: X}, {type: null}]` collapses to the bare `$ref`. A type
+      array cannot carry a reference, and the property is optional anyway —
+      absent and null mean the same thing to a client here.
+    """
+    if isinstance(node, list):
+        return [_normalise_nullable(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    node = {key: _normalise_nullable(value) for key, value in node.items()}
+
+    options = node.get("anyOf")
+    if isinstance(options, list) and len(options) == 2:
+        nulls = [o for o in options if o == {"type": "null"}]
+        others = [o for o in options if o != {"type": "null"}]
+        if len(nulls) == 1 and len(others) == 1:
+            other = others[0]
+            rest = {k: v for k, v in node.items() if k != "anyOf"}
+            if "$ref" in other:
+                return {**rest, **other}
+            if isinstance(other.get("type"), str):
+                return {**rest, **other, "type": [other["type"], "null"]}
+    return node
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("openapi.json"))
@@ -44,14 +83,18 @@ def main() -> int:
 
     app = build_app(create_async_engine(UNUSED_DSN))
     spec = app.openapi()
+    spec = _normalise_nullable(spec)  # type: ignore[assignment]
 
     # Frame schemas are folded into components/schemas as well as published
     # standalone. swift-openapi-generator only consumes OpenAPI, and PRD G3's
     # footnote requires frame types to be GENERATED — so embedding them means
     # one generator and one toolchain rather than adding a second codegen path
     # for a handful of types. The standalone file stays for non-Swift clients.
-    embedded = frame_json_schema(ref_template="#/components/schemas/{model}")
+    # Normalised too: they are folded in after the spec-wide pass, so they
+    # would otherwise keep the anyOf-null shape the generator drops.
+    embedded = _normalise_nullable(frame_json_schema(ref_template="#/components/schemas/{model}"))
     components = spec.setdefault("components", {}).setdefault("schemas", {})
+    assert isinstance(embedded, dict)
     for name, definition in embedded.get("$defs", {}).items():
         components.setdefault(name, definition)
 
