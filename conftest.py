@@ -148,6 +148,14 @@ _skipped: list[tuple[str, str]] = []
 def pytest_runtest_logreport(report: Any) -> None:
     if not report.skipped or report.when != "setup":
         return
+    # `hardware` tests need a real Pi with real silicon attached. CI cannot
+    # provide that and never will, so their absence is structural rather than an
+    # environment somebody forgot — and the marker is itself the declaration
+    # this hook exists to demand. Without this exemption the gate could never be
+    # green once a hardware-only test existed, which would end with the rule
+    # being switched off rather than obeyed.
+    if "hardware" in getattr(report, "keywords", {}):
+        return
     # (path, lineno, "Skipped: <reason>") for a skipif-driven skip.
     reason = report.longrepr[2] if isinstance(report.longrepr, tuple) else str(report.longrepr)
     if _ENV_SKIP_MARKER in reason:

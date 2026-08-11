@@ -376,6 +376,12 @@ async def _ignore(event: object) -> None:
 
 _PI_PWM = "BELLASREEF_TEST_PWM_CHANNEL"
 
+#: `hardware` is declared in pyproject: "requires real I2C/GPIO/1-wire on the
+#: Pi (never runs in CI)". The marker is what tells the skip-policing hook in
+#: conftest.py that this absence is structural rather than an environment
+#: somebody forgot to provide.
+pytestmark = pytest.mark.hardware
+
 requires_pwm_hardware = pytest.mark.skipif(
     not os.environ.get(_PI_PWM),
     reason=(
