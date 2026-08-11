@@ -20,26 +20,40 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Final, Protocol
 from uuid import uuid4
 
-from bellasreef_contracts import AlertBound, AlertState, SensorAlert, SensorReading, subjects
+from bellasreef_contracts import (
+    AlertBound,
+    AlertState,
+    SensorAlert,
+    SensorReading,
+    SensorSilence,
+    subjects,
+)
 
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "SILENCE_CADENCE_MULTIPLE",
+    "SILENCE_FLOOR_S",
     "AlertStore",
     "AlertSupervisor",
     "PublishAlert",
+    "PublishSilence",
+    "SilenceStore",
+    "SilenceWatcher",
     "Thresholds",
     "Transition",
     "evaluate",
     "should_evaluate",
+    "silence_deadline_s",
 ]
 
 #: Publishes one alert to one subject. A callable rather than a broker handle so
 #: the supervisor can be driven by a list in a test without a NATS server.
 PublishAlert = Callable[[str, SensorAlert], Awaitable[None]]
+PublishSilence = Callable[[str, SensorSilence], Awaitable[None]]
 
 
 class AlertStore(Protocol):
@@ -253,3 +267,188 @@ class AlertSupervisor:
             )
 
         return published
+
+
+# --------------------------------------------------------------- silence class
+
+#: How many missed polls make a probe silent, and the shortest deadline we will
+#: ever apply.
+#:
+#: Constants, not configuration. A per-device knob here is a way to turn the
+#: dead-probe alarm off by accident, and the failure it detects is the one that
+#: hid a ten-hour outage behind a stale number that looked like a healthy tank.
+#:
+#: Six is margin: a single skipped read on a serialised 1-Wire bus is ordinary,
+#: six in a row is not. The floor exists because six cadences of a fast probe is
+#: no time at all — the DS18B20 publishes about every 5.6s, so 6x is 33.6s, and
+#: a probe polling once a second would otherwise be declared dead after six
+#: seconds of perfectly normal scheduling jitter.
+SILENCE_CADENCE_MULTIPLE: Final = 6
+SILENCE_FLOOR_S: Final = 30.0
+
+
+def silence_deadline_s(cadence_s: float) -> float:
+    """How long this probe may be quiet before it counts as silent."""
+    return max(cadence_s * SILENCE_CADENCE_MULTIPLE, SILENCE_FLOOR_S)
+
+
+class SilenceStore(Protocol):
+    """The persistence a silence watcher needs. Mirrors :class:`AlertStore`."""
+
+    async def cadences(self) -> Mapping[str, float]: ...
+    async def open_silences(self) -> frozenset[str]: ...
+    async def raise_silence(
+        self,
+        device_id: str,
+        sensor_type: str,
+        *,
+        at: datetime,
+        last_reading_at: datetime | None,
+    ) -> None: ...
+    async def clear_silence(self, device_id: str, *, at: datetime, value: float) -> None: ...
+
+
+class SilenceWatcher:
+    """Raises an alert when a probe stops reporting, and clears it when it returns.
+
+    Every other alert in this system is a statement about a number. This one is
+    a statement about the absence of numbers, which is why it needs its own
+    class, its own message type, and a clock rather than a reading to fire it.
+
+    The clock part is the important design point. A threshold evaluator is
+    driven by readings, so it can only ever react to something that arrived —
+    which means a probe that stops arriving is invisible to it forever. This is
+    driven by :meth:`sweep` on a timer instead, and readings only ever *cancel*
+    it.
+    """
+
+    def __init__(self, store: SilenceStore, publish: PublishSilence) -> None:
+        self._store = store
+        self._publish = publish
+        self._last_seen: dict[str, datetime] = {}
+        self._sensor_types: dict[str, str] = {}
+        self._silent: set[str] = set()
+
+    async def prime(self) -> None:
+        """Resume silences already open in Postgres.
+
+        Without this a restart would find an empty set, try to raise a second
+        episode for a probe already recorded as silent, and lose it to the
+        partial unique index — the alert vanishes rather than duplicating,
+        which is the worse of the two failures.
+        """
+        self._silent = set(await self._store.open_silences())
+        if self._silent:
+            log.info("resumed open silence episodes", extra={"devices": sorted(self._silent)})
+
+    def is_silent(self, device_id: str) -> bool:
+        """Whether threshold evaluation should be suspended for this probe.
+
+        The last number a dead probe published is not evidence about now.
+        Evaluating it would either invent a recovery or keep asserting a breach
+        nobody can confirm.
+        """
+        return device_id in self._silent
+
+    async def on_reading(self, reading: SensorReading, *, now: datetime | None = None) -> None:
+        """Note that a probe is alive, and clear any silence it was under.
+
+        Gated on ``should_evaluate`` rather than mere arrival. A DS18B20 with a
+        bad CRC publishes a fault: that proves the wire is alive and proves
+        nothing about the tank, so it must not silence the alarm that says we do
+        not know the temperature.
+        """
+        if not should_evaluate(reading):
+            return
+        value = reading.value
+        assert value is not None  # guaranteed by should_evaluate
+
+        at = now or datetime.now(UTC)
+        self._last_seen[reading.sensor_id] = at
+        self._sensor_types[reading.sensor_id] = reading.sensor_type
+
+        if reading.sensor_id not in self._silent:
+            return
+
+        silent_for = 0.0
+        await self._store.clear_silence(reading.sensor_id, at=at, value=value)
+        self._silent.discard(reading.sensor_id)
+        cadence = (await self._store.cadences()).get(reading.sensor_id)
+        await self._emit(
+            reading.sensor_id,
+            reading.sensor_type,
+            state="clear",
+            silent_for_s=silent_for,
+            threshold_s=silence_deadline_s(cadence) if cadence else SILENCE_FLOOR_S,
+            last_reading_at=at,
+            at=at,
+        )
+        log.warning("probe reporting again", extra={"device_id": reading.sensor_id})
+
+    async def sweep(self, *, now: datetime | None = None) -> None:
+        """Check every probe against its own deadline. Driven by a timer."""
+        at = now or datetime.now(UTC)
+        cadences = await self._store.cadences()
+
+        for device_id, cadence in cadences.items():
+            if device_id in self._silent:
+                continue
+            last = self._last_seen.get(device_id)
+            if last is None:
+                # Never seen since this process started. Deliberately not an
+                # alert: the engine may have started before hardware-io, and
+                # accusing a probe of being dead because we have not been
+                # listening long enough is a false alarm on every boot.
+                continue
+
+            deadline = silence_deadline_s(cadence)
+            silent_for = (at - last).total_seconds()
+            if silent_for < deadline:
+                continue
+
+            sensor_type = self._sensor_types.get(device_id, "unknown")
+            await self._store.raise_silence(device_id, sensor_type, at=at, last_reading_at=last)
+            self._silent.add(device_id)
+            await self._emit(
+                device_id,
+                sensor_type,
+                state="breach",
+                silent_for_s=silent_for,
+                threshold_s=deadline,
+                last_reading_at=last,
+                at=at,
+            )
+            log.critical(
+                "probe has stopped reporting; the tank is not being monitored",
+                extra={
+                    "device_id": device_id,
+                    "silent_for_s": round(silent_for, 1),
+                    "deadline_s": deadline,
+                },
+            )
+
+    async def _emit(
+        self,
+        device_id: str,
+        sensor_type: str,
+        *,
+        state: AlertState,
+        silent_for_s: float,
+        threshold_s: float,
+        last_reading_at: datetime | None,
+        at: datetime,
+    ) -> None:
+        await self._publish(
+            subjects.silence(device_id),
+            SensorSilence(
+                message_id=uuid4(),
+                emitted_at=at,
+                source="control-engine",
+                device_id=device_id,
+                sensor_type=sensor_type,
+                state=state,
+                silent_for_s=silent_for_s,
+                silence_threshold_s=threshold_s,
+                last_reading_at=last_reading_at,
+            ),
+        )

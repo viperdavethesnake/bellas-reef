@@ -65,12 +65,17 @@ class AlertRecord:
     id: uuid.UUID
     device_id: str
     sensor_type: str
-    bound: str
-    threshold: float
-    clear_margin: float
-    unit: str
+    #: ``threshold`` or ``silence``. The fields below split along this line: a
+    #: silence has no bound, no threshold and no raising reading, because the
+    #: absence of a reading is the entire event.
+    alert_class: str
+    bound: str | None
+    threshold: float | None
+    clear_margin: float | None
+    unit: str | None
     raised_at: datetime
-    raised_value: float
+    raised_value: float | None
+    last_reading_at: datetime | None
     cleared_at: datetime | None
     cleared_value: float | None
 
@@ -84,12 +89,14 @@ def _record(row: AlertEpisode) -> AlertRecord:
         id=row.id,
         device_id=row.device_id,
         sensor_type=row.sensor_type,
+        alert_class=row.alert_class,
         bound=row.bound,
         threshold=row.threshold,
         clear_margin=row.clear_margin,
         unit=row.unit,
         raised_at=row.raised_at,
         raised_value=row.raised_value,
+        last_reading_at=row.last_reading_at,
         cleared_at=row.cleared_at,
         cleared_value=row.cleared_value,
     )
@@ -115,7 +122,8 @@ class PostgresAlertStore:
             rows = (
                 await session.execute(
                     select(AlertEpisode.device_id, AlertEpisode.bound).where(
-                        AlertEpisode.cleared_at.is_(None)
+                        AlertEpisode.cleared_at.is_(None),
+                        AlertEpisode.alert_class == "threshold",
                     )
                 )
             ).all()
@@ -133,6 +141,7 @@ class PostgresAlertStore:
                     id=uuid.uuid4(),
                     device_id=alert.device_id,
                     sensor_type=alert.sensor_type,
+                    alert_class="threshold",
                     bound=alert.bound,
                     threshold=alert.threshold,
                     clear_margin=alert.clear_margin,
@@ -158,6 +167,7 @@ class PostgresAlertStore:
                         update(AlertEpisode)
                         .where(
                             AlertEpisode.device_id == alert.device_id,
+                            AlertEpisode.alert_class == "threshold",
                             AlertEpisode.bound == alert.bound,
                             AlertEpisode.cleared_at.is_(None),
                         )
@@ -175,6 +185,100 @@ class PostgresAlertStore:
                 raise AlertStoreError(
                     f"no open episode for {alert.device_id!r}/{alert.bound!r} to clear"
                 )
+
+    # -------------------------------------------------------- silence class
+
+    async def open_silences(self) -> frozenset[str]:
+        """Devices currently recorded as silent.
+
+        Read at engine startup for the same reason as :meth:`open_bounds`: the
+        partial unique index is per (device, class), so a restart that forgot an
+        open silence would try to raise a second one and lose the alert to a
+        constraint violation rather than duplicate it.
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(AlertEpisode.device_id).where(
+                        AlertEpisode.cleared_at.is_(None),
+                        AlertEpisode.alert_class == "silence",
+                    )
+                )
+            ).scalars()
+        return frozenset(rows)
+
+    async def raise_silence(
+        self,
+        device_id: str,
+        sensor_type: str,
+        *,
+        at: datetime,
+        last_reading_at: datetime | None,
+    ) -> None:
+        """Open a silence episode.
+
+        ``at`` is when we noticed, ``last_reading_at`` is when the probe was
+        last heard. They are six cadences apart by construction, and the UI
+        needs both: one to place the band, the other to say how long it has
+        really been.
+        """
+        async with self._sessions() as session, session.begin():
+            session.add(
+                AlertEpisode(
+                    id=uuid.uuid4(),
+                    device_id=device_id,
+                    sensor_type=sensor_type,
+                    alert_class="silence",
+                    raised_at=at,
+                    last_reading_at=last_reading_at,
+                )
+            )
+
+    async def clear_silence(self, device_id: str, *, at: datetime, value: float) -> None:
+        """Close the open silence for a device.
+
+        ``value`` is the reading that ended it, so the episode closes with a
+        number rather than a shrug. That also keeps the ``cleared_pair_together``
+        constraint true for this class without carving an exception into it.
+        """
+        async with self._sessions() as session, session.begin():
+            closed = (
+                (
+                    await session.execute(
+                        update(AlertEpisode)
+                        .where(
+                            AlertEpisode.device_id == device_id,
+                            AlertEpisode.alert_class == "silence",
+                            AlertEpisode.cleared_at.is_(None),
+                        )
+                        .values(cleared_at=at, cleared_value=value)
+                        .returning(AlertEpisode.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not closed:
+                raise AlertStoreError(f"no open silence for {device_id!r} to clear")
+
+    async def cadences(self) -> Mapping[str, float]:
+        """Declared polling interval per sensor, for the silence deadline.
+
+        Only sensors that declared one. A sensor with no cadence cannot be
+        judged silent — there is no expectation to miss — and leaving it out of
+        this map is how the watcher skips it without a special case.
+        """
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(Device.device_id, Device.poll_interval_s).where(
+                        Device.kind == "sensor",
+                        Device.poll_interval_s.is_not(None),
+                        Device.enabled.is_(True),
+                    )
+                )
+            ).all()
+        return {device_id: float(interval) for device_id, interval in rows}
 
     async def thresholds(self) -> Mapping[str, tuple[float | None, float | None, float]]:
         """Configured bands, keyed by device id: ``(min, max, clear_margin)``.

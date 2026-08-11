@@ -299,14 +299,27 @@ class AlertView(BaseModel):
     id: UUID
     device_id: str
     sensor_type: str
-    bound: Literal["min", "max"]
-    threshold: float
-    clear_margin: float
-    unit: str
+
+    #: ``threshold`` or ``silence``. Everything below the fold is threshold-only
+    #: and null on a silence, which has no bound, no band and no raising
+    #: reading. Clients switch on this rather than sniffing for nulls: a probe
+    #: that has gone quiet is a different thing to draw, not a breach with
+    #: missing fields.
+    alert_class: Literal["threshold", "silence"]
+
+    bound: Literal["min", "max"] | None = None
+    threshold: float | None = None
+    clear_margin: float | None = None
+    unit: str | None = None
     raised_at: datetime
-    raised_value: float
-    cleared_at: datetime | None
-    cleared_value: float | None
+    raised_value: float | None = None
+
+    #: Silence only: when the probe was last heard from, which is earlier than
+    #: ``raised_at`` by the deadline that had to elapse before anyone noticed.
+    last_reading_at: datetime | None = None
+
+    cleared_at: datetime | None = None
+    cleared_value: float | None = None
 
     @property
     def active(self) -> bool:
@@ -411,22 +424,31 @@ class _PendingTokens:
 
 
 def _alert_view(row: AlertRecord) -> "AlertView":
-    """Widen the store's `bound` string to the literal the API promises.
+    """Widen the store's stringly-typed columns to the literals the API promises.
 
-    The database CHECK already guarantees 'min' or 'max'; this is where the type
-    system is told, once, rather than at every call site.
+    The database CHECKs already guarantee both — `alert_class` is
+    threshold-or-silence, and `bound` is min-or-max whenever the class is
+    threshold. This is where the type system is told, once, rather than at every
+    call site.
     """
-    bound: Literal["min", "max"] = "min" if row.bound == "min" else "max"
+    alert_class: Literal["threshold", "silence"] = (
+        "silence" if row.alert_class == "silence" else "threshold"
+    )
+    bound: Literal["min", "max"] | None = None
+    if row.bound is not None:
+        bound = "min" if row.bound == "min" else "max"
     return AlertView(
         id=row.id,
         device_id=row.device_id,
         sensor_type=row.sensor_type,
+        alert_class=alert_class,
         bound=bound,
         threshold=row.threshold,
         clear_margin=row.clear_margin,
         unit=row.unit,
         raised_at=row.raised_at,
         raised_value=row.raised_value,
+        last_reading_at=row.last_reading_at,
         cleared_at=row.cleared_at,
         cleared_value=row.cleared_value,
     )

@@ -558,38 +558,111 @@ class AlertEpisode(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     device_id: Mapped[str] = mapped_column(String(64), index=True)
     sensor_type: Mapped[str] = mapped_column(String(64))
-    bound: Mapped[str] = mapped_column(String(3))
 
-    threshold: Mapped[float] = mapped_column(Float)
-    clear_margin: Mapped[float] = mapped_column(Float)
-    unit: Mapped[str] = mapped_column(String(16))
+    #: ``threshold`` or ``silence``. Two genuinely different emergencies: a
+    #: probe reading 40 °C says the heater is stuck, a probe saying nothing says
+    #: you do not know what the tank is doing. The second is worse and reads as
+    #: calm on a dashboard, which is exactly why it needs its own class rather
+    #: than a synthetic bound.
+    alert_class: Mapped[str] = mapped_column(String(16), server_default=text("'threshold'"))
+
+    #: Threshold episodes only. NULL on a silence, which has no side to be on.
+    bound: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clear_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     raised_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
-    raised_value: Mapped[float] = mapped_column(Float)
+    #: NULL on a silence: nothing was read, and that is the whole event.
+    raised_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    #: Silence episodes only. When the probe was last heard from, which is not
+    #: ``raised_at`` — that is when we *noticed*, six cadences later. NULL for a
+    #: probe that has not reported at all, where there is genuinely nothing to
+    #: point at.
+    last_reading_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cleared_value: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("bound IN ('min', 'max')", name="alert_bound_valid"),
+        CheckConstraint("alert_class IN ('threshold', 'silence')", name="alert_class_valid"),
+        # A threshold episode carries its whole threshold story or it is not one.
+        # Written as an implication rather than plain NOT NULL columns because
+        # the same table now holds a class for which every one of these is
+        # meaningless.
+        CheckConstraint(
+            "alert_class <> 'threshold' OR ("
+            " bound IN ('min', 'max')"
+            " AND threshold IS NOT NULL"
+            " AND clear_margin IS NOT NULL"
+            " AND unit IS NOT NULL"
+            " AND raised_value IS NOT NULL)",
+            name="threshold_episode_is_complete",
+        ),
+        # And a silence must not smuggle threshold fields in. Rejecting rather
+        # than ignoring, the same rule device-classes.md §2.2 applies to a safe
+        # state we could not honour: a value we would never render is a value
+        # that would eventually be believed.
+        CheckConstraint(
+            "alert_class <> 'silence' OR ("
+            " bound IS NULL"
+            " AND threshold IS NULL"
+            " AND clear_margin IS NULL"
+            " AND raised_value IS NULL)",
+            name="silence_episode_carries_no_threshold",
+        ),
         # Cleared means both halves recorded. A row with a clear time and no
-        # clearing reading would render as "recovered to —".
+        # clearing reading would render as "recovered to —". This holds for
+        # silence too: a silence clears on the first good reading, so there is
+        # always a number to record.
         CheckConstraint(
             "(cleared_at IS NULL) = (cleared_value IS NULL)", name="cleared_pair_together"
         ),
         CheckConstraint(
             "cleared_at IS NULL OR cleared_at >= raised_at", name="cleared_after_raised"
         ),
-        # At most one open episode per bound per device. The engine also holds
-        # this in memory, but the engine restarts and the database does not:
-        # without this index a restart mid-breach would open a second episode
-        # and the tank would appear to be in breach twice.
+        # At most one open episode per class per bound per device. The engine
+        # also holds this in memory, but the engine restarts and the database
+        # does not: without this a restart mid-breach would open a second
+        # episode and the tank would appear to be in breach twice.
+        #
+        # NULLS NOT DISTINCT is load-bearing, not tidiness. A silence row has a
+        # NULL bound, and under Postgres' default every NULL is distinct — so
+        # without this the index would happily admit a hundred open silence
+        # episodes for one probe while claiming to be unique.
         Index(
-            "uq_sensor_alerts_one_active_per_bound",
+            "uq_sensor_alerts_one_active_per_class_bound",
             "device_id",
+            "alert_class",
             "bound",
             unique=True,
             postgresql_where=text("cleared_at IS NULL"),
+            postgresql_nulls_not_distinct=True,
         ),
     )
+
+
+class HubIdentity(Base):
+    """Who this hub is, decided once and never again.
+
+    Written on first boot and then immutable. Before this, a backup manifest
+    identified its origin by database host, database name and whichever machine
+    ran the tool — enough to tell two hubs apart in practice, and not enough if
+    they ever shared a hostname and a database name. Restoring the wrong
+    archive onto a tank is not a mistake you want resting on a hostname.
+
+    Single row, enforced by the database rather than by everyone remembering.
+    ``singleton`` exists only to be the unique key: a partial index on a
+    constant is the same trick with less to read.
+    """
+
+    __tablename__ = "hub_identity"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    singleton: Mapped[bool] = mapped_column(Boolean, server_default=text("true"), unique=True)
+
+    __table_args__ = (CheckConstraint("singleton", name="hub_identity_is_singleton"),)

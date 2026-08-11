@@ -35,6 +35,7 @@ __all__ = [
     "ActuatorRole",
     "ActuatorState",
     "AlertBound",
+    "AlertClass",
     "AlertState",
     "BinaryLevel",
     "ControlAuthority",
@@ -44,6 +45,7 @@ __all__ = [
     "SensorAlert",
     "SensorReading",
     "SensorRegistration",
+    "SensorSilence",
     "StateReason",
     "Transport",
 ]
@@ -176,6 +178,72 @@ AlertState = Literal["breach", "clear"]
 #: from ``value`` vs ``threshold``, because on a *clear* the value is by
 #: definition back inside the band and the comparison no longer identifies it.
 AlertBound = Literal["min", "max"]
+
+
+#: Which kind of thing went wrong. Lives on the episode and in the database
+#: rather than as a field on :class:`SensorAlert`, because the two classes carry
+#: genuinely different payloads: a threshold breach has a reading and a bound, a
+#: silence has neither, and that is the whole point of it.
+AlertClass = Literal["threshold", "silence"]
+
+
+class SensorSilence(_Message):
+    """A probe stopped reporting, or started again.
+
+    Published on ``bellasreef.silence.<device_id>``. Deliberately NOT on
+    ``bellasreef.alert.<device_id>``: ``ALL_ALERTS`` is a ``>`` wildcard, so a
+    payload of a different shape arriving there would be handed to consumers
+    that are contractually required to reject it loudly.
+
+    A separate message type rather than a widened :class:`SensorAlert`. Adding a
+    field to an existing message is a MAJOR change under the versioning table in
+    ``docs/contracts/nats-subjects.md``, and making ``value``/``threshold``/
+    ``bound`` optional would weaken them in every generated client for the sake
+    of a class that never populates them. A new type on a new subject is MINOR
+    and leaves both models strict.
+
+    Silence is a different emergency from a breach. A probe reading 40 °C tells
+    you the heater is stuck; a probe saying nothing tells you that you do not
+    know what the tank is doing, which is worse and reads on a dashboard as
+    calm. It also has to suppress threshold evaluation while it lasts: the last
+    number a dead probe published is not evidence about now.
+    """
+
+    device_id: DeviceId
+    sensor_type: DeviceId
+    state: AlertState
+
+    #: How long the probe had been quiet when this was emitted.
+    silent_for_s: float = Field(ge=0)
+
+    #: The deadline that was applied, carried so a client can say *why* 45s of
+    #: quiet counted. Derived from the probe's declared cadence, so it differs
+    #: per device and is not something a client could recompute.
+    silence_threshold_s: float = Field(gt=0)
+
+    #: ``None`` for a probe that has not reported since the engine started.
+    #: There is genuinely nothing to point at in that case, and inventing a
+    #: timestamp would make "never seen" indistinguishable from "seen at boot".
+    last_reading_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _a_raise_must_satisfy_its_own_deadline(self) -> Self:
+        """A breach that has not actually exceeded its threshold is a bug.
+
+        Same guard as SensorAlert's inverted-comparison check, for the same
+        reason: an evaluator comparing against the wrong side of the deadline
+        produces alerts that look entirely plausible downstream.
+
+        Only on ``breach``. A clear reports how long the silence lasted, which
+        is history rather than a trigger, and clamping it would lose the
+        duration on any silence that ended quickly.
+        """
+        if self.state == "breach" and self.silent_for_s < self.silence_threshold_s:
+            raise ValueError(
+                f"silence breach requires silent_for_s >= silence_threshold_s "
+                f"({self.silent_for_s} < {self.silence_threshold_s})"
+            )
+        return self
 
 
 class SensorAlert(_Message):

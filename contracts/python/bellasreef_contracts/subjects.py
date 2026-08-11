@@ -25,6 +25,7 @@ __all__ = [
     "parse_device_id",
     "registry",
     "sensor",
+    "silence",
     "state",
     "validate_token",
 ]
@@ -72,6 +73,20 @@ def alert(device_id: str) -> str:
     """
     validate_token(device_id, field="device_id")
     return f"{ROOT}.alert.{device_id}"
+
+
+def silence(device_id: str) -> str:
+    """A probe went quiet, or came back.
+
+    Its own root rather than a fourth token under ``bellasreef.alert.``.
+    ``ALL_ALERTS`` is a ``>`` wildcard, so anything published beneath it reaches
+    consumers that parse every message as :class:`SensorAlert` and are required
+    to reject what they cannot parse. Sharing the root would make a new alert
+    class a breaking change for every existing alert subscriber, which is the
+    opposite of what a new class should cost.
+    """
+    validate_token(device_id, field="device_id")
+    return f"{ROOT}.silence.{device_id}"
 
 
 def cmd(actuator_class: str, actuator_id: str) -> str:
@@ -123,6 +138,7 @@ def parse_device_id(subject: str) -> str:
 
 # Wildcard subscriptions. Consumers filter with these; they are contract too.
 ALL_ALERTS: Final = f"{ROOT}.alert.>"
+ALL_SILENCE: Final = f"{ROOT}.silence.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"
 ALL_COMMANDS: Final = f"{ROOT}.cmd.>"
 ALL_STATE: Final = f"{ROOT}.state.>"

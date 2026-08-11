@@ -46,7 +46,7 @@ from bellasreef_service import (
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from bellasreef_control_engine.alerts import AlertSupervisor, Thresholds
+from bellasreef_control_engine.alerts import AlertSupervisor, SilenceWatcher, Thresholds
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import Intent, LightingScheduler
@@ -138,6 +138,7 @@ class ControlEngine:
         self._clock_was_trusted = self._clock_trusted
 
         self.alerts: AlertSupervisor | None = None
+        self.silence: SilenceWatcher | None = None
         self._alert_store = alert_store
         self._thresholds: dict[str, Thresholds] = {}
         self._threshold_refresh_s = threshold_refresh_s
@@ -233,6 +234,8 @@ class ControlEngine:
         publisher = self.publisher
         self.alerts = AlertSupervisor(self._alert_store, publisher.publish_alert)
         await self.alerts.prime()
+        self.silence = SilenceWatcher(self._alert_store, publisher.publish_silence)
+        await self.silence.prime()
         await self._refresh_thresholds(force=True)
         await publisher.subscribe_sensors(self._on_reading)
 
@@ -264,9 +267,22 @@ class ControlEngine:
     async def _on_reading(self, reading: SensorReading) -> None:
         if self.alerts is None:
             return
+
+        # Before thresholds, and unconditionally: a probe reporting again has
+        # to end its silence even if nobody ever configured a band for it.
+        if self.silence is not None:
+            await self.silence.on_reading(reading)
+
         await self._refresh_thresholds()
         thresholds = self._thresholds.get(reading.sensor_id)
         if thresholds is None:
+            return
+
+        if self.silence is not None and self.silence.is_silent(reading.sensor_id):
+            # Unreachable in practice, since the call above clears the silence
+            # for any reading good enough to evaluate. Kept as the explicit
+            # statement of the rule: a reading arriving while the probe is
+            # recorded silent is not evidence about now.
             return
 
         published = await self.alerts.on_reading(reading, thresholds)
@@ -317,10 +333,30 @@ class ControlEngine:
 
     async def _tick(self, now: datetime) -> None:
         await self._expire_overrides()
+        await self._sweep_silence(now)
         held = {t: o.duty for t, o in self._held.items()}
         intents = self.scheduler.due(now, held)
         for intent in intents:
             await self._publish(intent, now)
+
+    async def _sweep_silence(self, now: datetime) -> None:
+        """Ask the clock whether any probe has gone quiet.
+
+        On the tick rather than on a reading, which is the whole point: a
+        reading-driven check can only ever react to a message that arrived, so
+        a probe that stops arriving is invisible to it forever. That is exactly
+        how a dead probe sat behind a stale number for ten hours.
+
+        Failures are logged, not raised. This runs inside the supervisor loop
+        that also feeds the liveness guard, and a database hiccup here must not
+        take the lighting schedule down with it.
+        """
+        if self.silence is None:
+            return
+        try:
+            await self.silence.sweep(now=now)
+        except Exception:
+            log.exception("silence sweep failed")
 
     async def _publish(self, intent: Intent, now: datetime) -> None:
         if self.publisher is None or not self.publisher.connected:

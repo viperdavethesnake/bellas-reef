@@ -29,6 +29,7 @@ from bellasreef_contracts import (
     PwmLevel,
     SensorAlert,
     SensorReading,
+    SensorSilence,
     subjects,
 )
 from bellasreef_service import get_logger
@@ -136,6 +137,17 @@ class CommandPublisher:
         if self._nc is None:
             raise RuntimeError("publisher not connected")
         await self._nc.publish(subject, alert.model_dump_json().encode())
+
+    async def publish_silence(self, subject: str, message: SensorSilence) -> None:
+        """A probe going quiet, on core pub/sub for the same reason as alerts.
+
+        Its own subject root, not a token under ``bellasreef.alert.``, so that
+        subscribers parsing every message there as a SensorAlert are not handed
+        a payload they are obliged to reject.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+        await self._nc.publish(subject, message.model_dump_json().encode())
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
         """Durable audit event, deduped on the same id in the header and payload."""

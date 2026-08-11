@@ -15,6 +15,7 @@ from bellasreef_contracts.messages import (
     ActuatorRole,
     ActuatorState,
     AlertBound,
+    AlertClass,
     AlertState,
     BinaryLevel,
     ControlAuthority,
@@ -24,6 +25,7 @@ from bellasreef_contracts.messages import (
     SensorAlert,
     SensorReading,
     SensorRegistration,
+    SensorSilence,
     StateReason,
     Transport,
 )
@@ -37,6 +39,7 @@ __all__ = [
     "ActuatorRole",
     "ActuatorState",
     "AlertBound",
+    "AlertClass",
     "AlertState",
     "BinaryLevel",
     "ControlAuthority",
@@ -46,6 +49,7 @@ __all__ = [
     "SensorAlert",
     "SensorReading",
     "SensorRegistration",
+    "SensorSilence",
     "StateReason",
     "Transport",
 ]

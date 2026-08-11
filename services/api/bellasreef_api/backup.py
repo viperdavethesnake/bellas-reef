@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 from bellasreef_db.revisions import KNOWN_REVISIONS
@@ -133,12 +134,17 @@ class HubIdentity(_Strict):
     ``taken_on`` is the machine that ran the tool, and has the mirror-image
     problem: on the hub it is the hub, from a laptop it is the laptop.
 
-    Recording both means at least one of them is always meaningful, and the
-    pair together says where the operator was standing. **There is no stable
-    hub UUID in the schema today** — if two hubs ever share a hostname and a
-    database name, these manifests cannot tell them apart. That is a known gap,
-    not an oversight; closing it needs a row in Postgres written at first boot.
+    ``hub_id`` is the one that settles it: a UUID written once at first boot
+    and restored along with everything else, so an archive names the hub rather
+    than the circumstances of its own creation. Optional only for reading
+    archives written before the identity table existed — a manifest without one
+    is old, not wrong.
     """
+
+    #: The hub's own identity row, written at first boot and carried through a
+    #: restore with the rest of the data. This is the identifier that actually
+    #: distinguishes two hubs; the three below are corroboration.
+    hub_id: UUID | None = None
 
     database_host: str
     database: str
@@ -467,8 +473,8 @@ class BackupResult:
     manifest: Manifest
 
 
-async def _hub_facts(dsn: str) -> tuple[str, str]:
-    """``(schema_revision, postgres_version)`` straight from the database."""
+async def _hub_facts(dsn: str) -> tuple[str, str, UUID | None]:
+    """``(schema_revision, postgres_version, hub_id)`` straight from the database."""
     engine = create_async_engine(dsn)
     try:
         async with engine.connect() as conn:
@@ -477,6 +483,7 @@ async def _hub_facts(dsn: str) -> tuple[str, str]:
                 stamped = (
                     await conn.execute(text("SELECT version_num FROM alembic_version"))
                 ).all()
+                hub_row = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
             except SQLAlchemyError as exc:
                 raise BackupError(
                     "the database has no alembic_version table, so it has never been "
@@ -490,7 +497,11 @@ async def _hub_facts(dsn: str) -> tuple[str, str]:
             f"alembic_version holds {len(stamped)} rows; a hub at a single, known schema "
             "revision is a precondition for a restorable backup"
         )
-    return str(stamped[0][0]), version
+    # None only for a hub that has not started a service since migrating. Not
+    # an error: the backup is still restorable, it just cannot name its origin
+    # as precisely.
+    hub_id = UUID(str(hub_row[0])) if hub_row is not None else None
+    return str(stamped[0][0]), version, hub_id
 
 
 async def _create_vm_snapshot(vm_url: str) -> str:
@@ -528,7 +539,7 @@ async def create_backup(
     always a choice somebody made rather than a variable somebody forgot.
     """
     pg_dump = _pg_binary("pg_dump", pg_bin)
-    schema_revision, postgres_version = await _hub_facts(dsn)
+    schema_revision, postgres_version, hub_id = await _hub_facts(dsn)
     snapshot = await _create_vm_snapshot(vm_url) if vm_url else None
 
     uri, env = _libpq_target(dsn)
@@ -562,6 +573,7 @@ async def create_backup(
             manifest_version=MANIFEST_VERSION,
             created_at=datetime.now(UTC),
             hub=HubIdentity(
+                hub_id=hub_id,
                 database_host=make_url(dsn).host or "",
                 database=make_url(dsn).database or "",
                 postgres_version=postgres_version,

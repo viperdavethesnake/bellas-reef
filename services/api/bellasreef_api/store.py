@@ -76,6 +76,39 @@ class Store:
             )
             return secret
 
+    # ------------------------------------------------------------ identity
+
+    async def hub_id(self) -> UUID:
+        """This hub's identity, minted on first call and never again.
+
+        Same lazy shape as :meth:`signing_secret`, and for the same reason: the
+        migration deliberately does not seed a row. A migration runs on every
+        hub *including one that is about to have a backup restored into it*, and
+        stamping an id at migration time would give the restored database a new
+        identity — destroying the very fact this table exists to carry.
+
+        Written here, so a restore brings the original row back with the rest of
+        the data and the archive still names the hub it came from.
+        """
+        async with self._engine.begin() as conn:
+            row = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
+            if row is not None:
+                return UUID(str(row[0]))
+
+            hub = uuid4()
+            # ON CONFLICT DO NOTHING, then re-read: two services starting
+            # together would otherwise race, and the singleton unique
+            # constraint would turn the loser's INSERT into a crash on boot.
+            await conn.execute(
+                text(
+                    "INSERT INTO hub_identity (id, singleton) VALUES (:id, true) "
+                    "ON CONFLICT (singleton) DO NOTHING"
+                ),
+                {"id": hub},
+            )
+            winner = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
+            return UUID(str(winner[0])) if winner is not None else hub
+
     # ------------------------------------------------------------ clients
 
     async def total_clients_ever(self) -> int:

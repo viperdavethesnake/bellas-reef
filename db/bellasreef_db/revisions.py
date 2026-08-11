@@ -31,6 +31,8 @@ KNOWN_REVISIONS: Final[tuple[str, ...]] = (
     "0008",
     "0009",
     "0010",
+    "0011",
+    "0012",
 )
 
 #: What a hub running this code stamps into ``alembic_version`` once migrated.
