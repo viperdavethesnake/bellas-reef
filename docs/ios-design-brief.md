@@ -1,6 +1,6 @@
-# iOS app — design brief v1.2
+# iOS app — design brief v1.3
 
-**Status:** active — v1.2 amends §2 (destructive controls vs safety red); v1.1 added §7 UX standards · **Owner:** David / Bella's Reef LLC
+**Status:** active — v1.3 adds violet to §2 as the silence class's colour; v1.2 amends §2 (destructive controls vs safety red); v1.1 added §7 UX standards · **Owner:** David / Bella's Reef LLC
 **Scope:** look/feel, palette, screen map, UX standards, and the one contract
 change the app design requires. The app is closed-source (see PRD Q3); this
 brief lives in the public repo because it drives API and contract decisions,
@@ -31,6 +31,7 @@ The tank carries the color; the UI stays nearly monochrome.
 | Accent | Single saturated electric teal/cyan | Interactive elements and the healthy state. One accent, everywhere. |
 | Amber | Attention | Stale sensor, pending approval, override active. |
 | Red | Safety only, in status and data | Interlock latched, fail-safe fired, clock untrusted. **Red never appears in status or data display for anything else** — when a reading or a status line goes red, it means something. |
+| Violet | The silence alert class, and nothing else | Added v1.3. A probe has stopped reporting: *we no longer know*, as distinct from we know and it is bad. **This color has exactly one meaning and may never be borrowed for a second one.** Amber would file "nobody has any idea what the tank is doing" beside "the tank is slightly cold", and the first is strictly worse. Red would assert a certainty about the water that silence is precisely the absence of. Violet sits outside the temperature metaphor on purpose: this band is a statement about the instrumentation, not about the tank. Applies to the silence banner, its glyph, and its History band; it is not an accent, not a chart series color, and not available for a future feature that merely needs a fifth hue. |
 | Destructive controls | Standard iOS red | Amended v1.2. Destructive *controls* — `.destructive` buttons, confirmation dialogs, swipe-to-delete — follow the platform convention, including its red. This is not a safety signal and does not weaken the rule above: safety-red governs what the app is *telling you about the tank*, while control-red is what iOS uses to say "this deletes something". Overloading a system-standard control colour would make unpair look like a hardware fault. |
 | Channel colors | Inherited from fixture config | A royal-blue channel renders royal blue. The lighting screen's palette comes from the hardware, not the design system. |
 
