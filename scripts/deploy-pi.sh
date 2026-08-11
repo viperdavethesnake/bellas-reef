@@ -63,6 +63,12 @@ step "installing unit files"
 ssh "$PI_HOST" "sudo install -m 0644 ${PI_DIR}/deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload" \
     || die "could not install units"
 
+step "enabling services at boot"
+# Idempotent, and separate from restart on purpose: `systemctl restart` on a
+# disabled unit starts it now and forgets it at the next power cut, which on a
+# tank is the outage you find out about from a thermometer.
+ssh "$PI_HOST" "sudo systemctl enable ${UNITS[*]} 2>&1 | tail -1" || die "could not enable units"
+
 step "restarting services"
 # Restarted oldest-dependency-first. hardware-io provisions the streams the
 # others bind to, and the API's registry consumer retries until the stream
