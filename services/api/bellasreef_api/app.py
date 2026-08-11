@@ -517,6 +517,19 @@ def build_app(
         entire point of it. Note that the ASGI transport used in tests does not
         run lifespans, so the consumer stays out of the way there.
         """
+        # Mint the hub's identity if this is its first boot. Here rather than
+        # in the migration, which also runs on a hub about to have a backup
+        # restored into it — stamping an id there would give the restored
+        # database a new identity and destroy the fact the row exists to carry.
+        #
+        # Best effort: a hub that cannot write its own name should still serve
+        # temperatures. It shows up as a backup manifest with a null hub_id,
+        # which the archive format already treats as "old, not wrong".
+        try:
+            await store.hub_id()
+        except Exception:
+            log.exception("could not establish hub identity")
+
         for name, component in (
             ("registry consumer", registry),
             ("telemetry writer", telemetry),
