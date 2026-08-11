@@ -354,3 +354,65 @@ tank controller means one stray signal hangs it until the watchdog fires.
   naive host firewall config.
 - **Unattended upgrades.** Deliberately absent so nothing reboots mid-dose. The
   trade is that patching must become a scheduled, supervised action.
+
+## 9. The device file, and the PWM overlay
+
+### `/etc/bellasreef/devices.yaml`
+
+hardware-io is topology-driven. What this hub is wired to is declared in
+`/etc/bellasreef/devices.yaml`, host-owned like the service env files beside
+it, so the code and the unit files stay identical on every hub.
+
+```bash
+sudo install -m 0644 deploy/config/devices.yaml.example /etc/bellasreef/devices.yaml
+sudo -e /etc/bellasreef/devices.yaml
+```
+
+The service **refuses to start** on a missing, malformed, or unknown-driver
+entry, and names the offending device. Coming up with a light missing is a hub
+that looks healthy and monitors half a tank, which is the failure this project
+keeps meeting in different costumes.
+
+Override the path for testing with `BELLASREEF_DEVICES_FILE`.
+
+Find probe ROM codes with:
+
+```bash
+ls /sys/bus/w1/devices/ | grep '^28-'
+```
+
+### PWM overlay — host mutation, and it needs a reboot
+
+The RP1 PWM block is present without any overlay: `pwmchip0` at
+`1f0009c000.pwm`, `npwm` 4 (measured 2026-08-11, kernel 6.18.39). What the
+overlay does is **mux header pins to it**. Without one, exporting a channel
+succeeds and drives nothing.
+
+```bash
+# In the [pi5] section of /boot/firmware/config.txt.
+# Pin and function are David's to choose — they are wiring decisions.
+dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+```
+
+Two cautions, both learned the hard way on this board:
+
+- **Never put a trailing `#` comment on a `dtoverlay=` line.** The firmware DT
+  parser can fold it into the value. This is the same rule as the 1-Wire
+  overlay in §1.
+- The `pwm-2chan` entry in `/boot/firmware/overlays/README` is written for
+  earlier silicon — it talks about BCM2711, A+/B+/Pi2, and the onboard analogue
+  audio. **The pin/function table there has not been confirmed against RP1 on
+  this board.** Confirm the mapping before wiring anything to it.
+
+After editing, reboot and confirm the channel exports:
+
+```bash
+echo 0 | sudo tee /sys/class/pwm/pwmchip0/export
+ls /sys/class/pwm/pwmchip0/pwm0/     # period duty_cycle polarity enable
+echo 0 | sudo tee /sys/class/pwm/pwmchip0/unexport
+```
+
+`/sys/class/pwm` is **not** the forbidden sysfs GPIO interface. `/sys/class/gpio`
+is deprecated and absent on this board; `/sys/class/pwm` is the current kernel
+PWM ABI and the only interface the RP1 PWM block exposes. libgpiod does not
+cover PWM — it is a GPIO character-device library, and hardware PWM is not GPIO.

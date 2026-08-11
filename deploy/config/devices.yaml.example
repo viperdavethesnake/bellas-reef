@@ -1,0 +1,82 @@
+# What this hub is wired to. Copy to /etc/bellasreef/devices.yaml on the host.
+#
+# Host-owned, like the service env files beside it: the code and the unit files
+# are identical on every hub, and this is the part that differs between tanks.
+# Adding a probe or moving a light to different silicon is an edit and a
+# restart, not a commit.
+#
+# hardware-io will NOT start if this file is missing, malformed, or names a
+# driver it does not know. That is deliberate. Coming up with a device missing
+# is a hub that looks healthy and monitors half a tank.
+#
+# Two rules worth knowing before you edit:
+#
+#   `id` is identity. It is the NATS subject token, the row in the devices
+#   table, the name on the phone, and the key its history is stored under.
+#   Changing an id orphans all of that. Changing a `binding` does not — a light
+#   moved from the Pi's PWM to a PCA9685 board keeps every bit of its past.
+#
+#   Unknown keys are refused rather than ignored. `chanel: 1` is an error, not
+#   a silent fallback to channel 0.
+
+version: 1
+
+actuators:
+  # David's build: two LED channels on the Pi's own hardware PWM.
+  #
+  # `channel` is the pwmchip channel, not a GPIO number. Which pin it lands on
+  # is set by the PWM overlay in config.txt — see docs/host-setup.md §9.
+  #
+  # `inverted` follows the output stage and is set from bench measurement, not
+  # from reasoning. Leave it false until a meter says otherwise.
+  - id: led-blue
+    role: light
+    binding:
+      driver: pi-pwm
+      channel: 0
+      inverted: false
+
+  - id: led-white
+    role: light
+    binding:
+      driver: pi-pwm
+      channel: 1
+      inverted: false
+
+  # The many-channel option, for a hub that outgrows two. Same contract, same
+  # safety registration, invisible to everything above hardware-io — the only
+  # thing that changes upward is `driver_id`.
+  #
+  # BENCH-BLOCKED: the PCA9685 driver has never driven a real light. Do not
+  # uncomment on a hub wired to lights until the bench session passes.
+  #
+  # - id: led-red
+  #   role: light
+  #   binding:
+  #     driver: pca9685
+  #     channel: 0
+  #     bus: 1
+  #     address: 0x40
+
+sensors:
+  # Probes are addressed by ROM code — the probe's own identity, burned in at
+  # manufacture, so it survives being moved to another port on the bus. The ROM
+  # is deliberately not the device id: replacing a failed probe should change
+  # one line here rather than rewrite the history of the tank.
+  #
+  # Find them with: ls /sys/bus/w1/devices/ | grep '^28-'
+  - id: display-tank
+    binding:
+      driver: ds18b20
+      rom: 28-000000bfe244
+      poll_interval_s: 5.0
+
+  # Declare a probe before it is wired and the hub knows it is missing: the
+  # silence watcher raises an alert for a declared probe that never reports,
+  # where an undiscovered one is simply invisible. That is the difference
+  # between "no second probe" and "the second probe fell off the bus".
+  #
+  # - id: sump
+  #   binding:
+  #     driver: ds18b20
+  #     rom: 28-0000010c4d91

@@ -19,7 +19,8 @@ import signal
 import subprocess
 import time
 from datetime import UTC, datetime
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 from uuid import uuid4
 
 from bellasreef_contracts import (
@@ -34,9 +35,11 @@ from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
-from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
+from bellasreef_hardware_io.drivers.onewire import DS18B20
+from bellasreef_hardware_io.factory import build_actuators, build_sensors
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
+from bellasreef_hardware_io.topology import DEVICES_PATH, load_topology
 
 __all__ = ["HardwareIO", "clock_is_trusted", "main"]
 
@@ -158,15 +161,56 @@ class HardwareIO:
 
     # ------------------------------------------------------------- lifecycle
 
-    def discover(self) -> None:
-        """Attach every DS18B20 the kernel has enumerated."""
-        for probe in discover_probes():
-            driver = DS18B20(probe)
-            self.sensors.append(driver)
+    def load_devices(self, path: Path | None = None) -> None:
+        """Build every device this hub declares. Nothing here is hardcoded.
+
+        Replaces a `discover()` that enumerated whatever the kernel had found on
+        the 1-Wire bus and constructed a DS18B20 for each. Two problems with
+        that, and the second is the serious one.
+
+        It could only ever build one kind of thing, so a second driver type
+        meant another branch in this file.
+
+        And discovery cannot tell "no second probe" from "the second probe
+        fell off the bus". A hub that enumerates one probe where yesterday it
+        found two comes up perfectly healthy and monitors half the tank.
+        Declared devices do not have that failure: a probe named in the file
+        and not reporting is a probe the silence watcher raises an alert about.
+
+        A bad entry raises. hardware-io does not start with a device missing —
+        see topology.py.
+        """
+        topology = load_topology(path or DEVICES_PATH)
+
+        for sensor in build_sensors(topology):
+            self.sensors.append(sensor)
             log.info(
                 "sensor attached",
-                extra={"driver_id": driver.driver_id, "sensor_type": driver.sensor_type},
+                extra={"driver_id": sensor.driver_id, "sensor_type": sensor.sensor_type},
             )
+
+        for built in build_actuators(topology, open_i2c=self._open_i2c):
+            self.supervisor.register(built.registration, built.driver)
+            self._registrations.append(built.registration)
+            log.info(
+                "actuator attached",
+                extra={
+                    "actuator_id": built.registration.actuator_id,
+                    "driver_id": built.registration.driver_id,
+                },
+            )
+
+    @staticmethod
+    def _open_i2c(bus: int) -> Any:
+        """Open a real I²C bus. Imported lazily so a Pi-only build still runs.
+
+        A hub with no PCA9685 declared never reaches this, and on a dev machine
+        `smbus2` may not be installed at all — which must not stop the tests or
+        a PWM-only hub from starting.
+        """
+        from smbus2 import SMBus
+
+        return SMBus(bus)
 
     def register_drill_actuator(self) -> None:
         """Attach a fake actuator so the restart drill has something to assert.
@@ -488,7 +532,10 @@ async def _amain() -> int:
         liveness_timeout_s=float(os.environ.get("BELLASREEF_LIVENESS_TIMEOUT_S", "15")),
         metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9101")),
     )
-    service.discover()
+    # Topology-driven. A missing or invalid device file raises here and the
+    # service does not start — deliberately louder than coming up with nothing
+    # attached, which is a hub that looks healthy and monitors an empty room.
+    service.load_devices(Path(os.environ.get("BELLASREEF_DEVICES_FILE", str(DEVICES_PATH))))
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

@@ -23,9 +23,9 @@ from typing import Any
 
 import pytest
 from bellasreef_contracts import BinaryLevel, PwmLevel
+from bellasreef_hardware_io.drivers.dimming import MIN_USABLE_DUTY
 from bellasreef_hardware_io.drivers.pca9685 import (
     INVRT_ON,
-    MIN_USABLE_DUTY,
     OPEN_DRAIN,
     PCA9685_PRE_SCALE,
     Pca9685Channel,

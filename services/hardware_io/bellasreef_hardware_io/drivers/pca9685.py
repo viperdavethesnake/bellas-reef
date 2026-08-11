@@ -39,20 +39,17 @@ would eventually reinvent it.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import Final, Protocol
 
-from bellasreef_contracts import ActuatorLevel, PwmLevel
+from bellasreef_contracts import ActuatorLevel, ActuatorRegistration, PwmLevel
 from bellasreef_service import get_logger
 
-if TYPE_CHECKING:
-    from bellasreef_contracts import ActuatorRegistration
+from bellasreef_hardware_io.drivers.dimming import light_registration, snap_duty
 
 log = get_logger(__name__)
 
 __all__ = [
     "INVRT_ON",
-    "MIN_USABLE_DUTY",
     "OPEN_DRAIN",
     "PCA9685_PRE_SCALE",
     "I2CBus",
@@ -132,18 +129,6 @@ INVRT_ON: Final = True
 #: never a chosen value — just what the silicon powers up with.
 PCA9685_PRE_SCALE: Final = 11
 
-#: Below this the XLG output is undefined — it may flicker, sit dark, or go to
-#: full. This is a property of the LED driver, not something software can smooth
-#: over.
-#:
-#: Ruled in session-4 planning and recorded in CLAUDE.md "Verified host facts":
-#: **anything under 8% snaps to 0.** Not clamped up to 0.08. A diurnal ramp
-#: crosses this band twice every day, so dawn and dusk are the normal path
-#: through it, not an edge case — and of the two options, snapping down is the
-#: one that cannot leave a channel emitting light at a duty the hardware refuses
-#: to define.
-MIN_USABLE_DUTY: Final = 0.08
-
 
 class I2CBus(Protocol):
     """The narrow slice of SMBus this driver needs.
@@ -173,11 +158,12 @@ def duty_to_counts(duty: float) -> tuple[int, int]:
       every day.
     * ``>= 0.08`` — passed through as a counted duty.
     """
-    if duty <= 0.0 or duty < MIN_USABLE_DUTY:
+    snapped = snap_duty(duty)
+    if snapped <= 0.0:
         return (0, _FULL << 8)
-    if duty >= 1.0:
+    if snapped >= 1.0:
         return (_FULL << 8, 0)
-    return (0, min(round(duty * _COUNTS), _COUNTS - 1))
+    return (0, min(round(snapped * _COUNTS), _COUNTS - 1))
 
 
 class Pca9685Device:
@@ -338,39 +324,14 @@ def registration(
     max_runtime_s: float = 18 * 3600.0,
     heartbeat_timeout_s: float = 30.0,
 ) -> ActuatorRegistration:
-    """The registration for one LED channel, with the full R1 safety triple.
+    """This channel's registration, from the shared light rule.
 
-    ``authoritative`` because hardware-io handles nothing else
-    (device-classes.md §3): the bus is local, synchronous and deterministic, and
-    a write either lands or raises. That declaration is what obliges the other
-    three fields, and PRD R1 rejects the registration without them.
-
-    ``max_runtime_s`` defaults to 18 hours. This is a *runaway* bound, not a
-    photoperiod: a reef light legitimately runs 10-12 hours a day, so anything
-    near that would trip on a normal Tuesday and teach the operator to ignore
-    it. 18 hours is comfortably longer than any real schedule and far shorter
-    than "forever", which is what a stuck-on channel would otherwise be.
-
-    ``heartbeat_timeout_s`` is 30s, matching the drill actuator. Lose the
-    control engine for half a minute and the channel goes dark — which for a
-    light is a visible, survivable failure, and the reason lighting was chosen
-    as the first actuator at all.
+    Shared with the RP1 PWM driver on purpose: a channel's safety contract must
+    not change because the wiring moved to different silicon.
     """
-    from uuid import uuid4
-
-    from bellasreef_contracts import ActuatorRegistration
-
-    return ActuatorRegistration(
-        message_id=uuid4(),
-        emitted_at=datetime.now(UTC),
-        source="hardware-io",
+    return light_registration(
         actuator_id=channel.actuator_id,
-        actuator_class="pwm",
-        role="light",
         driver_id=channel.driver_id,
-        control_authority="authoritative",
-        failsafe_capable=True,
-        transport="local",
         safe_state=channel.safe_state,
         max_runtime_s=max_runtime_s,
         heartbeat_timeout_s=heartbeat_timeout_s,
