@@ -59,6 +59,18 @@ step "syncing dependencies"
 ssh "$PI_HOST" "cd ${PI_DIR} && uv sync --frozen 2>&1 | tail -3" \
     || die "uv sync failed on ${PI_HOST}"
 
+step "applying migrations"
+# Before the restart, so the new code never meets the old schema. Caught the
+# hard way: a deploy that shipped code reading `sensor_alerts.alert_class` to a
+# database that had never heard of it, and control-engine crash-looped on boot.
+#
+# Migrations here are additive by policy, so the *old* code running during this
+# window is fine. Note that the restore flow deliberately does NOT do this —
+# see docs/backup-restore.md, where migrating before a restore is exactly the
+# mistake that gets an archive refused.
+ssh "$PI_HOST" "cd ${PI_DIR}/db && set -a && . /etc/bellasreef/api.env && set +a && uv run alembic upgrade head 2>&1 | tail -5" \
+    || die "alembic upgrade failed on ${PI_HOST}"
+
 step "installing unit files"
 ssh "$PI_HOST" "sudo install -m 0644 ${PI_DIR}/deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload" \
     || die "could not install units"
