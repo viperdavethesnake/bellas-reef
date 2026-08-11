@@ -13,6 +13,11 @@ dependencies = [
     "sqlalchemy>=2.0.36",
     "asyncpg>=0.30",
     "nats-py>=2.9",
+    # The telemetry writer and the backup command both speak HTTP to
+    # VictoriaMetrics. This was already imported by telemetry.py and only
+    # resolved because the workspace dev group happens to pull it in — the
+    # built image would have failed at import.
+    "httpx>=0.28",
 ]
 
 [project.scripts]
