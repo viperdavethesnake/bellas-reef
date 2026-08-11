@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal
 
 import yaml
 from bellasreef_contracts import DeviceId
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 __all__ = [
     "DEVICES_PATH",
@@ -121,6 +121,28 @@ class Topology(_Strict):
     version: Literal[1] = 1
     actuators: list[ActuatorEntry] = Field(default_factory=list)
     sensors: list[SensorEntry] = Field(default_factory=list)
+
+    @field_validator("actuators", "sensors", mode="before")
+    @classmethod
+    def _empty_section_is_empty(cls, value: object) -> object:
+        """A section header with nothing under it means "none of these".
+
+        YAML parses
+
+            actuators:
+              # - id: led-blue
+              #   ...
+
+        as null, not as an empty list — and commenting a section out while
+        leaving its header is the most natural edit an operator will ever make
+        to this file. It cost a failed deploy the first time.
+
+        Accepted deliberately, and it does not soften anything that matters:
+        an unknown driver or a malformed binding is still refused. The
+        strictness is there to catch entries that are wrong, not to punish a
+        section that is empty.
+        """
+        return [] if value is None else value
 
     def device_ids(self) -> list[str]:
         return [e.id for e in self.actuators] + [e.id for e in self.sensors]

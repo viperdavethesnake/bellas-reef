@@ -287,3 +287,25 @@ class _FakeBus:
 
     def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
         return None
+
+
+def test_a_commented_out_section_is_empty_not_invalid(tmp_path: Path) -> None:
+    """`actuators:` with every entry commented out parses as null, not [].
+
+    Commenting a section out while leaving its header is the most natural edit
+    anyone will make to this file, and it cost a failed deploy the first time.
+    Accepting it softens nothing that matters: an unknown driver or a malformed
+    binding is still refused.
+    """
+    empty_section = """
+version: 1
+actuators:
+  # - id: led-blue
+  #   binding: {driver: pi-pwm, channel: 0}
+sensors:
+  - id: display-tank
+    binding: {driver: ds18b20, rom: 28-000000bfe244}
+"""
+    topology = load_topology(_write(tmp_path, empty_section))
+    assert topology.actuators == []
+    assert [s.id for s in topology.sensors] == ["display-tank"]
