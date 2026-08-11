@@ -15,6 +15,7 @@ passes every unit test and still tops off a tank an hour late.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
 from collections.abc import Callable, Coroutine
@@ -425,22 +426,28 @@ def test_a_deleted_consumer_is_re_established_in_place() -> None:
         supervisor = InterlockSupervisor(on_event=Recorder())
         consumer = CommandConsumer(spine, supervisor, durable=f"heal-{uuid.uuid4().hex[:8]}")
         await consumer.subscribe()
-        assert await consumer.drain_once(timeout=0.2) == []
+        try:
+            assert await consumer.drain_once(timeout=0.2) == []
 
-        # Pull it out from under the running consumer.
-        await spine.js.delete_consumer("BR_CMD", consumer._durable)
+            # Pull it out from under the running consumer.
+            await spine.js.delete_consumer("BR_CMD", consumer._durable)
 
-        # First drain notices and heals; it returns nothing because the fetch
-        # that discovered the loss carried no messages.
-        await consumer.drain_once(timeout=0.2)
-        healed = consumer._sub is not None
-        attempts = consumer._heal_attempts
+            # First drain notices and heals; it returns nothing because the
+            # fetch that discovered the loss carried no messages.
+            await consumer.drain_once(timeout=0.2)
+            healed = consumer._sub is not None
+            attempts = consumer._heal_attempts
 
-        # And it keeps working afterwards.
-        assert await consumer.drain_once(timeout=0.2) == []
-        await spine.js.delete_consumer("BR_CMD", consumer._durable)
-        await spine.close()
-        return attempts, "recovered" if healed else "still lost"
+            # And it keeps working afterwards.
+            assert await consumer.drain_once(timeout=0.2) == []
+            return attempts, "recovered" if healed else "still lost"
+        finally:
+            # In a finally, not on the happy path: an assertion above used to
+            # skip the cleanup and leave a durable holding the workqueue's
+            # only slot for this filter subject.
+            with contextlib.suppress(Exception):
+                await spine.js.delete_consumer("BR_CMD", consumer._durable)
+            await spine.close()
 
     attempts, outcome = run(scenario)
     assert outcome == "recovered"
@@ -472,15 +479,75 @@ def test_the_heal_budget_is_bounded_and_then_it_gives_up() -> None:
         consumer.subscribe = always_fails  # type: ignore[method-assign]
         consumer.HEAL_BACKOFF_S = 0.01
 
-        for _ in range(consumer.MAX_HEAL_ATTEMPTS):
-            await consumer._heal(RuntimeError("gone"))
+        try:
+            for _ in range(consumer.MAX_HEAL_ATTEMPTS):
+                await consumer._heal(RuntimeError("gone"))
+
+            try:
+                await consumer._heal(RuntimeError("gone"))
+            except ConsumerLostError:
+                return "gave up"
+            return "kept retrying past the budget"
+        finally:
+            # The durable created by the real subscribe() at the top is still
+            # on the stream. BR_CMD is a workqueue, which permits exactly one
+            # consumer per filter subject, so leaving it here does not merely
+            # litter — it stops hardware-io from ever binding again. This leak
+            # is what turned a recoverable consumer loss on the hub into a
+            # ten-hour outage.
+            with contextlib.suppress(Exception):
+                await spine.js.delete_consumer("BR_CMD", consumer._durable)
+            await spine.close()
+
+    assert run(scenario) == "gave up"
+
+
+@requires_nats
+def test_a_heal_that_cannot_re_subscribe_still_reaches_the_bounded_give_up() -> None:
+    """The budget has to be reachable through the path the service actually takes.
+
+    This is the bug that took the hub down for ten hours. The test above drives
+    ``_heal`` directly and passes; the running service never does that. It calls
+    ``drain_once``, and a heal that failed to re-subscribe left ``_sub`` as None,
+    so the *next* ``drain_once`` hit a bare ``raise RuntimeError("not
+    subscribed")``. The process died there — before the attempt budget could
+    advance, and therefore without the ConsumerLostError that exists to trigger
+    the drilled restart path.
+
+    Observed on the hub as `filtered consumer not unique on workqueue stream`:
+    another consumer held the filter subject, so re-creating ours could not
+    succeed no matter how many times it was tried. Healing is still the right
+    response (the squatter may be a leaked test durable that goes away), but it
+    has to be a *bounded* heal, and this is the test that says so.
+    """
+
+    async def scenario() -> str:
+        spine = Spine(nats_url())
+        await spine.connect()
+        await spine.provision()
+        supervisor = InterlockSupervisor(on_event=Recorder())
+        consumer = CommandConsumer(spine, supervisor, durable=f"stuck-{uuid.uuid4().hex[:8]}")
+        await consumer.subscribe()
+        consumer.HEAL_BACKOFF_S = 0.01
+
+        async def always_fails() -> None:
+            raise RuntimeError("another consumer owns this filter subject")
+
+        # Pull the consumer, then make re-establishing it impossible.
+        await spine.js.delete_consumer("BR_CMD", consumer._durable)
+        consumer.subscribe = always_fails  # type: ignore[method-assign]
 
         try:
-            await consumer._heal(RuntimeError("gone"))
+            for _ in range(consumer.MAX_HEAL_ATTEMPTS + 3):
+                await consumer.drain_once(timeout=0.2)
+            return "never gave up"
         except ConsumerLostError:
-            await spine.close()
             return "gave up"
-        await spine.close()
-        return "kept retrying past the budget"
+        except RuntimeError as exc:
+            return f"died the wrong way: {exc}"
+        finally:
+            with contextlib.suppress(Exception):
+                await spine.js.delete_consumer("BR_CMD", consumer._durable)
+            await spine.close()
 
     assert run(scenario) == "gave up"

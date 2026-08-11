@@ -206,6 +206,13 @@ class Spine:
         )
 
 
+#: JetStream's error code for "filtered consumer not unique on workqueue
+#: stream". Distinct from a vanished consumer, and it needs a distinct message:
+#: no amount of retrying re-creates a consumer whose filter subject somebody
+#: else is holding.
+_FILTER_NOT_UNIQUE = 10100
+
+
 class ConsumerLostError(RuntimeError):
     """The command consumer could not be recovered within its retry budget.
 
@@ -253,6 +260,9 @@ class CommandConsumer:
         self._max_deliver = max_deliver
         self._sub: JetStreamContext.PullSubscription | None = None
         self._heal_attempts = 0
+        #: Set while a heal is in flight and has not yet succeeded. It is what
+        #: lets ``drain_once`` tell "lost mid-flight" from "never subscribed".
+        self._heal_cause: Exception | None = None
 
     #: How many consecutive re-subscribe attempts before giving up and letting
     #: the process die.
@@ -282,7 +292,16 @@ class CommandConsumer:
     async def drain_once(self, *, batch: int = 16, timeout: float = 1.0) -> list[CommandOutcome]:
         """Fetch and process one batch. Returns what happened to each message."""
         if self._sub is None:
-            raise RuntimeError("not subscribed")
+            if self._heal_cause is None:
+                # Never subscribed at all. That is a caller mistake, not a
+                # broker event, and healing would paper over it.
+                raise RuntimeError("not subscribed")
+            # A heal ran and did not stick. Keep healing so the attempt budget
+            # advances to ConsumerLostError and the drilled restart path runs.
+            # Falling through to the bare RuntimeError above is how this
+            # service died on the hub with its budget still untouched.
+            await self._heal(self._heal_cause)
+            return []
         try:
             msgs = await self._sub.fetch(batch, timeout=timeout)
         except (TimeoutError, nats.errors.TimeoutError):
@@ -348,6 +367,7 @@ class CommandConsumer:
         """
         self._heal_attempts += 1
         self._sub = None
+        self._heal_cause = cause
         log.critical(
             "command consumer lost; commands are not being applied",
             extra={
@@ -373,6 +393,26 @@ class CommandConsumer:
         try:
             await self._spine.provision()
             await self.subscribe()
+        except BadRequestError as exc:
+            if exc.err_code == _FILTER_NOT_UNIQUE:
+                # Not "the consumer vanished" — "somebody else holds the filter".
+                # A workqueue stream permits exactly one consumer per filter
+                # subject, so re-creating ours cannot succeed until the other
+                # one goes. Usually a leaked test durable. Named explicitly
+                # because the operator action is different: find it and delete
+                # it, rather than wait for a retry that cannot work.
+                log.critical(
+                    "another consumer already holds this filter subject on the "
+                    "workqueue; hardware-io cannot bind until it is deleted",
+                    extra={
+                        "durable": self._durable,
+                        "attempt": self._heal_attempts,
+                        "limit": self.MAX_HEAL_ATTEMPTS,
+                    },
+                )
+            else:
+                log.exception("re-subscribe failed", extra={"durable": self._durable})
+            return
         except Exception:
             log.exception("re-subscribe failed", extra={"durable": self._durable})
             return
@@ -382,6 +422,7 @@ class CommandConsumer:
             extra={"durable": self._durable, "attempts": self._heal_attempts},
         )
         self._heal_attempts = 0
+        self._heal_cause = None
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
         await self._spine.publish_audit("command", {"event": event_type, **detail})
