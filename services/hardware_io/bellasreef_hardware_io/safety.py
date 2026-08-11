@@ -50,9 +50,19 @@ TripReason = Literal[
     "latched",
     "clock_untrusted",
     "shutdown",
+    # Not a trip: nothing was moved and nothing latched. It is here because the
+    # audit trail is the only place a misrouted controller becomes visible, and
+    # that trail is keyed on this type.
+    "unknown_actuator",
 ]
 
-CommandOutcome = Literal["applied", "rejected_expired", "rejected_latched", "rejected_clock"]
+CommandOutcome = Literal[
+    "applied",
+    "rejected_expired",
+    "rejected_latched",
+    "rejected_clock",
+    "rejected_unknown",
+]
 
 NowFn = Callable[[], datetime]
 
@@ -278,8 +288,24 @@ class InterlockSupervisor:
 
         Order matters. Clock trust is checked before expiry, because an expiry
         decision made against an untrusted clock is not a decision.
+
+        A command naming an actuator we do not own is refused rather than
+        raised. The distinction is not academic: this used to be a KeyError
+        that escaped `apply`, escaped `drain_once`, and killed the process —
+        and because BR_CMD is a workqueue, the same message was waiting on
+        restart, so the service crash-looped and the probe went silent for the
+        duration. A hub also has to tolerate this by design, since a phase-2
+        spoke announcing actuators this node has never heard of is the normal
+        case, not an error.
         """
-        guard = self._guards[command.actuator_id]
+        guard = self._guards.get(command.actuator_id)
+        if guard is None:
+            await self._emit_unowned(
+                command.actuator_id,
+                "unknown_actuator",
+                "no such actuator on this node; command refused",
+            )
+            return "rejected_unknown"
 
         if not self._clock_trusted:
             await self._emit(guard, "clock_untrusted", "clock not synchronised; command refused")
@@ -349,6 +375,24 @@ class InterlockSupervisor:
         await self._on_event(
             SafetyEvent(
                 actuator_id=guard.actuator_id,
+                reason=reason,
+                at=self._now(),
+                detail=detail,
+            )
+        )
+
+    async def _emit_unowned(self, actuator_id: str, reason: TripReason, detail: str) -> None:
+        """Report on an actuator that has no guard, because it has no guard.
+
+        Separate from :meth:`_emit` only because that one reads its id off the
+        guard, and here the whole point is that there isn't one. The event
+        still has to go out: a controller commanding the wrong node is a
+        misconfiguration that stays invisible if the message is silently
+        dropped.
+        """
+        await self._on_event(
+            SafetyEvent(
+                actuator_id=actuator_id,
                 reason=reason,
                 at=self._now(),
                 detail=detail,

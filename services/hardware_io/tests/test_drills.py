@@ -521,3 +521,51 @@ def test_actuators_start_at_safe_state() -> None:
         await sup.stop()
 
     run(scenario)
+
+
+# ------------------------------------------ drill: a command for nothing we own
+
+
+def test_a_command_for_an_unknown_actuator_is_refused_not_fatal() -> None:
+    """An unregistered actuator_id must be a refusal, never an exception.
+
+    This killed the hub. control-engine published a `led-blue` command from a
+    lighting profile; this hardware-io has one probe and zero actuators, so the
+    guard lookup raised KeyError straight out of `apply`, up through
+    `drain_once`, and out of the process.
+
+    Then it got worse than a crash. BR_CMD is a workqueue, so the command was
+    still there on restart: the service came up, fetched the same message, and
+    died again. Under systemd's Restart=always that is an unbounded crash loop,
+    and the probe publishes nothing for the whole of it. A hub that cannot
+    survive being told to move an actuator it does not have is not a hub that
+    can be extended, and phase 2 is a second node announcing new actuators.
+
+    Refusing terminates the message, so the queue drains instead of feeding the
+    loop forever.
+    """
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        pump = FakeActuator("ato-pump", OFF)
+        sup.register(_registration("ato-pump"), pump)
+        await sup.start()
+
+        outcome = await sup.apply(_command("led-blue"))
+        assert outcome == "rejected_unknown"
+
+        reasons = [e.reason for e in rec.events]
+        assert "unknown_actuator" in reasons, (
+            "a command for an actuator we do not own has to be audited; silently "
+            "dropping it makes a misrouted controller invisible"
+        )
+
+        # And the actuator we DO own is untouched. A refusal on one id must not
+        # be a side effect on another.
+        assert pump.is_safe()
+
+        # The service survives it, which is the whole point.
+        assert await sup.apply(_command("ato-pump")) == "applied"
+
+    run(scenario)
