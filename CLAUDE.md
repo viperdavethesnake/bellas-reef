@@ -51,11 +51,51 @@ Five services + spine, all containers. Hub-and-spoke ready; phase 1 is single Pi
 4. Control modules individually, each entering service via shadow mode (decisions journaled, zero actuation). Temperature CONTROL waits for relay drivers + passed drills.
 5. Clients, hardening, publication.
 
+## Environment boundary (non-negotiable)
+
+**Integration tests never connect to the hub's broker or database.** Not as a
+habit — structurally. `conftest.py` refuses to run when any `BELLASREEF_TEST_*`
+endpoint resolves to anything but loopback, or when the target database is the
+production `bellasreef`.
+
+This is not caution, it is arithmetic. Durables are shared broker state and
+BR_CMD is a workqueue that permits exactly one consumer per filter subject, so
+a test that binds a durable on the hub's NATS is *contending for the hub's own
+slot by design*. A test run cost ten hours of lost monitoring on 2026-08-10:
+a leaked `doomed-<uuid>` durable held the filter, hardware-io could not
+re-bind, and the process exited.
+
+Local integration runs use ephemeral dev containers on loopback, the same
+shape CI uses. With no container runtime installed, the integration suites do
+not run — say so explicitly with `BELLASREEF_ALLOW_ENV_SKIPS=1` and let CI be
+the place they are actually checked. Pointing them at the hub is not an
+alternative.
+
+## Deployment discipline (non-negotiable)
+
+**The Pi runs supervised systemd units, from pushed commits, only.**
+
+- No dev launchers. `scripts/dev/run-*.sh` are deleted, not deprecated. An
+  unsupervised process that exits stays exited, which is the second half of the
+  same 2026-08-10 outage.
+- No rsync, no editing on the Pi, no uncommitted state. `/home/david/bellasreef`
+  is a git clone reset to `origin/main`; anything not pushed does not run.
+- Deploy with `scripts/deploy-pi.sh`. It refuses a dirty or unpushed tree,
+  resets the Pi to the pushed commit, restarts the units, and then **verifies
+  fresh telemetry on the wire** before reporting success. A process check is
+  not a deploy check: hardware-io without `BELLASREEF_NATS_URL` starts
+  cleanly, serves metrics and publishes nothing.
+- Service environment lives in `/etc/bellasreef/<service>.env` on the host, not
+  baked into the unit files. Unit files in this repo stay machine-agnostic.
+- Logs are in journald (`journalctl -u bellasreef-hardware-io`). A log in
+  `/tmp` gets overwritten by the next start, which destroyed the evidence for
+  the first half of that outage.
+
 ## Dev environment
 
 - Dev machine: macOS. Project root: this repo.
 - Target: Raspberry Pi 5, NVMe (SD unsupported), Raspberry Pi OS/Debian arm64, kernel 6.x+. Reachable via `ssh <pi-host>` (see `.env.local`, never committed).
-- Workflow: code + unit tests on Mac; hardware-dependent integration tests run on the Pi via SSH. Images built multi-arch; deploy = `docker compose pull && up -d` on the Pi.
+- Workflow: code + unit tests on Mac; integration tests against loopback dev containers or in CI, never against the hub. Deploy with `scripts/deploy-pi.sh`.
 - Hardware access in containers: pass specific `/dev` nodes to hardware-io only. No privileged containers.
 - Host-touching config (dtoverlays: w1-gpio, i2c enable) is documented in `docs/host-setup.md` as the ONLY host mutation.
 

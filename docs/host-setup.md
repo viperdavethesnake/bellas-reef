@@ -213,16 +213,59 @@ GPIO pin map, or `config.txt`.
 A failure here is a wiring defect. Do not attempt to compensate for it in
 software — there is no software running at the moment this drill tests.
 
-## 7. hardware-io under systemd, and the restart drill
+## 7. Services under systemd, and the restart drill
 
-`deploy/systemd/bellasreef-hardware-io.service` exists for two reasons: it is
-how the service runs when not containerised, and it is the only way to
-demonstrate the `sd_notify` watchdog path.
+Every service on this host runs as a supervised systemd unit, from a pushed
+commit. There are no dev launchers; `scripts/dev/run-*.sh` were deleted on
+2026-08-11 after an unsupervised hardware-io exited and stayed exited for ten
+hours. See CLAUDE.md, "Deployment discipline".
+
+Deploy with `scripts/deploy-pi.sh`, which refuses a dirty or unpushed tree,
+resets `/home/david/bellasreef` to the pushed commit, installs the units,
+restarts them, and then waits for a fresh sample to reach VictoriaMetrics
+before reporting success.
+
+### Service configuration lives on the host
+
+The unit files carry no environment values, so the same unit works on any hub.
+Configuration is read from:
+
+```
+/etc/bellasreef/hardware-io.env
+/etc/bellasreef/control-engine.env
+/etc/bellasreef/api.env
+```
+
+Mode `0640`, group `david`. They hold the database DSN, which contains a
+password, and `Environment=` lines in a unit file are readable by any user
+through `systemctl show`.
+
+`BELLASREEF_NATS_URL` is the entry that bites. Leave it out and hardware-io
+reads the probe, serves metrics, logs a clean startup, and publishes nothing at
+all. Nothing about the process looks wrong; the tank is simply not monitored.
+That is why `deploy-pi.sh` verifies a sample on the wire instead of a process
+in the table.
+
+### Logs are in journald
 
 ```bash
-sudo cp deploy/systemd/bellasreef-hardware-io.service /etc/systemd/system/
+journalctl -u bellasreef-hardware-io -f
+journalctl -u bellasreef-hardware-io --since "2 hours ago"
+```
+
+Not `/tmp/*.log`. A log in `/tmp` is truncated by the next start, which is how
+the evidence for the first half of the 2026-08-10 outage was destroyed before
+anyone read it.
+
+### Installing by hand
+
+`deploy-pi.sh` does this for you; the manual form is here for a first
+bring-up.
+
+```bash
+sudo install -m 0644 deploy/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now bellasreef-hardware-io
+sudo systemctl enable --now bellasreef-hardware-io bellasreef-control-engine bellasreef-api
 ```
 
 The unit is ordered `After=time-sync.target` / `Wants=time-sync.target`. On a

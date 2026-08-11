@@ -37,9 +37,14 @@ WorkingDirectory=/home/david/bellasreef
 # for no benefit.
 ExecStart=/home/david/bellasreef/.venv/bin/python -m bellasreef_hardware_io.app
 
-Environment=BELLASREEF_LOG_LEVEL=INFO
-Environment=BELLASREEF_LIVENESS_TIMEOUT_S=15
-Environment=BELLASREEF_METRICS_PORT=9101
+# Machine-specific configuration lives on the host, not in this file, so the
+# unit stays the same on every hub. BELLASREEF_NATS_URL belongs here and its
+# absence is the trap: without it hardware-io reads the probe, serves
+# metrics, logs a clean startup and publishes nothing at all.
+#
+# Not Environment= lines: a secret in a unit file is world-readable via
+# `systemctl show`, and control-engine's DSN carries the database password.
+EnvironmentFile=/etc/bellasreef/hardware-io.env
 
 StandardOutput=journal
 StandardError=journal
