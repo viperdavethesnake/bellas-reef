@@ -190,6 +190,7 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 | Interface | Path | State |
 |---|---|---|
 | I²C | `/dev/i2c-1` | enabled; see device inventory below |
+| PWM (RP1) | `/sys/class/pwm/pwmchip0` | `1f0009c000.pwm`; **npwm reads 4** (measured 2026-08-11, kernel 6.18.39, no PWM overlay loaded) |
 | I²C (HDMI DDC) | `/dev/i2c-13`, `/dev/i2c-14` | ignore |
 | 1-Wire | `/sys/bus/w1/devices/w1_bus_master1` | live; DS18B20 probes appear as `28-*` |
 | SPI | — | disabled (`dtoverlay=nospi10`) |
@@ -204,6 +205,14 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 
 `0x70` on a bus scan is **not a second board** — it is the PCA9685's ALLCALLADR
 (`0x05` reads `0xE0`; `0xE0 >> 1 = 0x70`). Expect both addresses from one chip.
+
+**PWM channel count, and a discrepancy with the archive.** Our Pi reports
+`npwm` **4**. The archived HAL README (v3.1.0) states the count "should show: 2"
+and calls two channels the hardware reality. Both are recorded; ours is the
+measured one, taken with no PWM overlay loaded. Which channels reach GPIO12/13
+is set by the overlay, and the mapping the archive gives — channel 0→GPIO12,
+channel 1→GPIO13 — has not been confirmed on this board. Do not resolve this
+from the number alone.
 
 **Measured DS18B20 read cost: 831 ms** on this hardware, above the ~750 ms
 datasheet conversion time. This is the empirical basis for the driver-interface

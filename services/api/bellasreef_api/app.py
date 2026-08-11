@@ -48,7 +48,7 @@ from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
 from bellasreef_api.history import DEFAULT_BUCKETS, MAX_BUCKETS, HistoryReader
-from bellasreef_api.registry import RegistryConsumer
+from bellasreef_api.registry import CapabilityConsumer, RegistryConsumer
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -193,6 +193,33 @@ class AuditEvent(BaseModel):
     subject: str
     device_id: str | None
     event: dict[str, Any]
+
+
+class CapabilityView(BaseModel):
+    """One thing this hub's hardware can offer, and whether it is claimed.
+
+    The app's "find devices" source. A capability is a fact about the hardware —
+    this hub has PWM channels — true whether or not anybody has decided what
+    they are for. `bound_to` is the device that claimed it, or null if it is
+    free to bind.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["pi-pwm", "pca9685", "w1-bus"]
+    #: Stable within its source, and what a binding names: the channel number
+    #: for PWM, the ROM code for a 1-Wire probe.
+    channel: str
+    #: Whatever the announcement carried that is worth rendering — the GPIO a
+    #: channel reaches, the I2C address, the bus master.
+    detail: dict[str, Any]
+    announced_at: datetime
+    #: The device_id that has claimed this channel, or null.
+    bound_to: str | None = None
+
+    @property
+    def bound(self) -> bool:
+        return self.bound_to is not None
 
 
 class DeviceView(BaseModel):
@@ -505,6 +532,7 @@ def build_app(
         return secret_cache["secret"]
 
     registry = RegistryConsumer(nats_url, store) if nats_url else None
+    capabilities = CapabilityConsumer(nats_url, store) if nats_url else None
     telemetry = (
         TelemetryWriter(nats_url, vm_url, store, durable_suffix=durable_suffix)
         if nats_url and vm_url
@@ -538,6 +566,7 @@ def build_app(
 
         for name, component in (
             ("registry consumer", registry),
+            ("capability consumer", capabilities),
             ("telemetry writer", telemetry),
             ("audit writer", audit_writer),
         ):
@@ -565,6 +594,7 @@ def build_app(
     # The audit writer spent its whole life constructible and unstarted.
     app.state.background = {
         "registry consumer": registry,
+        "capability consumer": capabilities,
         "telemetry writer": telemetry,
         "audit writer": audit_writer,
     }
@@ -595,6 +625,24 @@ def build_app(
     @app.get("/healthz", tags=["ops"], operation_id="health")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get(
+        "/api/v1/capabilities",
+        response_model=list[CapabilityView],
+        tags=["devices"],
+        operation_id="listCapabilities",
+        responses={401: AUTH_401},
+    )
+    async def list_capabilities(
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> list[CapabilityView]:
+        """What the hardware can offer, and what has been claimed.
+
+        Tier one of the registry, and the app's find-devices source. Announced
+        by hardware-io on startup; nothing here is a device until an operator
+        binds it.
+        """
+        return [CapabilityView(**row) for row in await store.list_capabilities()]
 
     @app.get("/api/v1/info", response_model=Info, tags=["discovery"], operation_id="info")
     async def info() -> Info:

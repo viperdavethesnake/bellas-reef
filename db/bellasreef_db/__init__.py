@@ -8,6 +8,7 @@ from bellasreef_db.models import (
     AuditLog,
     Base,
     CalibrationRecord,
+    Capability,
     Device,
     DosingTransaction,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "AuditLog",
     "Base",
     "CalibrationRecord",
+    "Capability",
     "ClockUntrustedError",
     "Device",
     "DosingTransaction",

@@ -35,6 +35,7 @@ from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
+from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.factory import build_actuators, build_sensors
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
@@ -200,6 +201,31 @@ class HardwareIO:
                 },
             )
 
+    async def _announce_capabilities(self) -> None:
+        """Tell the registry what this hub's hardware can offer.
+
+        Read-only discovery: nothing here exports a PWM channel or touches a
+        pin. Announcing what exists must never change what it is doing.
+
+        A source that finds nothing still announces an empty list rather than
+        staying silent — "this hub has no 1-Wire probes" and "nobody has asked"
+        are different answers, and only one of them lets an operator conclude
+        the bus is empty.
+        """
+        if self.spine is None:
+            return
+        for announcement in (discover_pwm(), discover_w1()):
+            if announcement is None:
+                continue
+            await self.spine.publish_capabilities(announcement)
+            log.info(
+                "capability announced",
+                extra={
+                    "hardware_source": announcement.hardware_source,
+                    "channels": len(announcement.channels),
+                },
+            )
+
     @staticmethod
     def _open_i2c(bus: int) -> Any:
         """Open a real I²C bus. Imported lazily so a Pi-only build still runs.
@@ -332,6 +358,12 @@ class HardwareIO:
         self.spine = Spine(url)
         await self.spine.connect()
         await self.spine.provision()
+
+        # Capabilities before registrations: what the hardware can offer is
+        # true whether or not anyone has bound it, and a client opening a "find
+        # devices" screen needs the offer list even on a hub where nothing has
+        # been declared yet.
+        await self._announce_capabilities()
 
         for registration in self._registrations:
             await self.spine.publish_registration(registration)

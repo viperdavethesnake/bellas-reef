@@ -389,20 +389,27 @@ overlay does is **mux header pins to it**. Without one, exporting a channel
 succeeds and drives nothing.
 
 ```bash
-# In the [pi5] section of /boot/firmware/config.txt.
-# Pin and function are David's to choose — they are wiring decisions.
-dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+# In /boot/firmware/config.txt. Two single-channel overlays, not pwm-2chan —
+# this is the form the archived HAL (v3.1.0) shipped and ran on real hardware.
+dtoverlay=pwm,pin=12,func=4
+dtoverlay=pwm,pin=13,func=4
 ```
 
-Two cautions, both learned the hard way on this board:
+Channel mapping, from the archive: **channel 0 → GPIO12, channel 1 → GPIO13.**
+
+Three cautions:
 
 - **Never put a trailing `#` comment on a `dtoverlay=` line.** The firmware DT
-  parser can fold it into the value. This is the same rule as the 1-Wire
-  overlay in §1.
-- The `pwm-2chan` entry in `/boot/firmware/overlays/README` is written for
-  earlier silicon — it talks about BCM2711, A+/B+/Pi2, and the onboard analogue
-  audio. **The pin/function table there has not been confirmed against RP1 on
-  this board.** Confirm the mapping before wiring anything to it.
+  parser can fold it into the value. Same rule as the 1-Wire overlay in §1.
+- **`npwm` disagrees with the archive.** Ours reads **4**; the archive states it
+  should read 2 and calls two channels the hardware reality. Recorded in
+  CLAUDE.md, unresolved. hardware-io announces whatever `npwm` reports rather
+  than assuming a count, so this disagreement does not have to be settled before
+  the registry works — but it should be settled before anyone trusts channels
+  2 and 3.
+- The channel→GPIO mapping is reported to clients as a convenience and **has not
+  been confirmed on this board**. It is a wiring fact; confirm it before binding
+  anything to a pin.
 
 After editing, reboot and confirm the channel exports:
 

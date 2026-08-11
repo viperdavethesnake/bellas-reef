@@ -10,6 +10,7 @@ and the constraints are doing real work that an ORM layer would only obscure.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -108,6 +109,76 @@ class Store:
             )
             winner = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
             return UUID(str(winner[0])) if winner is not None else hub
+
+    # ------------------------------------------------------------ capabilities
+
+    async def replace_capabilities(
+        self, source: str, channels: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        """Store what one hardware source announced, replacing what it said before.
+
+        Replace rather than merge. What the hardware reports is the truth, so a
+        channel that has gone away must stop being offered — a merge would leave
+        an operator able to bind a PCA9685 channel on a board that is no longer
+        on the bus.
+
+        Scoped to one source: a PWM announcement must not clear the 1-Wire bus.
+        """
+        async with self._engine.begin() as conn:
+            if channels:
+                await conn.execute(
+                    text(
+                        "DELETE FROM capabilities WHERE source = :source AND channel <> ALL(:keep)"
+                    ),
+                    {"source": source, "keep": [c for c, _ in channels]},
+                )
+            else:
+                await conn.execute(
+                    text("DELETE FROM capabilities WHERE source = :source"),
+                    {"source": source},
+                )
+
+            for channel, detail in channels:
+                await conn.execute(
+                    text(
+                        "INSERT INTO capabilities (id, source, channel, detail, announced_at) "
+                        "VALUES (:id, :source, :channel, CAST(:detail AS jsonb), :now) "
+                        "ON CONFLICT (source, channel) DO UPDATE "
+                        "SET detail = EXCLUDED.detail, announced_at = EXCLUDED.announced_at"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source": source,
+                        "channel": channel,
+                        "detail": json.dumps(detail),
+                        "now": datetime.now(UTC),
+                    },
+                )
+
+    async def list_capabilities(self) -> list[dict[str, Any]]:
+        """Every announced capability, with whether a device has claimed it.
+
+        The bound flag is computed by joining rather than stored, because a
+        binding lives on the device and storing a copy here would be two places
+        that can disagree about whether a channel is free.
+        """
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT c.source, c.channel, c.detail, c.announced_at, "
+                        "       d.device_id AS bound_to "
+                        "  FROM capabilities c "
+                        "  LEFT JOIN devices d "
+                        "         ON d.driver_type = c.source "
+                        "        AND d.adopted "
+                        "        AND COALESCE(d.binding ->> 'channel', d.binding ->> 'rom') "
+                        "            = c.channel "
+                        " ORDER BY c.source, c.channel"
+                    )
+                )
+            ).mappings()
+            return [dict(row) for row in rows]
 
     # ------------------------------------------------------------ clients
 

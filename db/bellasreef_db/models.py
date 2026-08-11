@@ -103,6 +103,32 @@ class Device(Base):
     #: id rather than showing "ds18b20-28-000000bfe244" and calling it a name.
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
+    #: Where in the system this device physically is — "sump", "display left".
+    #: Free text and nullable: it is for the operator's eyes, and a hub with one
+    #: tank has nothing useful to put here.
+    location: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # ---- binding: which capability channel this device is assigned to ----
+    #
+    # A device's identity (device_id, name, history) is independent of where it
+    # is bound. Rebinding a light to different silicon changes these columns and
+    # nothing else, so its subject, its alert history and its name all carry on.
+
+    #: ``pi-pwm`` | ``pca9685`` | ``ds18b20``. NULL means announced but not yet
+    #: adopted — a 1-Wire probe the hub can see and the operator has not claimed.
+    driver_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    #: Driver-specific binding, validated per driver at the API boundary.
+    #: ``{"channel": 0}`` for pi-pwm; ``{"bus": 1, "address": 64, "channel": 3}``
+    #: for pca9685; ``{"rom": "28-..."}`` for ds18b20.
+    binding: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    #: True once the operator has claimed this device. An announced-unadopted
+    #: device is visible through the API and inert: hardware-io builds no driver
+    #: for it, so a probe appearing on the bus cannot start publishing under a
+    #: name nobody chose.
+    adopted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
@@ -113,6 +139,17 @@ class Device(Base):
 
     __table_args__ = (
         CheckConstraint("kind IN ('sensor', 'actuator')", name="kind_valid"),
+        CheckConstraint(
+            "driver_type IS NULL OR driver_type IN ('pi-pwm', 'pca9685', 'ds18b20')",
+            name="driver_type_valid",
+        ),
+        # Adopted means bound. The pair is what hardware-io keys on when it asks
+        # the registry what to build, and an adopted device with no binding
+        # would be an assignment to nowhere.
+        CheckConstraint(
+            "NOT adopted OR (driver_type IS NOT NULL AND binding IS NOT NULL)",
+            name="adopted_devices_are_bound",
+        ),
         # A name of spaces is not a name. Blank-but-present would defeat the
         # fallback: clients check for NULL, and "   " is not NULL.
         CheckConstraint(
@@ -246,6 +283,54 @@ class Device(Base):
             """,
             name="clear_zone_is_reachable",
         ),
+    )
+
+
+class Capability(Base):
+    """What a hardware source has announced it can do.
+
+    Tier one of the registry. hardware-io announces these on startup — the PWM
+    channels it can see, the 1-Wire bus, a PCA9685 if one is on the I²C bus —
+    and the API stores them. This is what a "find devices" screen lists.
+
+    Deliberately separate from :class:`Device`. A capability is a fact about the
+    hardware: this hub has four PWM channels whether or not anybody has decided
+    what they are for. A device is an operator's decision: *that* channel is the
+    blue LED in the display tank. Conflating them is what makes a config file
+    the source of truth and leaves the app with nothing to show until somebody
+    edits YAML over SSH.
+
+    Rows are replaced on each announcement rather than merged: what the hardware
+    reports is the truth, and a capability that has gone away should stop being
+    offered.
+    """
+
+    __tablename__ = "capabilities"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    #: ``pi-pwm`` | ``pca9685`` | ``w1-bus``.
+    source: Mapped[str] = mapped_column(String(32), index=True)
+
+    #: Stable identifier for this capability within its source, so a binding can
+    #: name it: the channel number for PWM, the ROM for a 1-Wire probe.
+    channel: Mapped[str] = mapped_column(String(64))
+
+    #: Everything the announcement carried that a client might render: the GPIO
+    #: a PWM channel reaches, the I²C address, the bus master name.
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+
+    announced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('pi-pwm', 'pca9685', 'w1-bus')", name="capability_source_valid"
+        ),
+        # One row per physical thing. A second announcement updates rather than
+        # duplicates, so a hardware-io restart does not double the list.
+        Index("uq_capabilities_source_channel", "source", "channel", unique=True),
     )
 
 

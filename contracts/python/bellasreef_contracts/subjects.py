@@ -20,6 +20,7 @@ __all__ = [
     "SubjectError",
     "alert",
     "audit",
+    "capability",
     "cmd",
     "heartbeat",
     "parse_device_id",
@@ -89,6 +90,17 @@ def silence(device_id: str) -> str:
     return f"{ROOT}.silence.{device_id}"
 
 
+def capability(source: str) -> str:
+    """What one hardware source can offer.
+
+    Retained last-value per subject: a consumer that starts after hardware-io
+    still learns the topology, rather than waiting for the next restart to find
+    out what this hub is made of.
+    """
+    validate_token(source, field="source")
+    return f"{ROOT}.capability.{source}"
+
+
 def cmd(actuator_class: str, actuator_id: str) -> str:
     """A command addressed to one actuator. Durable via JetStream."""
     validate_token(actuator_class, field="actuator_class")
@@ -138,6 +150,7 @@ def parse_device_id(subject: str) -> str:
 
 # Wildcard subscriptions. Consumers filter with these; they are contract too.
 ALL_ALERTS: Final = f"{ROOT}.alert.>"
+ALL_CAPABILITIES: Final = f"{ROOT}.capability.>"
 ALL_SILENCE: Final = f"{ROOT}.silence.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"
 ALL_COMMANDS: Final = f"{ROOT}.cmd.>"

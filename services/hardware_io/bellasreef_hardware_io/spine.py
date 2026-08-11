@@ -22,6 +22,7 @@ from bellasreef_contracts import (
     ActuatorCommand,
     ActuatorRegistration,
     ActuatorState,
+    CapabilityAnnouncement,
     Heartbeat,
     SensorReading,
     SensorRegistration,
@@ -51,6 +52,7 @@ CMD_STREAM: Final = "BR_CMD"
 STATE_STREAM: Final = "BR_STATE"
 AUDIT_STREAM: Final = "BR_AUDIT"
 REGISTRY_STREAM: Final = "BR_REGISTRY"
+CAPABILITY_STREAM: Final = "BR_CAPABILITY"
 
 STREAMS: Final = (
     StreamConfig(
@@ -79,6 +81,18 @@ STREAMS: Final = (
     StreamConfig(
         name=REGISTRY_STREAM,
         subjects=[subjects.ALL_REGISTRY],
+        retention=RetentionPolicy.LIMITS,
+        storage=StorageType.FILE,
+        max_msgs_per_subject=1,
+    ),
+    # Capabilities: what this hub's hardware can offer, as opposed to what
+    # anyone has decided to do with it. Last-value-per-subject like the
+    # registry, so a consumer that starts after hardware-io still learns the
+    # topology instead of waiting for the next restart to find out what the
+    # hub is made of.
+    StreamConfig(
+        name=CAPABILITY_STREAM,
+        subjects=[subjects.ALL_CAPABILITIES],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
         max_msgs_per_subject=1,
@@ -186,6 +200,20 @@ class Spine:
         await self._nc.publish(
             subjects.registry(registration.sensor_id),
             registration.model_dump_json().encode(),
+        )
+
+    async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
+        """Announce what one hardware source can offer.
+
+        The whole channel list per source, not one message per channel: a source
+        that loses a channel says so by republishing a shorter list, where
+        per-channel messages could only ever add.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+        await self._nc.publish(
+            subjects.capability(announcement.hardware_source),
+            announcement.model_dump_json().encode(),
         )
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:

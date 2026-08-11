@@ -19,7 +19,7 @@ import contextlib
 from typing import Any
 
 import nats
-from bellasreef_contracts import SensorRegistration, subjects
+from bellasreef_contracts import CapabilityAnnouncement, SensorRegistration, subjects
 from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
@@ -30,6 +30,107 @@ from pydantic import ValidationError
 from bellasreef_api.store import Store
 
 log = get_logger(__name__)
+
+
+class CapabilityConsumer:
+    """Subscribes to capability announcements and stores what the hub can offer.
+
+    Separate from :class:`RegistryConsumer` because the two tiers are separate.
+    A registration says "this device exists and here is its safety contract"; an
+    announcement says "this hardware could be bound to something". Merging them
+    would put a device row in the database for every unclaimed PWM channel,
+    which is the conflation the two-tier registry exists to undo.
+    """
+
+    RETRY_S = 5.0
+
+    def __init__(self, url: str, store: Store) -> None:
+        self._url = url
+        self._store = store
+        self._nc: Client | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._subscribed = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._subscribed and self._nc is not None and self._nc.is_connected
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._subscribe_forever())
+
+    async def _subscribe_forever(self) -> None:
+        while True:
+            try:
+                await self._subscribe()
+                return
+            except asyncio.CancelledError:
+                raise
+            except NotFoundError:
+                log.info(
+                    "capability stream not provisioned yet; waiting",
+                    extra={"retry_in_s": self.RETRY_S},
+                )
+            except Exception:
+                log.exception("capability consumer could not subscribe; retrying")
+            await asyncio.sleep(self.RETRY_S)
+
+    async def _subscribe(self) -> None:
+        if self._nc is None or not self._nc.is_connected:
+            self._nc = await nats.connect(self._url)
+        js = self._nc.jetstream()
+        # LAST_PER_SUBJECT for the same reason as the registry: hardware-io
+        # announces once, at its own startup, so a plain subscription would see
+        # nothing on an API that restarted afterwards.
+        await js.subscribe(
+            subjects.ALL_CAPABILITIES,
+            cb=self._on_message,
+            config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+        )
+        self._subscribed = True
+        log.info("capability consumer subscribed", extra={"subject": subjects.ALL_CAPABILITIES})
+
+    async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._nc is not None:
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
+
+    async def _on_message(self, msg: Msg) -> None:
+        try:
+            announcement = CapabilityAnnouncement.model_validate_json(msg.data)
+        except ValidationError:
+            log.warning(
+                "capability message did not validate; ignored",
+                extra={"subject": msg.subject},
+            )
+            with contextlib.suppress(Exception):
+                await msg.ack()
+            return
+
+        try:
+            await self._store.replace_capabilities(
+                announcement.hardware_source,
+                [(c.channel, dict(c.detail)) for c in announcement.channels],
+            )
+            log.info(
+                "capabilities stored",
+                extra={
+                    "hardware_source": announcement.hardware_source,
+                    "channels": len(announcement.channels),
+                },
+            )
+        except Exception:  # broad by design: a bad row must not kill the consumer
+            log.exception(
+                "could not store capabilities",
+                extra={"hardware_source": announcement.hardware_source},
+            )
+        with contextlib.suppress(Exception):
+            await msg.ack()
 
 
 class RegistryConsumer:

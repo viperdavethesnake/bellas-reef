@@ -38,6 +38,9 @@ __all__ = [
     "AlertClass",
     "AlertState",
     "BinaryLevel",
+    "CapabilityAnnouncement",
+    "CapabilityChannel",
+    "CapabilitySource",
     "ControlAuthority",
     "DeviceId",
     "Heartbeat",
@@ -170,6 +173,49 @@ class SensorReading(_Message):
         if self.quality == "ok" and self.value is None:
             raise ValueError("quality='ok' requires a value; use 'fault' to report a failed read")
         return self
+
+
+#: What a hardware source can offer, as opposed to what anyone has decided to
+#: do with it.
+CapabilitySource = Literal["pi-pwm", "pca9685", "w1-bus"]
+
+
+class CapabilityChannel(_Frozen):
+    """One offerable thing: a PWM channel, a probe on the bus."""
+
+    #: Stable within its source, and what a binding names. The channel number
+    #: for PWM, the ROM code for a 1-Wire probe.
+    channel: str = Field(min_length=1, max_length=64)
+
+    #: Anything a client should render — the GPIO a channel reaches, the I²C
+    #: address, the bus master. Free-form because it differs per source and no
+    #: consumer should switch on it.
+    detail: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class CapabilityAnnouncement(_Message):
+    """What one hardware source can offer, published on startup.
+
+    Tier one of the registry. Deliberately not a device: a capability is a fact
+    about the hardware — this hub has four PWM channels — true whether or not
+    anybody has decided what they are for. A device is the operator's decision
+    that *that* channel is the blue LED.
+
+    Carries the source's **whole** channel list rather than one message per
+    channel, so a source that loses a channel can say so by republishing a
+    shorter list. One message per channel could only ever add.
+
+    Published on ``bellasreef.capability.<source>`` and retained last-value per
+    subject, so a consumer that starts late still learns the topology without
+    waiting for a hardware-io restart.
+    """
+
+    #: Which hardware source this describes. Deliberately NOT ``source``, which
+    #: the message envelope already uses for *who published this* — overriding
+    #: it would silently discard the publisher's identity on every
+    #: announcement.
+    hardware_source: CapabilitySource
+    channels: list[CapabilityChannel]
 
 
 AlertState = Literal["breach", "clear"]
