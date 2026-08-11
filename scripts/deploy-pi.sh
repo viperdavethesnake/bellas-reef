@@ -13,19 +13,21 @@
 # until it has seen a *fresh sample land in VictoriaMetrics* — the wire, not
 # the gauge.
 #
-# Usage:  ./scripts/deploy-pi.sh [--host bellasreef.local] [--no-verify]
+# Usage:  ./scripts/deploy-pi.sh [--host H] [--no-verify] [--no-verify-ci]
 
 set -uo pipefail
 
 PI_HOST="${BELLASREEF_PI_HOST:-bellasreef.local}"
 PI_DIR="/home/david/bellasreef"
 VERIFY=1
+SKIP_CI_CHECK=0
 UNITS=(bellasreef-hardware-io bellasreef-control-engine bellasreef-api)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host) PI_HOST="$2"; shift 2 ;;
         --no-verify) VERIFY=0; shift ;;
+        --no-verify-ci) SKIP_CI_CHECK=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -48,6 +50,33 @@ if ! git merge-base --is-ancestor "$SHA" "origin/${BRANCH}" 2>/dev/null; then
     die "HEAD (${SHA:0:8}) is not on origin/${BRANCH}. Push first."
 fi
 echo "  ${SHA:0:8} on origin/${BRANCH}"
+
+step "checking CI is green for this commit"
+# The stop condition is CI green AND deployed. Without this check the script
+# shipped a red commit to the tank — which it did, once, minutes after the rule
+# was written down. Reading a CI result and acting on it are two different
+# things; an exit code is the control.
+#
+# A missing or unreachable answer warns rather than blocks: GitHub being down
+# must not stop a deploy during an incident, but it must say so out loud.
+if [[ $SKIP_CI_CHECK -eq 1 ]]; then
+    printf '\033[33m  skipped at your request\033[0m\n'
+elif ! command -v gh >/dev/null 2>&1; then
+    printf '\033[33m  gh not available — deploying without checking CI\033[0m\n'
+else
+    conclusion="$(gh run list --commit "$SHA" --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || true)"
+    case "$conclusion" in
+        success)
+            echo "  CI success"
+            ;;
+        "")
+            printf '\033[33m  no CI run found for %s yet — deploying unverified\033[0m\n' "${SHA:0:8}"
+            ;;
+        *)
+            die "CI for ${SHA:0:8} is '${conclusion}'. Fix it before it reaches the tank, or pass --no-verify-ci to ship a known-red build deliberately."
+            ;;
+    esac
+fi
 
 # ---------------------------------------------------------------------- deploy
 
