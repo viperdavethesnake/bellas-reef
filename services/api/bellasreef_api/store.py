@@ -256,8 +256,9 @@ class Store:
                 (
                     await conn.execute(
                         text(
-                            "SELECT device_id, sensor_type, bound, threshold, unit, "
-                            "raised_at, raised_value, cleared_at, cleared_value "
+                            "SELECT device_id, sensor_type, alert_class, bound, threshold, unit, "
+                            "raised_at, raised_value, last_reading_at, "
+                            "cleared_at, cleared_value "
                             "FROM sensor_alerts "
                             "WHERE raised_at <= :end "
                             "AND (cleared_at IS NULL OR cleared_at >= :start) "

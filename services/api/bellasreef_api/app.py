@@ -139,16 +139,30 @@ class HistoryEpisode(BaseModel):
 
     device_id: str
     sensor_type: str
-    bound: Literal["min", "max"]
-    threshold: float
-    unit: str
+
+    #: ``threshold`` or ``silence``. The client draws these differently rather
+    #: than inferring from null fields: a band saying "we stopped knowing" is a
+    #: different statement from one saying "it was too cold", and rendering them
+    #: alike would let the more serious one hide inside the other.
+    alert_class: Literal["threshold", "silence"]
+
+    bound: Literal["min", "max"] | None = None
+    threshold: float | None = None
+    unit: str | None = None
     raised_at: datetime
-    raised_value: float
+    raised_value: float | None = None
+
+    #: Silence only. When the probe was last heard from, which is earlier than
+    #: ``raised_at`` by the deadline that had to elapse first — so a client can
+    #: start the band where the data actually stopped rather than where the hub
+    #: got around to noticing.
+    last_reading_at: datetime | None = None
+
     #: ``None`` while the episode is still open. Left open deliberately; the
     #: client clamps the band to the window edge rather than the hub inventing
     #: a clear time that never happened.
-    cleared_at: datetime | None
-    cleared_value: float | None
+    cleared_at: datetime | None = None
+    cleared_value: float | None = None
 
 
 class HistoryView(BaseModel):
@@ -981,11 +995,13 @@ def build_app(
             HistoryEpisode(
                 device_id=row["device_id"],
                 sensor_type=row["sensor_type"],
-                bound="min" if row["bound"] == "min" else "max",
+                alert_class="silence" if row["alert_class"] == "silence" else "threshold",
+                bound=None if row["bound"] is None else ("min" if row["bound"] == "min" else "max"),
                 threshold=row["threshold"],
                 unit=row["unit"],
                 raised_at=row["raised_at"],
                 raised_value=row["raised_value"],
+                last_reading_at=row["last_reading_at"],
                 cleared_at=row["cleared_at"],
                 cleared_value=row["cleared_value"],
             )
