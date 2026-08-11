@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.metadata import version
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
@@ -64,7 +65,12 @@ log = get_logger(__name__)
 
 SERVICE: Final = "api"
 API_VERSION: Final = "v1"
-CONTRACTS_VERSION: Final = "3.0.0"
+#: Derived, never written out. This was a string literal, contracts went to
+#: 3.1.0 for the silence class, and the literal stayed at 3.0.0 — so `/info`
+#: told every client it spoke an older contract than it did, and the same stale
+#: string went into every backup manifest. A hand-maintained copy of a number
+#: that lives somewhere else has exactly one behaviour over time.
+CONTRACTS_VERSION: Final = version("bellasreef-contracts")
 
 #: Every authenticated route can return 401 via the current_client
 #: dependency. Declared and shared so a client can MODEL "your credential
