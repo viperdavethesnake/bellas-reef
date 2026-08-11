@@ -2,38 +2,38 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """PCA9685 16-channel PWM over I²C — LED dimming (PRD R10a).
 
-**BENCH-UNVERIFIED.** Everything here is exercised against a fake bus and
-nothing here has driven a real light. Two assertions are outstanding and both
-require David at the bench:
+**BENCH-UNVERIFIED.** Everything here runs against a fake bus and nothing here
+has driven a real light. Two assertions are outstanding, both David's to make:
 
-1. **duty 0.0 measures dark**, on a meter or a lamp, not by reasoning about the
-   datasheet. See :data:`INVRT_ON` — that is the knob, and its current setting
-   is a hypothesis.
+1. **duty 0.0 measures dark**, on the DMM at the FET drain.
 2. **The fail-safe drills** (process kill, container kill, NATS outage, power
    pull) against a real actuator.
 
 Until both pass, this driver must not be registered on a hub wired to lights.
 
-Why (1) is the whole ballgame
------------------------------
-The chip powers up in totem-pole (``MODE2 = 0x04``, OUTDRV set — measured on
-this hardware, 2026-08-09). R10a calls for **open-drain**, because parallel
-Mean Well XLG-AB-class drivers share a dimming line and a totem-pole output
-driving it high fights every other output on that line.
+Output stage, as ruled 2026-08-11
+---------------------------------
+Recorded as given. Per CLAUDE.md's bench boundary, this file states the design
+and the measurements it is waiting on; it does not argue the electronics.
 
-Open-drain changes what the load sees. The pin only *sinks*: the idle level
-comes from an external pull-up, so the register's "on" period pulls the dimming
-input LOW, where totem-pole with ``INVRT=0`` drove it HIGH. Flip OUTDRV without
-re-examining INVRT and the output inverts.
+* An **external N-FET stage per channel** (2N7000-class, 1 kΩ gate resistor,
+  drain to the dim line and its 10 V pull-up, source to common ground).
+* The PCA9685 stays **totem-pole**, driving the FET gate. See
+  :data:`OPEN_DRAIN`.
+* The stage is expected to invert, so :data:`INVRT_ON` compensates — **as an
+  expectation, set for real by Stage-1 measurement**, not as a derivation.
 
-That inversion is a safety inversion, not a cosmetic one. Our contract declares
-``PwmLevel(duty=0.0)`` to be the safe state, meaning dark. If the output is
-inverted at the hardware, **duty 0.0 drives the channel to full brightness** —
-the declared safe state becomes the most dangerous one, and every fail-safe
-drill passes in software while the tank sits at 100%.
+Correction trail
+----------------
+An earlier revision of this driver configured the outputs **open-drain**, for a
+bench design in which a 10 V pull-up sat directly on the LEDn pin. That design
+was withdrawn on 2026-08-11: LEDn absolute maximum is 5.5 V and the outputs are
+5.5 V-only tolerant, so a 10 V pull-up was out of spec. The FET stage above
+replaces it, and the DMM now goes on the **FET drain, never the LEDn pin**.
 
-So the polarity decision is written down here as code, in one place, with a
-test — and then it is still not trusted until someone has looked at a lamp.
+Left in the file deliberately. The withdrawn design is the reason this driver's
+polarity handling exists at all, and a reader who does not know it was wrong
+would eventually reinvent it.
 """
 
 from __future__ import annotations
@@ -95,23 +95,30 @@ _COUNTS: Final = 4096
 
 # --------------------------------------------------------------- our decisions
 
-#: Open-drain, per R10a: parallel XLG-AB drivers share the dimming line and a
-#: totem-pole output would fight every other output on it.
-OPEN_DRAIN: Final = True
+#: Totem-pole, driving the external N-FET gate. Ruled 2026-08-11.
+#:
+#: Was open-drain, for a withdrawn bench design that put a 10 V pull-up on the
+#: LEDn pin directly — out of spec, since LEDn absolute maximum is 5.5 V. The
+#: FET stage carries the 10 V line now and the PCA9685 only ever drives a gate.
+#:
+#: ``False`` clears MODE2 OUTDRV... which is backwards from the name, so: this
+#: flag reads "are we in open-drain", and totem-pole is OUTDRV **set**.
+OPEN_DRAIN: Final = False
 
-#: Output logic inversion. **This is the bench knob.**
+#: Output logic inversion. **Set by Stage-1 measurement, not by argument.**
 #:
-#: Reasoning, which is not the same as evidence: in open-drain the pin only
-#: sinks, so with ``INVRT=0`` a register duty of 0.0 means "never sink", the
-#: external pull-up holds the dimming input HIGH, and a driver that dims on a
-#: HIGH input goes to full output. Setting INVRT makes duty 0.0 sink
-#: continuously and hold the line LOW.
+#: The expectation is that the FET stage inverts, so INVRT compensates and duty
+#: 0.0 leaves the dim line where "dark" is. That expectation is David's, from
+#: the bench design; this file does not re-derive it and must not.
 #:
-#: That chain has one unverified link — whether these particular XLG drivers
-#: read LOW as off — and it is exactly the link that decides whether our
-#: declared safe state is dark or blinding. Hence bench item 1. If the lamp says
-#: otherwise, this constant flips and nothing else changes, which is the entire
-#: reason the decision lives in one named place.
+#: What decides it is the meter. Stage 1 drives full-off, full-on and 50% with
+#: ``i2cset`` alone, David reads volts at the FET drain, and those three numbers
+#: fix this constant. If they say the opposite, this flips and nothing else in
+#: the driver changes — which is why the polarity lives in one named place.
+#:
+#: The stake: the contract declares ``PwmLevel(duty=0.0)`` the safe state,
+#: meaning dark. Get this wrong and the declared safe state is the dangerous
+#: one, and every fail-safe drill passes in software over a lit tank.
 INVRT_ON: Final = True
 
 #: PRE_SCALE for ~500 Hz on the internal 25 MHz oscillator:

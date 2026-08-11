@@ -195,18 +195,20 @@ def test_the_prescaler_is_five_hundred_hertz_not_the_chip_default() -> None:
 # ------------------------------------------------------- polarity, the bench knob
 
 
-def test_output_is_configured_open_drain_with_inversion() -> None:
-    """The R10a decision, asserted as register bits rather than as intent.
+def test_output_is_totem_pole_driving_the_fet_gate_with_inversion() -> None:
+    """The output-stage ruling of 2026-08-11, asserted as register bits.
 
-    Open-drain because parallel XLG-AB drivers share the dimming line and a
-    totem-pole output fights every other one on it. INVRT because in open-drain
-    the pin only sinks, so without it a duty of 0.0 stops sinking, the pull-up
-    holds the line HIGH, and a driver dimming on HIGH goes to full output — our
-    declared safe state becoming the most dangerous one.
+    Totem-pole because the PCA9685 drives an external N-FET gate; the 10 V dim
+    line lives on the FET drain, not on LEDn. Recorded as ruled — this test
+    checks the registers match the decision and does not argue the electronics.
 
-    **This test encodes a hypothesis, not a measurement.** If the bench lamp
-    says duty 0.0 is bright, INVRT_ON flips and this assertion flips with it.
-    That is the point of it being one constant in one place.
+    INVRT is an **expectation pending Stage-1 measurement**, not a conclusion.
+    If the meter at the FET drain says duty 0.0 is bright, INVRT_ON flips and
+    this assertion flips with it. One constant, one test, one place.
+
+    Supersedes an open-drain configuration written for a withdrawn bench design
+    that put a 10 V pull-up on LEDn directly, which is out of spec at a 5.5 V
+    absolute maximum.
     """
 
     async def scenario() -> FakeBus:
@@ -217,10 +219,10 @@ def test_output_is_configured_open_drain_with_inversion() -> None:
     bus = run(scenario)
     mode2 = bus.registers[_MODE2]
 
-    assert OPEN_DRAIN is True
-    assert not mode2 & _OUTDRV, "OUTDRV still set — the chip is in totem-pole"
+    assert OPEN_DRAIN is False
+    assert mode2 & _OUTDRV, "OUTDRV clear — the chip is open-drain, not driving a gate"
     assert INVRT_ON is True
-    assert mode2 & _INVRT, "INVRT clear — duty 0.0 would release the line, not hold it low"
+    assert mode2 & _INVRT, "INVRT clear — duty 0.0 would not land on the dark side"
 
 
 def test_every_channel_is_driven_off_before_the_frequency_changes() -> None:

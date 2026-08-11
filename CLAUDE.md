@@ -81,15 +81,47 @@ alternative.
 - No rsync, no editing on the Pi, no uncommitted state. `/home/david/bellasreef`
   is a git clone reset to `origin/main`; anything not pushed does not run.
 - Deploy with `scripts/deploy-pi.sh`. It refuses a dirty or unpushed tree,
-  resets the Pi to the pushed commit, restarts the units, and then **verifies
-  fresh telemetry on the wire** before reporting success. A process check is
-  not a deploy check: hardware-io without `BELLASREEF_NATS_URL` starts
-  cleanly, serves metrics and publishes nothing.
+  resets the Pi to the pushed commit, applies migrations, restarts the units,
+  and then **verifies fresh telemetry on the wire** before reporting success. A
+  process check is not a deploy check: hardware-io without
+  `BELLASREEF_NATS_URL` starts cleanly, serves metrics and publishes nothing.
+- **A backend pass is not done at CI green.** The stop condition is
+  **CI green → `scripts/deploy-pi.sh` → telemetry verified on the wire.** All
+  three, every time.
+
+  Green-and-undeployed is a state that reads as finished and is not. The Pi
+  drifted four commits behind main that way in one session, which meant the hub
+  was serving a contracts version it did not have and running code whose
+  replacement had already been reviewed and merged. "It passed CI" describes a
+  runner in a datacentre; the tank is on a shelf.
 - Service environment lives in `/etc/bellasreef/<service>.env` on the host, not
   baked into the unit files. Unit files in this repo stay machine-agnostic.
 - Logs are in journald (`journalctl -u bellasreef-hardware-io`). A log in
   `/tmp` gets overwritten by the next start, which destroyed the evidence for
   the first half of that outage.
+
+## Bench boundary (non-negotiable)
+
+**At the bench, Claude's role is registers and commands. Nothing else.**
+
+- In scope: set the requested duty, write the requested register, read it back,
+  report exactly what was written and exactly what was read. Show every command
+  before running it.
+- **Out of scope: electrical design.** Voltages, absolute-maximum ratings,
+  wiring, pull-ups, component choices, and what a load will do with a signal are
+  not Claude's to reason about, advise on, or verify. Those facts arrive as
+  David's measurements and rulings, and are recorded in "Verified host facts"
+  **as given** — not derived, not sanity-checked, not improved.
+- If a step looks electrically wrong: **one sentence, then stop.** No analysis,
+  no alternatives, no proposed redesign. Flagging is the whole contribution.
+
+This exists because the failure modes are asymmetric. A confident chain of
+electrical reasoning from a model that has never seen the bench reads exactly
+like knowledge, and the cost of being wrong is measured in hardware and
+livestock. A one-line flag costs a pause.
+
+Code comments follow the same rule: a driver may record *what was ruled* and
+*what was measured*, and must not argue the physics.
 
 ## Dev environment
 
@@ -179,29 +211,53 @@ timing rule — the cost is real, it is per-probe, and the bus is serialized.
 
 **PCA9685 power-on state:** MODE1 `0x11` = SLEEP set, oscillator off, no PWM
 being generated — safe idle. PRE_SCALE `0x1e` (30) is the default ≈196 Hz.
-MODE2 `0x04` = **OUTDRV set, i.e. totem-pole output**. PRD R10a calls for
-**open-drain** for parallel Mean Well XLG-AB-class drivers, so the driver must
-clear MODE2 bit 2 during init. Do not assume the default is what we want.
+MODE2 `0x04` = **OUTDRV set, i.e. totem-pole output**, which as of the
+2026-08-11 ruling is what we want — the PCA9685 drives an external N-FET gate
+(item 0a). An earlier plan called for open-drain; it is withdrawn, and item 0
+says why. Do not assume the default is what we want either way: it happens to
+match now, and a driver that inherits a value has still not made a decision.
 
 Three things follow from that MODE2 note. Session 4's driver work inherits all
 of them; none may be assumed.
 
-**1. Open-drain can invert the duty, and that is a safety inversion.**
-In open-drain the pin only *sinks* — the idle level is set by an external
-pull-up, so the register's "on" period pulls the dimming input LOW. In
-totem-pole with `INVRT=0` the same "on" period drives it HIGH. Flipping OUTDRV
-without re-examining `INVRT` (MODE2 bit 4) therefore inverts what the load sees.
+**0. SUPERSEDED — the open-drain plan, and why it is recorded rather than
+deleted.** Until 2026-08-11 the plan was to clear MODE2 OUTDRV and run the
+outputs **open-drain**, with a 10 kΩ pull-up to a 10 V rail sitting directly on
+the LEDn pin.
+
+That design is withdrawn. **LEDn absolute maximum is 5.5 V and the outputs are
+5.5 V-only tolerant**, so a 10 V pull-up was out of spec — David's error,
+confirmed against the datasheet after Claude flagged uncertainty rather than
+reasoning from memory about the rating.
+
+Kept in this file on purpose. Item 1 below exists *because* of the withdrawn
+design, and a reader who does not know it was wrong will eventually reinvent it.
+
+**0a. The output stage as it now stands (ruled 2026-08-11, recorded as given):**
+
+| | |
+|---|---|
+| Per-channel stage | external N-FET, 2N7000-class |
+| Gate | 1 kΩ resistor from the LEDn pin |
+| Drain | the dim line and its 10 V pull-up |
+| Source | common ground |
+| PCA9685 output mode | **totem-pole** — MODE2 OUTDRV **set**, driving the gate |
+| DMM probe point | **the FET drain. Never the LEDn pin.** |
+
+**1. The stage inverts, and that is a safety inversion until measured.**
+The expectation is that the FET stage inverts what the dim line sees relative to
+the LEDn pin, so `INVRT` (MODE2 bit 4) compensates.
 
 The consequence is not cosmetic. Our contract declares `PwmLevel(duty=0.0)` as
-the safe state, meaning dark. If the output is inverted at the hardware, **duty
-0.0 drives the channel to full brightness** — the declared safe state becomes
-the most dangerous one, and every fail-safe drill would pass in software while
+the safe state, meaning dark. If the polarity is wrong end-to-end, **duty 0.0
+drives the channel to full brightness** — the declared safe state becomes the
+most dangerous one, and every fail-safe drill would pass in software while
 lighting the tank at 100%.
 
-Rule: the PCA9685 driver must **prove on the bench that duty 0.0 measures dark**
-before it is trusted, and that check belongs in the bring-up procedure, not in a
-comment. `INVRT` is the knob that corrects it. Verify with a meter or a lamp,
-not by reasoning about the datasheet.
+Rule: the driver must **prove on the bench that duty 0.0 measures dark** before
+it is trusted, and that check belongs in the bring-up procedure, not in a
+comment. `INVRT` is the knob that corrects it. Verify with a meter at the FET
+drain, not by reasoning about the datasheet.
 
 **2. PWM frequency is pinned at 500 Hz, from bench findings.**
 
@@ -231,27 +287,43 @@ It matters more than it first looks, because **a diurnal ramp crosses that band
 twice every single day.** Dawn and dusk are exactly where a lighting schedule
 spends time at low duty, so this is not an edge case; it is the daily path.
 
-The PCA9685 driver must map duty explicitly, and the mapping is a decision to
-make and test, not to discover:
+**Ruled: anything under 8% snaps to 0.** Not clamped up. `duty == 0.0` is hard
+off and is the declared safe state, so it must never land inside the band; of
+the two options, snapping down is the one that cannot leave a channel emitting
+at a duty the hardware refuses to define.
 
-- `duty == 0.0` → hard off. Unambiguous, outside the undefined band, and this is
-  the declared safe state, so it must never land in it.
-- `0.0 < duty < 0.08` → **either** clamp up to 0.08 **or** snap down to 0.
-  Pick one, write it down, and cover it with a test. Silently passing the value
-  through is the one option that is wrong.
+**4.** Items 0a–3 are session-4 driver requirements. Each electrical fact above
+is David's, recorded as given — see the bench boundary. None may be assumed by
+measurement-free reasoning.
 
-Whichever is chosen changes what a ramp looks like at the extremes, so it is a
-product decision as much as a driver one.
-
-**4.** Items 1–3 plus the open-drain/`INVRT` note above are session-4 driver
-requirements. None may be assumed; each needs bench verification.
-
-**3. PRE_SCALE is only writable while SLEEP is set.**
+**5. PRE_SCALE is only writable while SLEEP is set.**
 The PCA9685 latches the prescaler from the sleeping oscillator. Changing PWM
 frequency means: set SLEEP, write PRE_SCALE, clear SLEEP, then wait ≥500 µs for
 the oscillator before setting the RESTART bit. A driver that writes PRE_SCALE on
 a running chip silently does nothing, which presents as "the frequency setting
 is ignored".
+
+## Bench plan (staged; no stage proceeds without David's go)
+
+**Stage 0 — readiness audit.** Report only. Complete 2026-08-11.
+
+**Stage 1 — raw CLI, zero Bella's Reef code.** `i2cset`/`i2cget` only, DMM on
+the **FET drain**. Read MODE1/MODE2/PRE_SCALE power-on values; set totem-pole;
+wake from SLEEP; drive CH0 full-off, full-on and 50% via the LED0 registers with
+David reading volts at each; set `PRE_SCALE=11` under SLEEP, read back, confirm
+~508 Hz at 50%. Every command shown before running. **Every measured value goes
+into this section.** Blocked until the FET stage is on the bench.
+
+The three measured voltages are what set `INVRT_ON` in the driver. They are
+ground truth with no stack in the loop.
+
+**Stage 2 — the same facts through our stack.** Register the channel via
+hardware-io (authoritative, role `light`, full safety triple), command the
+identical three duty points through control-engine over the spine, David
+confirms the meter matches Stage 1 exactly. **Any divergence is a driver bug by
+definition** — the CLI numbers are the truth.
+
+**Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
 the only kernel interface the `w1-therm` driver exposes — there is no character
