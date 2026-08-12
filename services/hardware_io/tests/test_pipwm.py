@@ -47,7 +47,7 @@ class SysfsError(OSError):
 class FakeSysfs:
     """A /sys/class/pwm that says no in the same places the real one does."""
 
-    def __init__(self, *, npwm: int = 4, export_delay: int = 0) -> None:
+    def __init__(self, *, npwm: int = 4, export_delay: int = 0, chgrp_delay: int = 0) -> None:
         self.values: dict[str, str] = {}
         self.writes: list[tuple[str, str]] = []
         self.exported: set[int] = set()
@@ -56,9 +56,26 @@ class FakeSysfs:
         #: modelling udev latency after export.
         self._export_delay = export_delay
         self._checks = 0
+        #: How many writability checks fail before udev "runs".
+        self._chgrp_delay = chgrp_delay
+        self._perm_checks = 0
 
     def _key(self, path: Path) -> str:
         return str(path)
+
+    def writable(self, path: Path) -> bool:
+        """Writable only once udev has caught up.
+
+        The real chip creates the attributes root:root 0644 on export and a
+        udev rule chgrps them to `gpio` a moment later. A fake that reported
+        everything writable the instant it existed could not catch a driver
+        that races that window — which is exactly the bug this models.
+        """
+        channel_dir = path.parent
+        if not self.exists(channel_dir):
+            return False
+        self._perm_checks += 1
+        return self._perm_checks > self._chgrp_delay
 
     def exists(self, path: Path) -> bool:
         name = path.name
@@ -239,6 +256,35 @@ def test_export_latency_is_waited_out_not_assumed() -> None:
     sysfs = run(scenario)
     assert sysfs.sequence()[0] == "export"
     assert sysfs.values["/sys/class/pwm/pwmchip0/pwm0/enable"] == "1"
+
+
+def test_the_udev_permission_window_is_waited_out() -> None:
+    """Export creates the attributes root:root; udev chgrps them a moment later.
+
+    The driver used to wait for the directory and then write immediately, into
+    a window where the files exist and it has no permission to them. On the
+    real hub that produced EACCES on duty_cycle and a diagnosis of "we need a
+    udev rule" — when the rule was already present and correct, and the service
+    was simply faster than it.
+    """
+
+    async def scenario() -> FakeSysfs:
+        sysfs = FakeSysfs(chgrp_delay=4)
+        await _channel(sysfs).open()
+        return sysfs
+
+    sysfs = run(scenario)
+    assert sysfs.values["/sys/class/pwm/pwmchip0/pwm0/enable"] == "1"
+
+
+def test_a_channel_that_never_becomes_writable_names_the_reason() -> None:
+    """Distinct from "never appeared" — different cause, different fix."""
+
+    async def scenario() -> None:
+        await _channel(FakeSysfs(chgrp_delay=10_000)).open()
+
+    with pytest.raises(RuntimeError, match="never became writable"):
+        run(scenario)
 
 
 def test_a_channel_that_never_appears_raises_rather_than_hanging() -> None:

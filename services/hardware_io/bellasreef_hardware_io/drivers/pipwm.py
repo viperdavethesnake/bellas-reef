@@ -28,6 +28,7 @@ fake in the tests — not written down in a comment and hoped for. See
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -83,6 +84,7 @@ class SysfsWriter(Protocol):
     def write(self, path: Path, value: str) -> None: ...
     def read(self, path: Path) -> str: ...
     def exists(self, path: Path) -> bool: ...
+    def writable(self, path: Path) -> bool: ...
 
 
 class RealSysfs:
@@ -96,6 +98,9 @@ class RealSysfs:
 
     def exists(self, path: Path) -> bool:
         return path.exists()
+
+    def writable(self, path: Path) -> bool:
+        return os.access(path, os.W_OK)
 
 
 def duty_to_ns(duty: float, period_ns: int) -> int:
@@ -205,21 +210,41 @@ class PiPwmChannel:
         )
 
     async def _await_export(self) -> None:
-        """Poll for the exported directory rather than sleeping a guess.
+        """Wait for the channel to exist **and be writable**.
 
-        A fixed sleep is either too short on a loaded boot or wasted on every
-        other one.
+        Two separate waits, and the second is the one that bit. Export creates
+        the attributes owned ``root:root 0644``; a udev rule then chgrps them to
+        the ``gpio`` group. Those happen in that order and not atomically, so a
+        driver that waits only for the directory writes into a window where the
+        files exist and it has no permission to them:
+
+            immediately after export:  -rw-r--r-- root root  -> EACCES
+            ~300ms later:              -rw-rw-r-- root gpio  -> fine
+
+        Measured on the target 2026-08-12. It cost a diagnosis of "the hub needs
+        a udev rule" when the rule was already there and already correct — the
+        service was simply faster than it.
+
+        Polling both rather than sleeping a guess: a fixed delay is too short on
+        a loaded boot and wasted on every other one.
         """
+        probe = self._dir / "duty_cycle"
         waited = 0.0
         while waited < _EXPORT_TIMEOUT_S:
-            if self._sysfs.exists(self._dir):
+            if self._sysfs.exists(self._dir) and self._sysfs.writable(probe):
                 return
             await asyncio.sleep(_EXPORT_POLL_S)
             waited += _EXPORT_POLL_S
+
+        if not self._sysfs.exists(self._dir):
+            raise RuntimeError(
+                f"{self._dir} did not appear within {_EXPORT_TIMEOUT_S}s of export. "
+                "The channel number may be beyond this chip's npwm."
+            )
         raise RuntimeError(
-            f"{self._dir} did not appear within {_EXPORT_TIMEOUT_S}s of export. "
-            "The channel number may be beyond this chip's npwm, or no PWM overlay "
-            "is loaded so the pin is not muxed to the PWM block."
+            f"{probe} never became writable within {_EXPORT_TIMEOUT_S}s. The udev "
+            "rule that chgrps exported PWM channels to the 'gpio' group has not "
+            "run, or this process is not in that group."
         )
 
     async def close(self) -> None:

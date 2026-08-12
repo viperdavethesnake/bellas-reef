@@ -466,25 +466,35 @@ Three cautions:
   been confirmed on this board**. It is a wiring fact; confirm it before binding
   anything to a pin.
 
-### PWM sysfs permissions — a second host action
+### PWM sysfs permissions — no rule needed, and why it looked like one
 
-The services run as `david`, and `/sys/class/pwm/pwmchip0/*` is root-owned.
-Export succeeds; writing `duty_cycle` does not:
+**Correction, 2026-08-12.** An earlier revision of this file said a udev rule
+was required. It is not: Raspberry Pi OS already ships one in
+`/usr/lib/udev/rules.d/99-com.rules`, and it is correct.
 
 ```
-PermissionError: [Errno 13] Permission denied:
-  '/sys/class/pwm/pwmchip0/pwm0/duty_cycle'
+SUBSYSTEM=="pwm", ACTION!="remove", PROGRAM="/bin/sh -c 'chgrp -R gpio /sys%p && chmod -R g=u /sys%p'"
 ```
 
-Measured on the hub 2026-08-12. A udev rule is needed to give the `gpio` group
-ownership of the exported channel attributes, in the same spirit as the `i2c`
-and `gpio` device nodes — the services must not run as root.
+What actually happened is a race, measured on this host:
 
-Unlike the overlay this is not optional-until-you-wire-something: without it a
-declared light builds, fails to open, and is skipped. hardware-io stays up and
-the probe keeps reporting (deliberately — a light that cannot open is dark
-either way, and a hub that will not start monitors nothing), but the channel
-never drives.
+```
+immediately after export:  -rw-r--r-- root root   -> EACCES
+~300 ms later:             -rw-rw-r-- root gpio   -> writable
+```
+
+Export creates the attributes owned `root:root`; udev chgrps them to the `gpio`
+group a moment afterwards, and the two are not atomic. hardware-io waited for
+the channel *directory* and then wrote immediately, landing in the window where
+the files exist and it has no permission to them. The service was simply faster
+than udev.
+
+The driver now waits for `duty_cycle` to be **writable**, not merely present,
+and the fake in its tests models the delay so the race cannot come back.
+
+Worth keeping as a caution: "we need a udev rule" was a plausible reading of
+`PermissionError`, and it was wrong. Check whether the permission arrives late
+before concluding it never arrives.
 
 After editing config.txt, reboot and confirm the channel exports:
 
