@@ -1036,7 +1036,23 @@ def test_two_clients_racing_for_one_recovery_window_get_one_credential() -> None
         return out
 
     out = run(scenario)
-    assert out["codes"] == [200, 409], "exactly one client may ride a recovery window in"
+
+    # Exactly one credential — but the loser has two legitimate ways to fail,
+    # and which one it takes is a matter of interleaving rather than of
+    # correctness. Asserting the flavour of the failure made this test green on
+    # a Mac and red in CI.
+    #
+    #   409  it read the window as open, minted, then lost `consume_window`
+    #   202  the winner had already consumed the window by the time it looked,
+    #        so there was no window to read and it fell through to the ordinary
+    #        pending branch — which is precisely right, the window was spent
+    #
+    # The invariant is that one caller is paired and the other is not. The three
+    # assertions below say that in the terms that matter: one token, the loser's
+    # row rolled back rather than orphaned, and one use recorded against a
+    # window that was used once.
+    assert out["codes"][0] == 200, "one caller must be paired"
+    assert out["codes"][1] in (202, 409), f"the loser must not be paired; got {out['codes'][1]}"
     assert len(out["tokens"]) == 1
     assert out["clients_ever"] == 2, "the loser's client row must be rolled back, not left orphaned"
     assert out["events"].count("pair.window_used") == 1, (
