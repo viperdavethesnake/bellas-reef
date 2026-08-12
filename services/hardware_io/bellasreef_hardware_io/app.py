@@ -175,7 +175,28 @@ class HardwareIO:
 
         for sensor in sensors:
             self.sensors.append(sensor)
+
         for built in actuators:
+            # Bring the channel up before registering it. The supervisor
+            # asserts every actuator into its safe state at startup, and an
+            # unopened RP1 channel has no sysfs attributes to write to.
+            #
+            # A failure here skips the actuator rather than taking the service
+            # down, and that asymmetry is deliberate: two lights that could not
+            # open took the temperature probe offline with them, which is a far
+            # worse outcome than a dark channel. A light that cannot be opened
+            # is dark either way; a hub that will not start monitors nothing.
+            opener = getattr(built.driver, "open", None)
+            if opener is not None:
+                try:
+                    await opener()
+                except Exception:
+                    log.exception(
+                        "actuator could not be opened; skipped",
+                        extra={"actuator_id": built.registration.actuator_id},
+                    )
+                    continue
+
             self.supervisor.register(built.registration, built.driver)
             self._registrations.append(built.registration)
 
