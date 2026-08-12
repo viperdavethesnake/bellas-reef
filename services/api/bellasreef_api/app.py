@@ -1004,13 +1004,38 @@ def build_app(
                 "there cannot be bound.",
             )
 
+        # The double-bind check applies to actuators only, and the asymmetry is
+        # the point.
+        #
+        # A probe has its own identity: the ROM is burned in, so a request
+        # naming that ROM is *this* hardware whatever id it proposes, and the
+        # right answer is to adopt the device already holding it. Refusing here
+        # is what produced the identity fork — a seed proposing a new name for a
+        # known probe got a row of its own.
+        #
+        # A PWM channel has no such identity. It is a slot, and the only thing
+        # that says what is plugged into it is the operator's declaration. So a
+        # second declaration on a taken channel is a mistake to report, not
+        # hardware to recognise.
         holder = await store.device_bound_to(body.driver_type, body.channel)
-        if holder is not None and holder != body.device_id:
+        if not is_sensor and holder is not None and holder != body.device_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 f"{body.driver_type} channel {body.channel!r} is already bound to "
                 f"{holder!r}. Unbind it first — two devices on one channel interleave "
                 "rather than coexist.",
+            )
+
+        # Cadence is required for a sensor rather than defaulted. It sets the
+        # silence deadline (6x cadence), so a silent default would pick the
+        # threshold at which the hub declares a probe dead — a number nobody
+        # chose. The devices CHECK requires it too.
+        if is_sensor and body.poll_interval_s is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "a sensor must declare poll_interval_s: it sets the deadline at which "
+                "the probe is reported silent, and defaulting it would pick that "
+                "threshold on the operator's behalf",
             )
 
         if is_sensor and body.role is not None:

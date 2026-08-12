@@ -250,7 +250,12 @@ def test_a_probe_binds_against_the_bus_not_a_source_of_its_own() -> None:
             response = await c.post(
                 "/api/v1/devices",
                 headers=headers,
-                json={"device_id": "probe", "driver_type": "ds18b20", "channel": ROM},
+                json={
+                    "device_id": "probe",
+                    "driver_type": "ds18b20",
+                    "channel": ROM,
+                    "poll_interval_s": 5.0,
+                },
             )
             return response.status_code
         finally:
@@ -436,6 +441,7 @@ def test_a_sensor_carrying_a_role_is_refused() -> None:
                     "driver_type": "ds18b20",
                     "channel": ROM,
                     "role": "light",
+                    "poll_interval_s": 5.0,
                 },
             )
             return response.status_code
@@ -479,6 +485,7 @@ def test_an_announced_probe_is_adopted_not_duplicated() -> None:
                     "driver_type": "ds18b20",
                     "channel": ROM,
                     "display_name": "Sump",
+                    "poll_interval_s": 5.0,
                 },
             )
             async with engine.connect() as conn:
