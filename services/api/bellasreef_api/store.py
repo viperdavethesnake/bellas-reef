@@ -171,7 +171,14 @@ class Store:
                         "       d.device_id AS bound_to "
                         "  FROM capabilities c "
                         "  LEFT JOIN devices d "
-                        "         ON d.driver_type = c.source "
+                        # A DS18B20 is a probe on the w1-bus, so the driver type
+                        # and the capability source differ. Joining them
+                        # directly reported every adopted probe as unbound —
+                        # the same mismatch the bind endpoint had, and it has to
+                        # be fixed in both places or the app shows a claimed
+                        # channel as free.
+                        "         ON (d.driver_type = c.source "
+                        "             OR (d.driver_type = 'ds18b20' AND c.source = 'w1-bus')) "
                         "        AND d.adopted "
                         "        AND COALESCE(d.binding ->> 'channel', d.binding ->> 'rom') "
                         "            = c.channel "
