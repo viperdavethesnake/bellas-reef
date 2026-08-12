@@ -466,7 +466,27 @@ Three cautions:
   been confirmed on this board**. It is a wiring fact; confirm it before binding
   anything to a pin.
 
-After editing, reboot and confirm the channel exports:
+### PWM sysfs permissions — a second host action
+
+The services run as `david`, and `/sys/class/pwm/pwmchip0/*` is root-owned.
+Export succeeds; writing `duty_cycle` does not:
+
+```
+PermissionError: [Errno 13] Permission denied:
+  '/sys/class/pwm/pwmchip0/pwm0/duty_cycle'
+```
+
+Measured on the hub 2026-08-12. A udev rule is needed to give the `gpio` group
+ownership of the exported channel attributes, in the same spirit as the `i2c`
+and `gpio` device nodes — the services must not run as root.
+
+Unlike the overlay this is not optional-until-you-wire-something: without it a
+declared light builds, fails to open, and is skipped. hardware-io stays up and
+the probe keeps reporting (deliberately — a light that cannot open is dark
+either way, and a hub that will not start monitors nothing), but the channel
+never drives.
+
+After editing config.txt, reboot and confirm the channel exports:
 
 ```bash
 echo 0 | sudo tee /sys/class/pwm/pwmchip0/export
