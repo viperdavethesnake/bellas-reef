@@ -190,7 +190,7 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 | Interface | Path | State |
 |---|---|---|
 | I²C | `/dev/i2c-1` | enabled; see device inventory below |
-| PWM (RP1) | `/sys/class/pwm/pwmchip0` | `1f0009c000.pwm`; **npwm reads 4** (measured 2026-08-11, kernel 6.18.39, no PWM overlay loaded) |
+| PWM (RP1) | `/sys/class/pwm/pwmchip0` | `1f00098000.pwm` after `pwm-2chan`; **npwm 4**. Two chips exist once the overlay loads and the index MOVED — `pwmchip0` was `1f0009c000.pwm` before it. Verified 2026-08-12 |
 | I²C (HDMI DDC) | `/dev/i2c-13`, `/dev/i2c-14` | ignore |
 | 1-Wire | `/sys/bus/w1/devices/w1_bus_master1` | live; DS18B20 probes appear as `28-*` |
 | SPI | — | disabled (`dtoverlay=nospi10`) |
@@ -205,6 +205,13 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 
 `0x70` on a bus scan is **not a second board** — it is the PCA9685's ALLCALLADR
 (`0x05` reads `0xE0`; `0xE0 >> 1 = 0x70`). Expect both addresses from one chip.
+
+**PWM pin muxing, verified 2026-08-12.** `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`
+gives `GPIO12 = PWM0_CHAN0` and `GPIO13 = PWM0_CHAN1`. The archive's form — two
+separate `dtoverlay=pwm` lines — was tried on this board and **only the second
+took**, leaving GPIO12 unmuxed while the channel still exported happily. A
+channel that exports while its pin reads `none` is the trap; check
+`pinctrl get 12,13`, not the presence of a sysfs directory.
 
 **PWM channel count, and a discrepancy with the archive.** Our Pi reports
 `npwm` **4**. The archived HAL README (v3.1.0) states the count "should show: 2"

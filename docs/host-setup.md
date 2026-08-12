@@ -400,6 +400,24 @@ Find probe ROM codes with:
 ls /sys/bus/w1/devices/ | grep '^28-'
 ```
 
+### The stack's containers must restart on boot
+
+NATS, PostgreSQL and VictoriaMetrics run as containers started by hand. They had
+**no restart policy**, so the first reboot of this host took the entire stack
+down with it: the services came up, could not reach `localhost:4222`, and sat
+retrying while the tank went unmonitored.
+
+```bash
+docker update --restart unless-stopped nats-dev pg-dev vm-dev
+```
+
+Applied 2026-08-12. `unless-stopped` rather than `always` so a container stopped
+deliberately stays stopped across a reboot.
+
+This is the same class of failure as an unsupervised service — something the hub
+depends on that nothing brings back — and it was invisible until the host was
+actually rebooted, which had not happened since the units were installed.
+
 ### Removing a device
 
 Deleting a device is **three things**, and doing fewer leaves it half-gone. This
@@ -444,13 +462,49 @@ overlay does is **mux header pins to it**. Without one, exporting a channel
 succeeds and drives nothing.
 
 ```bash
-# In /boot/firmware/config.txt. Two single-channel overlays, not pwm-2chan —
-# this is the form the archived HAL (v3.1.0) shipped and ran on real hardware.
+# In /boot/firmware/config.txt, [pi5] section. Applied and verified 2026-08-12.
+dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+```
+
+**Not two single-channel overlays.** The archived HAL (v3.1.0) prescribes
+
+```
 dtoverlay=pwm,pin=12,func=4
 dtoverlay=pwm,pin=13,func=4
 ```
 
-Channel mapping, from the archive: **channel 0 → GPIO12, channel 1 → GPIO13.**
+and that was tried first, on this board, and **does not work**: the second line
+wins and the first is silently discarded. Measured after the reboot —
+
+```
+12: no    pd | -- // GPIO12 = none
+13: a0    pd | lo // GPIO13 = PWM0_CHAN1
+```
+
+`pwm-2chan` produces both:
+
+```
+12: a0    pd | lo // GPIO12 = PWM0_CHAN0
+13: a0    pd | lo // GPIO13 = PWM0_CHAN1
+```
+
+The archive's channel mapping is otherwise correct — **channel 0 → GPIO12,
+channel 1 → GPIO13** — it is only the overlay form that does not carry to RP1.
+
+**Two pwmchips exist after the overlay loads**, and the index moved:
+
+| node | device | which |
+|---|---|---|
+| `pwmchip0` | `1f00098000.pwm` | the one the overlay muxes to GPIO12/13 |
+| `pwmchip1` | `1f0009c000.pwm` | present before the overlay; unmuxed |
+
+Before the overlay, `pwmchip0` **was** `1f0009c000.pwm`. The index is not stable
+across a config change, exactly like `gpiochip*`. Our bindings target
+`pwmchip0`, which is correct today and is worth re-checking after any overlay
+edit.
+
+Verify with `pinctrl get 12,13` after a reboot; a channel that exports happily
+while the pin reads `none` is the failure this section exists to prevent.
 
 Three cautions:
 
