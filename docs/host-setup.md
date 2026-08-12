@@ -355,6 +355,25 @@ tank controller means one stray signal hangs it until the watchdog fires.
 - **Unattended upgrades.** Deliberately absent so nothing reboots mid-dose. The
   trade is that patching must become a scheduled, supervised action.
 
+## 8b. Wiring reference
+
+**There is no current wiring sheet.** `artifacts/bellasreef-day1-wiring.pdf` was
+removed on 2026-08-12: it showed the withdrawn design with a 10 V pull-up
+directly on a PCA9685 LEDn pin, which is out of spec at a 5.5 V absolute
+maximum. A drawing that is wrong is worse than no drawing, because somebody
+builds from it.
+
+Until a corrected sheet exists, the wiring reference is:
+
+- **CLAUDE.md "Verified host facts"** — measured device inventory, bus paths,
+  and the correction trail for the withdrawn design.
+- **The output-stage table** in that section (item 0a): the external N-FET
+  stage, gate resistor, drain to the dim line, source to ground, and the DMM
+  probe point.
+
+Both are text, both are dated, and both distinguish what has been measured from
+what has only been ruled.
+
 ## 9. The device file, and the PWM overlay
 
 ### `/etc/bellasreef/devices.yaml`
@@ -380,6 +399,42 @@ Find probe ROM codes with:
 ```bash
 ls /sys/bus/w1/devices/ | grep '^28-'
 ```
+
+### Removing a device
+
+Deleting a device is **three things**, and doing fewer leaves it half-gone. This
+is written down because each part was discovered separately, by hand, after a
+device came back from the dead.
+
+1. **The registry rows.**
+
+   ```
+   DELETE FROM sensor_alerts WHERE device_id = '<id>';
+   DELETE FROM devices       WHERE device_id = '<id>';
+   ```
+
+   Episodes are deleted explicitly because `sensor_alerts` has **no foreign key**
+   to `devices` — deliberately, so deleting a device cannot erase the evidence
+   that it misbehaved. That is the right default, and it means a genuine removal
+   has to say so.
+
+2. **The retained announcement.** `BR_REGISTRY` is last-value-per-subject, so
+   the API replays it on every start and **recreates the row**. Deleting the row
+   without this looks like it worked, right up until the next restart.
+
+   ```
+   js.purge_stream("BR_REGISTRY", subject="bellasreef.registry.<id>")
+   ```
+
+   Order matters here and nowhere else: purge before or with the row delete, or
+   an API restart in between brings it back.
+
+3. **The telemetry series.** Otherwise the history of a device that no longer
+   exists stays queryable and keeps counting against retention.
+
+   ```
+   POST /api/v1/admin/tsdb/delete_series?match[]={device_id="<id>"}
+   ```
 
 ### PWM overlay — host mutation, and it needs a reboot
 

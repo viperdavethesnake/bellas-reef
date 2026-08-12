@@ -1,9 +1,25 @@
 # Bella's Reef — Product Requirements Document
 
-**Version:** 1.3
+**Version:** 1.4
 **Owner:** David / Bella's Reef LLC
 **Date:** 2026-08-09
 **Status:** Active
+
+### Changelog
+
+- **1.4 (2026-08-12)** — records the R1 rescoping of 2026-08-10, which changed a
+  P0 requirement's meaning with no version bump at the time. R1 previously
+  required *every* actuator registration to declare safe state, maximum runtime
+  and heartbeat timeout. It now requires that triple only of `authoritative`
+  registrations, and **rejects** a declared safe state on `advisory` or
+  `observe_only` ones, because the system cannot enforce what it cannot command.
+  Under the unscoped wording an advisory device was unregisterable — refused by
+  R1 for lacking a triple and by device-classes.md §2.2 for carrying one. No
+  implementation change accompanies this entry: the code has matched the amended
+  wording since 2026-08-10, and only the version record was missing.
+- **1.3 (2026-08-09)** — stream frame schema published alongside openapi.json.
+- **1.2 (2026-08-09)** — contracts 2.0.0 adds the required actuator `role`.
+- **1.1 (2026-08-09)** — licensing structure (Q3).
 
 **Changelog:**
 - **1.3 (2026-08-09):** G3 footnoted for the WebSocket. The REST client stays 100% generated. The stream's *transport* (connect, first-message auth, reconnect/backoff) is hand-written as a documented exception, because WebSockets are not expressible in OpenAPI 3.1 — but frame **decoding** must use types generated from the published frame JSON Schema. Hand-written frame structs are forbidden. Drift in frame shape stays a compile error, which is the property G3 exists to protect; the transport carries no contract knowledge.
