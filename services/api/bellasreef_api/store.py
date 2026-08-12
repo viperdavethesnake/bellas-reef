@@ -270,12 +270,13 @@ class Store:
                 await conn.execute(
                     text(
                         "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                        "                     poll_interval_s, role, display_name, location, "
+                        "                     poll_interval_s, transport, role, display_name, "
+                        "                     location, "
                         "                     driver_type, binding, adopted, actuator_class, "
                         "                     control_authority, failsafe_capable, transport, "
                         "                     safe_state, max_runtime_s, heartbeat_timeout_s) "
                         "VALUES (:id, :device_id, :kind, :driver_id, :sensor_type, "
-                        "        :poll_interval_s, :role, :display_name, :location, "
+                        "        :poll_interval_s, :transport, :role, :display_name, :location, "
                         "        :driver_type, CAST(:binding AS jsonb), true, :actuator_class, "
                         "        :control_authority, :failsafe_capable, :transport, "
                         "        CAST(:safe_state AS jsonb), :max_runtime_s, "
@@ -300,10 +301,12 @@ class Store:
                         # registered by hardware-io. The values come from the
                         # contract rather than being retyped here, so the row
                         # and the driver's registration cannot disagree.
+                        # A sensor declares its transport too (migration 0010).
+                        # hardware-io only ever owns local buses, per §3.
+                        "transport": "local",
                         "actuator_class": None if kind == "sensor" else "pwm",
                         "control_authority": None if kind == "sensor" else "authoritative",
                         "failsafe_capable": None if kind == "sensor" else True,
-                        "transport": None if kind == "sensor" else "local",
                         "safe_state": (
                             None if kind == "sensor" else json.dumps({"kind": "pwm", "duty": 0.0})
                         ),

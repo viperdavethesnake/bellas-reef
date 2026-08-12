@@ -107,9 +107,9 @@ def test_seeding_over_known_hardware_creates_no_new_rows() -> None:
             await conn.execute(
                 text(
                     "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                    "  poll_interval_s, display_name, alert_min, alert_max, "
+                    "  poll_interval_s, transport, display_name, alert_min, alert_max, "
                     "  alert_clear_margin, driver_type, binding, adopted) "
-                    "VALUES (:id, :did, 'sensor', 'ds18b20', 'temp', 5.0, "
+                    "VALUES (:id, :did, 'sensor', 'ds18b20', 'temp', 5.0, 'local', "
                     "  'Bob''s Big Ass Tank', 23.0, 25.5, 0.2, 'ds18b20', "
                     "  CAST(:binding AS jsonb), true)"
                 ),
@@ -463,8 +463,8 @@ def test_an_announced_probe_is_adopted_not_duplicated() -> None:
             await conn.execute(
                 text(
                     "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                    "  poll_interval_s) "
-                    "VALUES (:id, :did, 'sensor', 'ds18b20', 'temp', 5.0)"
+                    "  poll_interval_s, transport) "
+                    "VALUES (:id, :did, 'sensor', 'ds18b20', 'temp', 5.0, 'local')"
                 ),
                 {"id": uuid.uuid4(), "did": f"ds18b20-{ROM}"},
             )
