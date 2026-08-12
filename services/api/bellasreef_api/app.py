@@ -1274,6 +1274,78 @@ def build_app(
         await sink("device.renamed", {"device_id": device_id, "display_name": body.display_name})
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
 
+    @app.delete(
+        "/api/v1/devices/{device_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        tags=["hardware"],
+        operation_id="unbindDevice",
+        responses={
+            204: {"description": "Unbound. The channel is free to bind again."},
+            401: AUTH_401,
+            404: {"description": "No such device, or it is already unbound."},
+        },
+    )
+    async def unbind_device(
+        device_id: str,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> Response:
+        """Release a device's claim on its hardware channel.
+
+        **Soft, and DELETE anyway.** From the operator's side this is the delete:
+        the device stops existing as a claim on a channel, which is the only
+        thing the verb has to mean here. Underneath, the row survives with its
+        name, thresholds, alert history and every telemetry series keyed on its
+        `device_id`. Dropping the row would sever history from the hardware that
+        produced it, and re-binding the same probe tomorrow would then look like
+        new hardware — which is exactly the identity fork, reached from the other
+        end.
+
+        Without this endpoint a PWM channel bound to the wrong device was taken
+        for good: `bindDevice` returns 409 on an actuator channel someone else
+        holds, and nothing anywhere could let go. SQL on the hub was the only
+        way out, which is also the way an audit row went missing.
+        """
+        row = await store.unadopt_device(device_id)
+        if row is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"no adopted device {device_id!r}. It was never bound, or it is already unbound.",
+            )
+
+        # The tombstone the contract defines: adopted=False republished on the
+        # device's own subject, rather than a deleted subject. A deletion simply
+        # vanishes, and a hardware-io that was offline for it would come back
+        # believing the device is still its to build.
+        #
+        # driver_type and binding ride along even though only `adopted` is read.
+        # They cost nothing, the model permits them when adopted is False, and
+        # the retained last value on this subject is then a record of which
+        # channel was released rather than only that something was.
+        if assignments is not None:
+            await assignments.publish(
+                DeviceAssignment(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="api",
+                    device_id=row["device_id"],
+                    adopted=False,
+                    role=row["role"],
+                    driver_type=row["driver_type"],
+                    binding=row["binding"],
+                )
+            )
+
+        await sink(
+            "device.unbound",
+            {
+                "device_id": row["device_id"],
+                "driver_type": row["driver_type"],
+                "binding": row["binding"],
+            },
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.get(
         "/api/v1/audit",
         response_model=list[AuditEvent],

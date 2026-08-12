@@ -13,7 +13,7 @@ A gzipped tar with exactly two members.
 
 | Member | What it is |
 |---|---|
-| `manifest.json` | schema revision, contracts version, which database this came from, sha256 and size of the dump, the telemetry snapshot name, and the omissions list |
+| `manifest.json` | schema revision, contracts version, which hub this came from, sha256 and size of the dump, the telemetry snapshot name, the `contains` list, and the omissions list |
 | `postgres.dump` | `pg_dump --format=custom --no-owner --no-privileges` of the whole database |
 
 Ownership and grants are stripped on purpose. They are facts about a
@@ -51,8 +51,11 @@ would treat a password-manager export:
   after the fact. Revoking clients does not help: the key that signs their
   replacements is the same key that is in the file.
 
-The manifest says all of this in its `contains` list, next to the `omissions`
-list, so the file explains itself to whoever finds it later:
+`bellasreef backup` and `bellasreef restore` both print this at the end of every
+run, above the omissions list, so you meet it while you still have the file in
+front of you. The manifest carries the same text in its `contains` list, next to
+the `omissions` list, so the file also explains itself to whoever finds it
+later:
 
 ```bash
 tar xzOf backup.tar.gz manifest.json | jq .contains
@@ -223,13 +226,26 @@ allows itself.
 **Container images.** Pinned by digest in `deploy/compose.yaml`. `docker
 compose pull`.
 
-## A known gap
+## Which hub an archive came from
 
-There is no stable hub identifier in the schema. The manifest records the
-database host, the database name, and the machine that ran the tool, which is
-enough to tell two hubs apart in practice. If you ever run two hubs with the
-same hostname and the same database name, these manifests cannot distinguish
-them. Closing that properly means writing an identity row at first boot.
+`manifest.hub.hub_id` is the answer, and it is the only one that survives being
+moved around. It is a UUID written to `hub_identity` once at first boot and
+carried through a restore with the rest of the data, so an archive names the hub
+rather than the circumstances of its own creation.
+
+The other three fields corroborate and none of them is sufficient alone.
+`database_host` is Postgres as it was addressed — `postgres` when you run the
+documented `docker compose exec api bellasreef backup`, which identifies
+nothing; `bellasreef.local` when you run it from a laptop, which identifies
+everything. `taken_on` is the machine that ran the tool and has the
+mirror-image problem. `database` is almost always `bellasreef`.
+
+One case leaves `hub_id` null: a database that has been migrated but has never
+had a service start against it, because the id is minted at startup rather than
+in the migration. Stamping it in the migration would give a hub about to have a
+backup restored into it a brand-new identity, destroying the fact the row exists
+to carry. A manifest without a `hub_id` is old, not wrong — it reads, and it
+falls back to the three corroborating fields.
 
 ## Verifying a backup without restoring it
 

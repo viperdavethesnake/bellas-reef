@@ -364,6 +364,40 @@ class Store:
                 )
         return target, created
 
+    async def unadopt_device(self, device_id: str) -> dict[str, Any] | None:
+        """Release a device's claim on its channel. Returns the row, or None.
+
+        **Soft.** The row stays, with its display name, thresholds, alert
+        history and every telemetry series that already carries its
+        ``device_id``. Deleting it would break the identity that history hangs
+        off, and re-binding the same hardware later would then look like a new
+        device — the identity fork again, arrived at from the other direction.
+
+        ``adopted = false`` is the whole mechanism. :meth:`device_bound_to` and
+        the capability join both filter on it, so clearing it is what frees the
+        channel for a new bind; ``factory.py`` builds nothing for an unadopted
+        assignment, so the driver goes away too.
+
+        ``AND adopted`` makes the second call on the same device report nothing
+        happened rather than a second success — the same shape as
+        :meth:`revoke`, and for the same reason: "unbound" and "was never bound"
+        are different answers and an operator is entitled to know which one they
+        got.
+        """
+        async with self._engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "UPDATE devices SET adopted = false "
+                        " WHERE device_id = :device_id AND adopted "
+                        " RETURNING device_id, kind, role, driver_type, binding"
+                    ),
+                    {"device_id": device_id},
+                )
+            ).mappings()
+            first = row.first()
+            return dict(first) if first is not None else None
+
     async def adopted_assignments(self) -> list[dict[str, Any]]:
         """Every device an operator has claimed, for republishing on startup.
 

@@ -25,10 +25,13 @@ from bellasreef_api.backup import (
     DUMP_NAME,
     MANIFEST_NAME,
     MANIFEST_VERSION,
+    Manifest,
     RestoreRefusedError,
+    _contains,
     open_archive,
     write_archive,
 )
+from bellasreef_api.cli import _print_contains
 from bellasreef_db.revisions import HEAD_REVISION
 
 DUMP = b"PGDMP-not-really-but-bytes-are-bytes" * 64
@@ -251,3 +254,36 @@ def test_a_member_trying_to_escape_the_workdir_is_refused(tmp_path: Path) -> Non
 
     verified = open_archive(archive, tmp_path / "work")
     assert sorted(p.name for p in verified.dump_path.parent.iterdir()) == [DUMP_NAME]
+
+
+# ------------------------------------------------------- what the operator sees
+
+
+def test_the_operator_is_told_what_the_archive_contains(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The `contains` list reached the manifest and the docs, and stopped there.
+
+    Which is the one place it was no use: the terminal is where the file has
+    just been written and where the operator is deciding whether to drop it in a
+    cloud folder. Printed at backup and at restore, above the omissions, and
+    shaped as a warning rather than a bullet.
+    """
+    manifest = Manifest.model_validate(
+        _manifest_dict(contains=[item.model_dump() for item in _contains()])
+    )
+
+    _print_contains(manifest)
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "signing secret" in out
+    assert "password-manager export" in out, "the handling advice, not only the label"
+
+
+def test_an_archive_from_before_the_contains_list_still_prints(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Old, not wrong. A manifest without the field reads, and says nothing."""
+    _print_contains(Manifest.model_validate(_manifest_dict()))
+    assert capsys.readouterr().out == ""

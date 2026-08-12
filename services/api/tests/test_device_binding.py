@@ -22,13 +22,14 @@ import asyncio
 import os
 import uuid
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
 from bellasreef_api.app import build_app
 from bellasreef_api.store import Store
 from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
+from bellasreef_contracts.messages import DeviceAssignment
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -72,8 +73,10 @@ async def announce(engine: AsyncEngine, source: str, channel: str) -> None:
         )
 
 
-async def client_for(engine: AsyncEngine) -> tuple[httpx.AsyncClient, dict[str, str]]:
-    app = build_app(engine, audit=Audit(), nats_url=None, vm_url=None)
+async def client_for(
+    engine: AsyncEngine, *, audit: Audit | None = None, nats_url: str | None = None
+) -> tuple[httpx.AsyncClient, dict[str, str]]:
+    app = build_app(engine, audit=audit or Audit(), nats_url=nats_url, vm_url=None)
     c = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://hub")
     granted = await c.post("/api/v1/pair", json={"client_name": f"t-{uuid.uuid4().hex[:6]}"})
     token = (
@@ -597,3 +600,209 @@ def test_a_reconciled_assignment_carries_what_the_driver_needs() -> None:
     assert row["driver_type"] == "pi-pwm"
     assert row["binding"] == {"channel": "1"}
     assert row["role"] == "light"
+
+
+# ------------------------------------------------------------------ unbinding
+
+
+class RecordingPublisher:
+    """Stands in for :class:`AssignmentPublisher`. Records, does not connect."""
+
+    published: ClassVar[list[DeviceAssignment]] = []
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    async def publish(self, assignment: DeviceAssignment) -> None:
+        RecordingPublisher.published.append(assignment)
+
+    async def close(self) -> None:
+        return None
+
+
+async def bind_light(
+    c: httpx.AsyncClient, headers: dict[str, str], device_id: str, channel: str
+) -> httpx.Response:
+    return await c.post(
+        "/api/v1/devices",
+        headers=headers,
+        json={
+            "device_id": device_id,
+            "driver_type": "pi-pwm",
+            "channel": channel,
+            "role": "light",
+        },
+    )
+
+
+def test_unbinding_frees_the_channel_to_be_bound_again() -> None:
+    """The lockout this endpoint closes.
+
+    A PWM channel bound to the wrong device was taken for good: `bindDevice`
+    returns 409 on an actuator channel somebody else holds, and nothing anywhere
+    could let go of one. SQL on the hub was the only way out.
+    """
+
+    async def scenario() -> tuple[int, int, int, dict[str, Any]]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            blocked = await bind_light(c, headers, "led-red", "0")
+            unbound = await c.delete("/api/v1/devices/led-blue", headers=headers)
+            rebound = await bind_light(c, headers, "led-red", "0")
+            return (
+                blocked.status_code,
+                unbound.status_code,
+                rebound.status_code,
+                rebound.json(),
+            )
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    blocked, unbound, rebound, body = run(scenario)
+    assert blocked == 409
+    assert unbound == 204
+    assert rebound == 200
+
+    # Pinned, not endorsed. `Store.bind_device` matches an existing row on
+    # (driver_type, channel) whether or not it is adopted, so the freed channel
+    # re-adopts the row that used to hold it and the proposed `led-red` is
+    # discarded. For a PROBE that is exactly right — the ROM is the hardware's
+    # identity. For a PWM channel it is not obviously right: the slot has no
+    # identity of its own, and the operator's declaration is the only thing that
+    # says what is plugged into it.
+    #
+    # Left as-is deliberately. Changing the match rule means changing the code
+    # path that produced the identity fork, and it cannot be verified without a
+    # database. The channel is free either way, which is the lockout this
+    # endpoint exists to close. Recorded here so the next person meets it as a
+    # decision rather than a surprise.
+    assert body["device_id"] == "led-blue"
+    assert body["created"] is False
+
+
+def test_unbinding_keeps_the_row_and_its_history() -> None:
+    """Soft, and the softness is the point.
+
+    Deleting the row would sever a device's telemetry, thresholds and alert
+    history from the hardware that produced them, and re-binding the same probe
+    tomorrow would look like new hardware. That is the identity fork, reached
+    from the other end.
+    """
+
+    async def scenario() -> tuple[int, dict[str, Any]]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            await c.patch(
+                "/api/v1/devices/led-blue",
+                headers=headers,
+                json={"display_name": "Left blue bank"},
+            )
+            await c.delete("/api/v1/devices/led-blue", headers=headers)
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT adopted, display_name, binding FROM devices "
+                            " WHERE device_id = 'led-blue'"
+                        )
+                    )
+                ).mappings()
+                first = row.first()
+                assert first is not None
+                return await device_count(engine), dict(first)
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    count, row = run(scenario)
+    assert count == 1, "the row survives; only its claim on the channel does not"
+    assert row["adopted"] is False
+    assert row["display_name"] == "Left blue bank"
+    assert row["binding"] == {"channel": "0"}, (
+        "what it was bound to is kept, so re-binding it later is recognisably the "
+        "same hardware rather than something new"
+    )
+
+
+def test_unbinding_publishes_the_tombstone_and_audits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`adopted=False` on the device's own subject, not a deleted subject.
+
+    A deletion simply vanishes, and a hardware-io that was offline for it comes
+    back believing the device is still its to build. `factory.py` builds nothing
+    for an unadopted assignment, so the tombstone is what removes the driver.
+    """
+    RecordingPublisher.published = []
+    monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
+
+    async def scenario() -> list[str]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        audit = Audit()
+        c, headers = await client_for(engine, audit=audit, nats_url="nats://127.0.0.1:4222")
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            response = await c.delete("/api/v1/devices/led-blue", headers=headers)
+            assert response.status_code == 204, response.text
+            return audit.events
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    events = run(scenario)
+    # Pairing and minting a token go through the same sink; only the device
+    # events are this test's business.
+    assert [e for e in events if e.startswith("device.")] == ["device.bound", "device.unbound"]
+
+    assert [(a.device_id, a.adopted) for a in RecordingPublisher.published] == [
+        ("led-blue", True),
+        ("led-blue", False),
+    ]
+    tombstone = RecordingPublisher.published[-1]
+    assert tombstone.binding == {"channel": "0"}, (
+        "the retained last value then records which channel was released, not "
+        "merely that something happened"
+    )
+
+
+def test_unbinding_an_unknown_device_is_a_404() -> None:
+    async def scenario() -> tuple[int, int]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            missing = await c.delete("/api/v1/devices/no-such-device", headers=headers)
+            await c.delete("/api/v1/devices/led-blue", headers=headers)
+            again = await c.delete("/api/v1/devices/led-blue", headers=headers)
+            return missing.status_code, again.status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    missing, again = run(scenario)
+    assert missing == 404
+    assert again == 404, "already unbound is not a second success"
+
+
+def test_unbinding_needs_a_bearer() -> None:
+    async def scenario() -> int:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            return (await c.delete("/api/v1/devices/led-blue")).status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    assert run(scenario) == 401

@@ -50,6 +50,12 @@ class NatsAuditSink:
         self._url = url
         self._source = source
         self._nc: Client | None = None
+        #: Events this sink was asked to publish and could not. The API ignores
+        #: it — a request must not fail on a logging problem — but the CLI reads
+        #: it, because there the operator is standing at the terminal and is the
+        #: only one who will ever see that the trail has a hole in it. A
+        #: CRITICAL line in a log nobody is tailing is not telling anyone.
+        self.failures = 0
 
     async def _client(self) -> Client | None:
         if self._nc is None or not self._nc.is_connected:
@@ -67,6 +73,7 @@ class NatsAuditSink:
     async def __call__(self, event: str, detail: dict[str, Any]) -> None:
         client = await self._client()
         if client is None:
+            self.failures += 1
             log.critical("auth event dropped", extra={"event": event, **detail})
             return
 
@@ -86,6 +93,7 @@ class NatsAuditSink:
                 headers={"Nats-Msg-Id": message_id},
             )
         except Exception:
+            self.failures += 1
             log.critical("auth event failed to publish", extra={"event": event}, exc_info=True)
 
     async def close(self) -> None:

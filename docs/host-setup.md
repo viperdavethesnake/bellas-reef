@@ -518,3 +518,116 @@ echo 0 | sudo tee /sys/class/pwm/pwmchip0/unexport
 is deprecated and absent on this board; `/sys/class/pwm` is the current kernel
 PWM ABI and the only interface the RP1 PWM block exposes. libgpiod does not
 cover PWM — it is a GPIO character-device library, and hardware PWM is not GPIO.
+
+## 10. Getting back in: `bellasreef pair` and `bellasreef revoke`
+
+Two commands on the hub, for the two halves of losing a phone. They are the
+only terminal interaction in the whole system, and you should need them roughly
+never. Read this before you need it, because the day you need it is the day the
+app will not open.
+
+### Running the CLI
+
+`bellasreef` is a console script installed with the API package, so it lives in
+the same virtualenv systemd starts uvicorn from. It talks to Postgres directly
+and does not go through the API, which is the point: the API is what you cannot
+authenticate to.
+
+Configuration comes from the environment, and the service's environment lives in
+`/etc/bellasreef/api.env` (section 7), not in the unit file. Source it:
+
+```bash
+cd /home/david/bellasreef
+set -a; . /etc/bellasreef/api.env; set +a
+.venv/bin/bellasreef revoke --list
+```
+
+| Variable | What it is for | Missing |
+|---|---|---|
+| `BELLASREEF_DATABASE_URL` | everything. Required. | refuses, exit 2 |
+| `BELLASREEF_NATS_URL` | publishing the audit event | the command still does its job, then warns on stderr that the event was **not** recorded |
+
+Sourcing the file gets you both. Exporting the DSN by hand and nothing else is
+the mistake that loses the audit row, which is why the warning is loud rather
+than a log line.
+
+### Listing clients
+
+```bash
+.venv/bin/bellasreef revoke --list
+```
+
+```
+2 client(s) ever paired, 1 still live.
+
+  0f9e4c6a-1d2b-4a77-9f3e-1c5b8a2d4e60  David's iPhone
+      paired 2026-08-09T18:06:12+00:00 · last seen 2026-08-12T14:20:01+00:00 · live
+  6b1c0d55-9a4e-4f21-8d77-2e0a3c9b7f14  iPhone
+      paired 2026-07-30T11:02:44+00:00 · last seen 2026-08-01T07:55:10+00:00 · REVOKED 2026-08-01T08:10:00+00:00
+```
+
+`--json` gives the same rows machine-readably. Nothing is revoked by `--list`.
+
+### I lost my phone (and I still have another paired device)
+
+Revoke the lost one by id, or by name when the name is unambiguous:
+
+```bash
+.venv/bin/bellasreef revoke 0f9e4c6a-1d2b-4a77-9f3e-1c5b8a2d4e60
+.venv/bin/bellasreef revoke "David's iPhone"
+```
+
+If two clients share a name, the command lists them and revokes nothing. Every
+iOS device pairs as "iPhone" today (`UIDevice.current.name` returns the model),
+so expect to use ids.
+
+A revoke takes effect on the phone's next request. Its refresh token is dead and
+its access token stops working, because liveness is checked per request rather
+than waiting for the JWT to expire. One exception: a WebSocket that is already
+open keeps streaming until the socket drops.
+
+### I am locked out entirely
+
+The lost phone was the only paired device, so there is nobody left to approve a
+new one and the open-pairing window has been shut since the first device paired.
+Three steps, on the hub:
+
+```bash
+cd /home/david/bellasreef
+set -a; . /etc/bellasreef/api.env; set +a
+
+# 1. Open a recovery window. Default 300 seconds; --ttl takes seconds.
+.venv/bin/bellasreef pair --ttl 600
+
+# 2. On the replacement phone, open the app, pick the hub, pair.
+#    It gets a token immediately instead of a six-digit code, because the
+#    window is open. The window is spent by whoever uses it first.
+
+# 3. Turn the lost phone off.
+.venv/bin/bellasreef revoke --list
+.venv/bin/bellasreef revoke <id of the lost phone>
+```
+
+**Step 3 is not optional, and step 1 does not do it for you.** A pairing window
+*adds* a client. It does not clear client state, deliberately: the TOFU window
+that let your first device in is keyed on client rows having ever existed, so
+deleting revoked clients to "reset" the hub would reopen open pairing to anyone
+on the LAN. The recovery would be undoing the protection it is recovering from.
+Pair the replacement, then revoke the old one. Two commands, on purpose.
+
+If the window expires before you get to the app, run `pair` again. There is no
+cancel; a window is spent or it ages out.
+
+### Confirming the audit row landed
+
+Both commands publish to `bellasreef.audit.auth`, and the writer persists it to
+`audit_log`. From the new phone, or with a token:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" \
+  'http://bellasreef.local:8000/api/v1/audit?category=auth&limit=5' | jq .
+```
+
+Look for `pair.window_opened` and `client.revoked`. If the CLI warned that
+`BELLASREEF_NATS_URL` was unset, they will not be there, and there is no way to
+add them after the fact: `audit_log` is append-only by trigger.

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """`bellasreef` — the operator CLI.
 
-Two jobs, both of them things you reach for on a bad day.
+A handful of jobs, all of them things you reach for on a bad day.
 
 **pair** is the fire escape (auth.md §1), not the front door. It exists for one
 situation: every paired client is lost or revoked, so there is nobody left to
@@ -13,6 +13,19 @@ distinction is the whole point — deleting revoked clients would reopen the
 TOFU-ever window, which is keyed on rows having existed precisely so that
 revoking everything cannot reopen open pairing. A recovery path that undid the
 protection it is recovering from would be a much better attack than a feature.
+
+**revoke** is the other half of the same recovery. A window *adds* a client; it
+never removes one, deliberately, so pairing a replacement phone leaves the lost
+one paired beside it. Both revoke endpoints need a live token of your own, which
+is precisely what an operator whose only device is gone does not have. So:
+`bellasreef pair` to let the new phone in, `bellasreef revoke` to turn the old
+one off, and those two commands together are how you replace a phone.
+
+It also exists to retire the last reason anyone would reach for `psql`. The
+audit row is written by the handler, not by the mutation, so a revocation done
+in SQL leaves no trace at all — which is how one went missing on 2026-08-12.
+This subcommand emits `client.revoked` exactly as the API does, and says so out
+loud when it cannot.
 
 **backup**/**restore** are PRD R14. One command produces one restorable file;
 one command loads it onto fresh hardware or refuses, by name, without touching
@@ -34,10 +47,13 @@ import os
 import socket
 import sys
 import tempfile
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -48,7 +64,7 @@ from bellasreef_api.backup import (
     create_backup,
     restore_backup,
 )
-from bellasreef_api.store import Store
+from bellasreef_api.store import ClientRow, Store
 
 __all__ = ["main"]
 
@@ -57,7 +73,51 @@ __all__ = ["main"]
 DEFAULT_WINDOW_S = 300
 
 
-async def _open_window(dsn: str, ttl_s: float, nats_url: str | None) -> dict[str, Any]:
+async def _emit(nats_url: str | None, event: str, detail: dict[str, Any]) -> str | None:
+    """Publish one audit event. Returns a warning to shout, or ``None``.
+
+    Best effort by design — the window is already open, the client is already
+    revoked, and a broker that is down must not stop an operator recovering
+    their tank. But best effort **said out loud**. This used to be a bare
+    ``if nats_url:``, so the one scenario the CLI exists for — locked out, at
+    the hub, over SSH, with `BELLASREEF_NATS_URL` living in a systemd env file
+    the shell has never heard of — printed the same success banner and exit 0 as
+    a fully recorded run. The audit gap was invisible at exactly the moment
+    somebody was standing there to see it.
+
+    A CRITICAL log line is not a substitute. Nobody is tailing the journal while
+    they type this.
+    """
+    if not nats_url:
+        return (
+            f"BELLASREEF_NATS_URL is not set, so `{event}` was NOT recorded.\n"
+            "  The operation itself succeeded; the audit trail has a hole where\n"
+            "  it should be. The value is in /etc/bellasreef/api.env on the hub."
+        )
+
+    from bellasreef_api.audit import NatsAuditSink
+
+    sink = NatsAuditSink(nats_url, source="bellasreef-cli")
+    await sink(event, detail)
+    await sink.close()
+    if sink.failures:
+        return (
+            f"the audit sink at {nats_url} could not be reached, so `{event}`\n"
+            "  was NOT recorded. The operation itself succeeded."
+        )
+    return None
+
+
+def _warn(message: str) -> None:
+    """One shape for every "it worked, but" on this CLI. stderr, and loud."""
+    print(file=sys.stderr)
+    print(f"  !! {message}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+async def _open_window(
+    dsn: str, ttl_s: float, nats_url: str | None
+) -> tuple[dict[str, Any], str | None]:
     engine = create_async_engine(dsn, future=True)
     store = Store(engine)
     try:
@@ -68,22 +128,16 @@ async def _open_window(dsn: str, ttl_s: float, nats_url: str | None) -> dict[str
     finally:
         await engine.dispose()
 
-    if nats_url:
-        # Best effort: the window is already open, and failing to announce it
-        # must not stop the operator recovering their tank.
-        from bellasreef_api.audit import NatsAuditSink
-
-        sink = NatsAuditSink(nats_url, source="bellasreef-cli")
-        await sink(
-            "pair.window_opened",
-            {
-                "window_id": str(window_id),
-                "opened_by": opened_by,
-                "expires_at": expires.isoformat(),
-                "ttl_s": ttl_s,
-            },
-        )
-        await sink.close()
+    warning = await _emit(
+        nats_url,
+        "pair.window_opened",
+        {
+            "window_id": str(window_id),
+            "opened_by": opened_by,
+            "expires_at": expires.isoformat(),
+            "ttl_s": ttl_s,
+        },
+    )
 
     return {
         "window_id": str(window_id),
@@ -92,7 +146,227 @@ async def _open_window(dsn: str, ttl_s: float, nats_url: str | None) -> dict[str
         "opened_by": opened_by,
         "clients_ever": total,
         "clients_active": active,
+    }, warning
+
+
+# ------------------------------------------------------------------- revoke
+
+
+def _stamp(when: datetime | None) -> str:
+    return "never" if when is None else when.isoformat(timespec="seconds")
+
+
+def _client_json(row: ClientRow) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "created_at": row.created_at.isoformat(),
+        "last_seen_at": None if row.last_seen_at is None else row.last_seen_at.isoformat(),
+        "revoked_at": None if row.revoked_at is None else row.revoked_at.isoformat(),
+        "active": row.revoked_at is None,
     }
+
+
+def _print_clients(rows: Sequence[ClientRow]) -> None:
+    """Two lines per client, full id first.
+
+    Not a column table. The id is a 36-character UUID and it is the thing the
+    operator has to type back, so it gets a line of its own rather than being
+    truncated to fit beside four timestamps on an 80-column SSH session.
+    """
+    if not rows:
+        print("No client has ever paired with this hub.")
+        return
+
+    live = sum(1 for row in rows if row.revoked_at is None)
+    print(f"{len(rows)} client(s) ever paired, {live} still live.")
+    print()
+    for row in rows:
+        state = "live" if row.revoked_at is None else f"REVOKED {_stamp(row.revoked_at)}"
+        print(f"  {row.id}  {row.name}")
+        print(
+            f"      paired {_stamp(row.created_at)} · last seen "
+            f"{_stamp(row.last_seen_at)} · {state}"
+        )
+    print()
+    print("  Revoke one with:  bellasreef revoke <id|name>")
+
+
+def _resolve(rows: Sequence[ClientRow], target: str) -> tuple[ClientRow | None, list[ClientRow]]:
+    """Find the client ``target`` names. Returns ``(match, ambiguous_candidates)``.
+
+    An id is exact and final: if it does not match a row, nothing does, and
+    falling through to a name search would let a typo'd UUID revoke a device
+    that happens to be called something similar.
+
+    Names are matched exactly first, then case-insensitively, and **two matches
+    are never resolved by picking one**. Client names come from whatever the app
+    sent; two phones called "iPhone" is the expected case, not the exotic one
+    (see auth-review B9), and guessing between them revokes the wrong tank
+    control at the moment somebody is already having a bad day.
+    """
+    try:
+        wanted = UUID(target)
+    except ValueError:
+        pass
+    else:
+        for row in rows:
+            if row.id == wanted:
+                return row, []
+        return None, []
+
+    matches = [row for row in rows if row.name == target]
+    if not matches:
+        matches = [row for row in rows if row.name.casefold() == target.casefold()]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+@dataclass(frozen=True, slots=True)
+class _RevokeOutcome:
+    #: "revoked" | "unknown" | "ambiguous" | "already-revoked" | "raced"
+    status: str
+    client: ClientRow | None = None
+    candidates: tuple[ClientRow, ...] = ()
+    audit_warning: str | None = None
+
+
+async def _list_clients(dsn: str) -> list[ClientRow]:
+    engine = create_async_engine(dsn, future=True)
+    try:
+        return await Store(engine).list_clients()
+    finally:
+        await engine.dispose()
+
+
+async def _revoke(dsn: str, target: str, nats_url: str | None) -> _RevokeOutcome:
+    """Resolve, revoke, and audit — in that order, in one connection.
+
+    The audit event carries no ``revoked_by``. Every other producer of
+    ``client.revoked`` puts a client UUID in that field, and there is no client
+    here: the actor is a person at a terminal. Writing "david@bellasreef" into a
+    field consumers read as an id would corrupt the type for the sake of looking
+    complete. The sink stamps ``actor="bellasreef-cli"`` on every event it
+    publishes, which is the honest answer to who did this, and ``operator``
+    carries the shell detail beside it.
+    """
+    engine = create_async_engine(dsn, future=True)
+    store = Store(engine)
+    try:
+        rows = await store.list_clients()
+        match, candidates = _resolve(rows, target)
+        if match is None:
+            status = "ambiguous" if candidates else "unknown"
+            return _RevokeOutcome(status, candidates=tuple(candidates))
+        if match.revoked_at is not None:
+            return _RevokeOutcome("already-revoked", client=match)
+        if not await store.revoke(match.id):
+            # Read live, revoked between the two statements. Reported rather
+            # than smoothed over: the operator asked for a state change and did
+            # not cause one.
+            return _RevokeOutcome("raced", client=match)
+    finally:
+        await engine.dispose()
+
+    warning = await _emit(
+        nats_url,
+        "client.revoked",
+        {
+            "client_id": str(match.id),
+            "client_name": match.name,
+            "revoked_via": "cli",
+            "operator": f"{getpass.getuser()}@{socket.gethostname()}",
+        },
+    )
+    return _RevokeOutcome("revoked", client=match, audit_warning=warning)
+
+
+def _revoke_command(args: Any, dsn: str) -> int:
+    nats_url = os.environ.get("BELLASREEF_NATS_URL")
+
+    if args.list:
+        rows = asyncio.run(_list_clients(dsn))
+        if args.json:
+            print(json.dumps([_client_json(row) for row in rows], indent=2))
+        else:
+            _print_clients(rows)
+        return 0
+
+    if args.client is None:
+        print(
+            "name a client to revoke — its id or its name — or pass --list to see\n"
+            "what this hub knows about.",
+            file=sys.stderr,
+        )
+        return 2
+
+    outcome = asyncio.run(_revoke(dsn, args.client, nats_url))
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "status": outcome.status,
+                    "client": None if outcome.client is None else _client_json(outcome.client),
+                    "candidates": [_client_json(row) for row in outcome.candidates],
+                    "audit_warning": outcome.audit_warning,
+                },
+                indent=2,
+            )
+        )
+    if outcome.status == "ambiguous":
+        if not args.json:
+            print(
+                f"{args.client!r} names {len(outcome.candidates)} clients. Nothing was revoked.",
+                file=sys.stderr,
+            )
+            print(file=sys.stderr)
+            for row in outcome.candidates:
+                state = "live" if row.revoked_at is None else "revoked"
+                print(f"    {row.id}  {row.name}  ({state})", file=sys.stderr)
+            print(file=sys.stderr)
+            print("  Name one by id.", file=sys.stderr)
+        return 2
+    if outcome.status == "unknown":
+        if not args.json:
+            print(
+                f"no client with id or name {args.client!r}. "
+                "`bellasreef revoke --list` shows them all.",
+                file=sys.stderr,
+            )
+        return 2
+    if outcome.status == "already-revoked":
+        assert outcome.client is not None
+        if not args.json:
+            print(
+                f"{outcome.client.name} ({outcome.client.id}) was already revoked at "
+                f"{_stamp(outcome.client.revoked_at)}. Nothing to do.",
+                file=sys.stderr,
+            )
+        return 2
+    if outcome.status == "raced":
+        assert outcome.client is not None
+        if not args.json:
+            print(
+                f"{outcome.client.name} ({outcome.client.id}) was revoked by somebody "
+                "else between reading it and writing it. Nothing was done here.",
+                file=sys.stderr,
+            )
+        return 2
+
+    assert outcome.client is not None
+    if outcome.audit_warning:
+        _warn(outcome.audit_warning)
+    if args.json:
+        return 0
+
+    print(f"Revoked {outcome.client.name} ({outcome.client.id}).")
+    print()
+    print("  Its refresh token is dead and any access token it holds stops working")
+    print("  on the next request. The client row stays, revoked — that is what keeps")
+    print("  the open-pairing window shut.")
+    return 0
 
 
 def _devices_import(args: Any) -> int:
@@ -268,8 +542,35 @@ def _backup_command(args: Any, dsn: str) -> int:
     print(f"  contracts       : {manifest.contracts_version}")
     print(f"  taken           : {manifest.created_at.isoformat()}")
     print()
+    _print_contains(manifest)
     _print_omissions(manifest)
     return 0
+
+
+def _print_contains(manifest: Any) -> None:
+    """Say what IS in the archive, before saying what is not.
+
+    The omissions list has been printed since the first backup because absence
+    is invisible. Presence turned out to be invisible in the other direction: an
+    operator who reads a careful enumeration of what is missing concludes that
+    what is present is the boring part, and puts the file on a USB stick. The
+    archive carries the JWT signing secret in plaintext and there is no key
+    rotation, so that copy is a permanent credential for this hub.
+
+    It reached ``manifest.json`` and the docs and stopped there, which is the
+    one place nobody was looking — the terminal is where the file has just been
+    written and where the operator is deciding what to do with it.
+
+    Printed first, and as a warning rather than a bullet, because it is the more
+    important of the two lists.
+    """
+    if not getattr(manifest, "contains", None):
+        return
+    print("  !! WARNING — this archive is itself a credential:")
+    for item in manifest.contains:
+        print(f"       {item.what}")
+        print(f"       {item.handling}")
+    print()
 
 
 def _print_omissions(manifest: Any) -> None:
@@ -320,6 +621,7 @@ def _restore_command(args: Any, dsn: str) -> int:
     print(f"  taken           : {manifest.created_at.isoformat()}")
     print(f"  schema revision : {manifest.schema_revision}")
     print()
+    _print_contains(manifest)
     _print_omissions(manifest)
     return 0
 
@@ -348,6 +650,34 @@ def main(argv: list[str] | None = None) -> int:
         help=f"how long the window stays open (default {DEFAULT_WINDOW_S})",
     )
     pair.add_argument("--json", action="store_true", help="machine-readable output")
+
+    # A mode of `revoke` rather than a sibling `bellasreef clients`. The listing
+    # has no reason to exist on its own — `GET /api/v1/clients` is the way to
+    # look at clients, from a device that works. This one is for the operator
+    # who cannot reach the API, and every such operator is about to revoke
+    # something. One command to remember on a bad day beats two.
+    revoke = sub.add_parser(
+        "revoke",
+        help="revoke a paired client, or list them",
+        description=(
+            "Turn off a client's credentials from the hub. The other half of "
+            "replacing a phone: `bellasreef pair` lets the new one in, this turns "
+            "the old one off. Both revoke endpoints need a live token of your own, "
+            "which is exactly what a locked-out operator does not have."
+        ),
+    )
+    revoke.add_argument(
+        "client",
+        nargs="?",
+        metavar="ID|NAME",
+        help="the client to revoke: its id, or its name when that is unambiguous",
+    )
+    revoke.add_argument(
+        "--list",
+        action="store_true",
+        help="list every client this hub has ever paired, and revoke nothing",
+    )
+    revoke.add_argument("--json", action="store_true", help="machine-readable output")
 
     backup = sub.add_parser(
         "backup",
@@ -433,12 +763,18 @@ def main(argv: list[str] | None = None) -> int:
         return _backup_command(args, dsn)
     if args.command == "restore":
         return _restore_command(args, dsn)
+    if args.command == "revoke":
+        return _revoke_command(args, dsn)
 
     if args.ttl <= 0:
         print("--ttl must be greater than zero", file=sys.stderr)
         return 2
 
-    result = asyncio.run(_open_window(dsn, args.ttl, os.environ.get("BELLASREEF_NATS_URL")))
+    result, audit_warning = asyncio.run(
+        _open_window(dsn, args.ttl, os.environ.get("BELLASREEF_NATS_URL"))
+    )
+    if audit_warning:
+        _warn(audit_warning)
 
     if args.json:
         print(json.dumps(result, indent=2))

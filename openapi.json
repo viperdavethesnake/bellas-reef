@@ -1593,7 +1593,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "3.4.0"
+    "version": "3.5.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2065,6 +2065,58 @@
       }
     },
     "/api/v1/devices/{device_id}": {
+      "delete": {
+        "description": "Release a device's claim on its hardware channel.\n\n**Soft, and DELETE anyway.** From the operator's side this is the delete:\nthe device stops existing as a claim on a channel, which is the only\nthing the verb has to mean here. Underneath, the row survives with its\nname, thresholds, alert history and every telemetry series keyed on its\n`device_id`. Dropping the row would sever history from the hardware that\nproduced it, and re-binding the same probe tomorrow would then look like\nnew hardware \u2014 which is exactly the identity fork, reached from the other\nend.\n\nWithout this endpoint a PWM channel bound to the wrong device was taken\nfor good: `bindDevice` returns 409 on an actuator channel someone else\nholds, and nothing anywhere could let go. SQL on the hub was the only\nway out, which is also the way an audit row went missing.",
+        "operationId": "unbindDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unbound. The channel is free to bind again."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device, or it is already unbound."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unbind Device",
+        "tags": [
+          "hardware"
+        ]
+      },
       "patch": {
         "description": "Name a device, or clear the name.\n\nPATCH rather than PUT: this changes one operator-owned field on a row\nthe hub otherwise maintains from hardware announcements, and a PUT would\nimply the client is supplying the whole device.",
         "operationId": "renameDevice",

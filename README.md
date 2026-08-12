@@ -20,6 +20,29 @@ See [`docs/prd.md`](docs/prd.md) for what this is and why, and
 | `docs/` | PRD, contract specs, host setup, session log |
 | `clients/` | Web SPA, and a pointer to the iOS app |
 
+## Locked out of your own tank
+
+Nobody should be, so there is a way back in from the hub itself. Both commands
+are `bellasreef`, installed with the API package, and both talk to Postgres
+directly rather than through the API, because the API is the thing you cannot
+authenticate to. Full procedures in
+[`docs/host-setup.md`](docs/host-setup.md#10-getting-back-in-bellasreef-pair-and-bellasreef-revoke).
+
+```bash
+cd /home/david/bellasreef
+set -a; . /etc/bellasreef/api.env; set +a   # BELLASREEF_DATABASE_URL, and
+                                            # BELLASREEF_NATS_URL for the audit event
+
+.venv/bin/bellasreef pair --ttl 600   # open a 10-minute window; pair a replacement device
+.venv/bin/bellasreef revoke --list    # every client this hub has ever paired
+.venv/bin/bellasreef revoke <id>      # turn one off, by id or by unambiguous name
+```
+
+Replacing a phone is both commands. A pairing window *adds* a client and never
+removes one, because the trust-on-first-use window is keyed on client rows
+having ever existed: clearing them to "reset" the hub would reopen open pairing
+to the whole LAN. So pair the new device, then revoke the old one.
+
 ## Licensing
 
 This repository is **dual-licensed by component**. The split is deliberate: the
