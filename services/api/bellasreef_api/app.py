@@ -222,6 +222,35 @@ class CapabilityView(BaseModel):
         return self.bound_to is not None
 
 
+class BindDeviceRequest(BaseModel):
+    """Declare a device by binding it to an announced capability channel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Proposed id. Ignored if the capability is already carried by an existing
+    #: device — that device IS this hardware, and a caller proposing a new id
+    #: for known hardware is renaming at most, never creating.
+    device_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    driver_type: Literal["pi-pwm", "pca9685", "ds18b20"]
+    #: The capability channel: the channel number for PWM, the ROM for 1-Wire.
+    channel: str = Field(min_length=1, max_length=64)
+    #: Only ``light`` is implemented. Actuators require it; sensors must not
+    #: carry one.
+    role: Literal["light"] | None = None
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    location: str | None = Field(default=None, min_length=1, max_length=128)
+    poll_interval_s: float | None = Field(default=None, gt=0)
+
+
+class BoundDevice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    created: bool
+    driver_type: str
+    channel: str
+
+
 class DeviceView(BaseModel):
     """A registered device, as clients render it.
 
@@ -911,6 +940,103 @@ def build_app(
         return {"status": "revoked"}
 
     # ----------------------------------------------------------- hardware
+
+    @app.post(
+        "/api/v1/devices",
+        response_model=BoundDevice,
+        tags=["hardware"],
+        operation_id="bindDevice",
+        responses={
+            401: AUTH_401,
+            404: {"description": "No such capability channel has been announced."},
+            409: {"description": "That channel is already bound to another device."},
+            422: {"description": "The role is not legal for this device."},
+        },
+    )
+    async def bind_device(
+        body: BindDeviceRequest,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> BoundDevice:
+        """Bind an announced capability channel to a device.
+
+        Three validations, in the order that gives the most useful answer.
+
+        **The channel must have been announced.** Binding to hardware nobody has
+        reported means a device that can never work, and the operator finds out
+        when the tank does not light rather than here.
+
+        **It must not already be bound.** Two devices on one channel do not
+        coexist, they interleave — the second write wins, intermittently.
+
+        **The role must be legal.** ``light`` is the only one implemented; the
+        contract's other roles are reserved, and accepting one would register a
+        device nothing knows how to drive.
+
+        Then it **matches before it creates.** If a device already carries this
+        binding, that device is this hardware and is adopted in place, whatever
+        id was proposed. A seed that created beside an existing probe forked a
+        tank's history in two, and this is the check that makes that
+        unrepresentable.
+        """
+        is_sensor = body.driver_type == "ds18b20"
+
+        if not await store.capability_exists(body.driver_type, body.channel):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"no {body.driver_type} capability announced for channel {body.channel!r}. "
+                "hardware-io announces what it can see at startup; a channel that is not "
+                "there cannot be bound.",
+            )
+
+        holder = await store.device_bound_to(body.driver_type, body.channel)
+        if holder is not None and holder != body.device_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{body.driver_type} channel {body.channel!r} is already bound to "
+                f"{holder!r}. Unbind it first — two devices on one channel interleave "
+                "rather than coexist.",
+            )
+
+        if is_sensor and body.role is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "a sensor carries no role; sensor_type already says what it is",
+            )
+        if not is_sensor and body.role is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "an actuator must declare a role. Only 'light' is implemented.",
+            )
+
+        binding = {"rom": body.channel} if is_sensor else {"channel": body.channel}
+        device_id, created = await store.bind_device(
+            device_id=body.device_id,
+            kind="sensor" if is_sensor else "actuator",
+            driver_type=body.driver_type,
+            channel=body.channel,
+            binding=binding,
+            role=body.role,
+            display_name=body.display_name,
+            location=body.location,
+            sensor_type="temp" if is_sensor else None,
+            poll_interval_s=body.poll_interval_s if is_sensor else None,
+        )
+
+        await sink(
+            "device.bound",
+            {
+                "device_id": device_id,
+                "driver_type": body.driver_type,
+                "channel": body.channel,
+                "created": created,
+            },
+        )
+        return BoundDevice(
+            device_id=device_id,
+            created=created,
+            driver_type=body.driver_type,
+            channel=body.channel,
+        )
 
     @app.get(
         "/api/v1/devices",

@@ -19,6 +19,7 @@ __all__ = [
     "ROOT",
     "SubjectError",
     "alert",
+    "assignment",
     "audit",
     "capability",
     "cmd",
@@ -101,6 +102,16 @@ def capability(source: str) -> str:
     return f"{ROOT}.capability.{source}"
 
 
+def assignment(device_id: str) -> str:
+    """One device's binding, as the operator declared it.
+
+    Retained last-value per subject: a hardware-io that restarts alone learns
+    every assignment rather than waiting for someone to re-save each device.
+    """
+    validate_token(device_id, field="device_id")
+    return f"{ROOT}.assignment.{device_id}"
+
+
 def cmd(actuator_class: str, actuator_id: str) -> str:
     """A command addressed to one actuator. Durable via JetStream."""
     validate_token(actuator_class, field="actuator_class")
@@ -151,6 +162,7 @@ def parse_device_id(subject: str) -> str:
 # Wildcard subscriptions. Consumers filter with these; they are contract too.
 ALL_ALERTS: Final = f"{ROOT}.alert.>"
 ALL_CAPABILITIES: Final = f"{ROOT}.capability.>"
+ALL_ASSIGNMENTS: Final = f"{ROOT}.assignment.>"
 ALL_SILENCE: Final = f"{ROOT}.silence.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"
 ALL_COMMANDS: Final = f"{ROOT}.cmd.>"

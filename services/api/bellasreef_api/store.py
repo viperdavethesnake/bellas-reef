@@ -180,6 +180,143 @@ class Store:
             ).mappings()
             return [dict(row) for row in rows]
 
+    async def device_bound_to(self, driver_type: str, channel: str) -> str | None:
+        """Which device has claimed this capability channel, if any."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT device_id FROM devices "
+                        " WHERE adopted AND driver_type = :driver_type "
+                        "   AND COALESCE(binding ->> 'channel', binding ->> 'rom') = :channel"
+                    ),
+                    {"driver_type": driver_type, "channel": channel},
+                )
+            ).first()
+        return str(row[0]) if row else None
+
+    async def capability_exists(self, source: str, channel: str) -> bool:
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT 1 FROM capabilities WHERE source = :source AND channel = :channel"
+                    ),
+                    {"source": source, "channel": channel},
+                )
+            ).first()
+        return row is not None
+
+    async def bind_device(
+        self,
+        *,
+        device_id: str,
+        kind: str,
+        driver_type: str,
+        channel: str,
+        binding: dict[str, str],
+        role: str | None,
+        display_name: str | None,
+        location: str | None,
+        sensor_type: str | None,
+        poll_interval_s: float | None,
+    ) -> tuple[str, bool]:
+        """Bind a capability channel to a device. Returns ``(device_id, created)``.
+
+        **Matches before it creates**, and that is the whole point of this
+        method. If a device already carries this binding — the same ROM, the same
+        PWM channel — that device *is* this hardware, whatever id the caller
+        proposed, and it is adopted and updated in place.
+
+        This exists because the alternative happened. A seed naming a probe
+        ``display-tank`` created a second device row beside the one already
+        holding that probe's name, thresholds, alert history and a day of
+        telemetry, and the tank's history forked in two. The ROM is the
+        hardware's identity; the device_id is the registry's; a caller
+        proposing a new id for known hardware is renaming at most, never
+        creating.
+        """
+        async with self._engine.begin() as conn:
+            existing = (
+                await conn.execute(
+                    text(
+                        "SELECT device_id FROM devices "
+                        " WHERE driver_type = :driver_type "
+                        "   AND COALESCE(binding ->> 'channel', binding ->> 'rom') = :channel"
+                    ),
+                    {"driver_type": driver_type, "channel": channel},
+                )
+            ).first()
+
+            # A 1-Wire probe already in the registry from an announcement, keyed
+            # on its own id, is the same hardware even though it has no binding
+            # yet — that is the adopt path.
+            if existing is None and sensor_type is not None:
+                existing = (
+                    await conn.execute(
+                        text(
+                            "SELECT device_id FROM devices "
+                            " WHERE binding IS NULL AND kind = 'sensor' AND device_id = :id"
+                        ),
+                        {"id": device_id},
+                    )
+                ).first()
+
+            target = str(existing[0]) if existing else device_id
+            created = existing is None
+
+            if created:
+                await conn.execute(
+                    text(
+                        "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
+                        "                     poll_interval_s, role, display_name, location, "
+                        "                     driver_type, binding, adopted) "
+                        "VALUES (:id, :device_id, :kind, :driver_id, :sensor_type, "
+                        "        :poll_interval_s, :role, :display_name, :location, "
+                        "        :driver_type, CAST(:binding AS jsonb), true) "
+                        "ON CONFLICT (device_id) DO NOTHING"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "device_id": target,
+                        "kind": kind,
+                        "driver_id": driver_type,
+                        "sensor_type": sensor_type,
+                        "poll_interval_s": poll_interval_s,
+                        "role": role,
+                        "display_name": display_name,
+                        "location": location,
+                        "driver_type": driver_type,
+                        "binding": json.dumps(binding),
+                    },
+                )
+            else:
+                # Names its columns, and COALESCE on the operator-owned ones: a
+                # seed re-run must not blank a name somebody typed. Same rule as
+                # the sensor upsert — a re-announce cannot reset the operator's
+                # choices.
+                await conn.execute(
+                    text(
+                        "UPDATE devices "
+                        "   SET driver_type = :driver_type, "
+                        "       binding = CAST(:binding AS jsonb), "
+                        "       adopted = true, "
+                        "       role = COALESCE(:role, role), "
+                        "       display_name = COALESCE(:display_name, display_name), "
+                        "       location = COALESCE(:location, location) "
+                        " WHERE device_id = :device_id"
+                    ),
+                    {
+                        "device_id": target,
+                        "driver_type": driver_type,
+                        "binding": json.dumps(binding),
+                        "role": role,
+                        "display_name": display_name,
+                        "location": location,
+                    },
+                )
+        return target, created
+
     # ------------------------------------------------------------ clients
 
     async def total_clients_ever(self) -> int:

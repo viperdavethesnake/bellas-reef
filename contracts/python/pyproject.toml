@@ -1,6 +1,6 @@
 [project]
 name = "bellasreef-contracts"
-version = "3.2.0"
+version = "3.3.0"
 description = "Versioned wire contracts for Bella's Reef: NATS subjects, message payloads, driver interface"
 requires-python = ">=3.13"
 dependencies = [

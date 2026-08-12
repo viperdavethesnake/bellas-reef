@@ -42,6 +42,7 @@ __all__ = [
     "CapabilityChannel",
     "CapabilitySource",
     "ControlAuthority",
+    "DeviceAssignment",
     "DeviceId",
     "Heartbeat",
     "PwmLevel",
@@ -216,6 +217,49 @@ class CapabilityAnnouncement(_Message):
     #: announcement.
     hardware_source: CapabilitySource
     channels: list[CapabilityChannel]
+
+
+class DeviceAssignment(_Message):
+    """An operator's decision about one device, for hardware-io to act on.
+
+    Tier two of the registry, on the wire. The API publishes one of these
+    whenever a device is bound or unbound; hardware-io reads them at startup and
+    builds exactly the drivers they describe.
+
+    Deliberately not fetched over HTTP. hardware-io holds no credential and the
+    API's only unauthenticated endpoints are ``/info`` and ``/healthz`` by
+    design — giving hardware-io a token so it could read its own configuration
+    would be a new secret to manage for no gain. It is already on the spine.
+
+    Published on ``bellasreef.assignment.<device_id>`` and retained last-value
+    per subject, so a hardware-io that restarts alone still learns every
+    assignment rather than waiting for someone to re-save each device.
+
+    ``adopted=False`` is the tombstone: an unbind republishes with it, which
+    both removes the driver and leaves a record that the channel is free. A
+    deleted subject would simply vanish and a consumer that was offline would
+    never learn the device went away.
+    """
+
+    device_id: DeviceId
+    adopted: bool
+    role: ActuatorRole | None = None
+    driver_type: str | None = None
+    #: Driver-specific, validated at the API boundary before it is published:
+    #: ``{"channel": "0"}`` for pi-pwm, ``{"rom": "28-..."}`` for ds18b20.
+    binding: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def _adopted_means_bound(self) -> Self:
+        """An adopted device with nowhere to be is not an assignment.
+
+        Mirrors the database CHECK. Both layers, because this is what
+        hardware-io builds from and a half-filled assignment would produce a
+        driver pointed at nothing.
+        """
+        if self.adopted and (self.driver_type is None or self.binding is None):
+            raise ValueError("an adopted assignment requires driver_type and binding")
+        return self
 
 
 AlertState = Literal["breach", "clear"]
