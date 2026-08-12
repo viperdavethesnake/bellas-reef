@@ -3,7 +3,7 @@
 **Version:** 2.0
 **Owner:** David / Bella's Reef LLC
 **Date:** 2026-08-12
-**Status:** Draft for David's manual review — supersedes v1.4 on approval
+**Status:** Active — approved by David 2026-08-12, supersedes v1.4. Flagged for a further review pass.
 
 ### Changelog
 
