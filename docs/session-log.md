@@ -231,8 +231,9 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 
 ## Resume point — 2026-08-12 16:00
 
-The tank is dark and unmanaged by design: nothing is adopted, so hardware-io
-builds nothing. Adopting the devices is what brings lighting back.
+Nothing is adopted, so hardware-io builds nothing and no channel is driven.
+Adopting the devices is what resumes it. Bench hardware, nothing connected —
+this is a test-setup state, not an outage.
 
 **State:** hub wiped to factory, contracts 3.5.0, TOFU window open, no clients,
 no adopted devices. App deleted from the simulator by David. iOS wave-3 work is
@@ -265,12 +266,14 @@ are in the 3.5.0 spec and in the generated Swift client, and **no app code
 calls them.** Wave 3 was scoped from the auth review's findings and adoption
 was not an auth finding, so that screen was never asked for. My error.
 
-**The tank is dark and there is currently no way to restore it from the app.**
+**Nothing is adopted, so no channel is driven.** This is not urgent: there is
+no tank. The target is a Raspberry Pi on a bench with nothing connected to the
+PWM outputs. Restoring adoption is a test-setup step, not an incident.
 
 Decision pending, not taken:
 
 - **Option A (recommended, and it improves the test).** Take the TOFU grant by
-  curl, adopt the three devices over the API, tank comes back immediately.
+  curl, adopt the three devices over the API, so the channels are driven again.
   David's phone then installs wave 3 and pairs as the *second* device via the
   six-digit code — the journey that has never once worked, which is what we
   most want to prove. Afterwards remove the curl client with
@@ -278,7 +281,15 @@ Decision pending, not taken:
   2026-08-12 SQL revocation did not. Cost: spends the one-shot TOFU window on a
   curl client rather than the phone.
 - **Option B.** Build adoption UI as wave 4 first. Right end state either way,
-  but the tank stays dark while it is built.
+  and nothing is harmed while it is built.
 
 Wave 4 (adoption UI: list capabilities, adopt, unbind) is needed regardless of
 which option is taken.
+
+**Framing correction, 2026-08-12 16:06 (David).** "there is NO TANK. We are
+bench testing a Rpi stop creating critical issues." Several entries above
+described an idle bench as an outage. There is no livestock and nothing is
+connected to the PWM outputs. CLAUDE.md's language about dead tanks describes
+the eventual product and the reasoning behind the safety architecture; it does
+not describe the current setup. Severity is to be assessed against what is
+actually on the bench.
