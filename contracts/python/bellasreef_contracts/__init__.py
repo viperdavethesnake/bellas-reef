@@ -7,6 +7,8 @@ The package version is the contract version. See
 """
 
 from bellasreef_contracts.messages import (
+    LIGHT_HEARTBEAT_TIMEOUT_S,
+    LIGHT_MAX_RUNTIME_S,
     SCHEMA_VERSION,
     ActuatorClass,
     ActuatorCommand,
@@ -35,6 +37,8 @@ from bellasreef_contracts.messages import (
 )
 
 __all__ = [
+    "LIGHT_HEARTBEAT_TIMEOUT_S",
+    "LIGHT_MAX_RUNTIME_S",
     "SCHEMA_VERSION",
     "ActuatorClass",
     "ActuatorCommand",

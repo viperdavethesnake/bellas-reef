@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -270,10 +271,15 @@ class Store:
                     text(
                         "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
                         "                     poll_interval_s, role, display_name, location, "
-                        "                     driver_type, binding, adopted) "
+                        "                     driver_type, binding, adopted, actuator_class, "
+                        "                     control_authority, failsafe_capable, transport, "
+                        "                     safe_state, max_runtime_s, heartbeat_timeout_s) "
                         "VALUES (:id, :device_id, :kind, :driver_id, :sensor_type, "
                         "        :poll_interval_s, :role, :display_name, :location, "
-                        "        :driver_type, CAST(:binding AS jsonb), true) "
+                        "        :driver_type, CAST(:binding AS jsonb), true, :actuator_class, "
+                        "        :control_authority, :failsafe_capable, :transport, "
+                        "        CAST(:safe_state AS jsonb), :max_runtime_s, "
+                        "        :heartbeat_timeout_s) "
                         "ON CONFLICT (device_id) DO NOTHING"
                     ),
                     {
@@ -288,6 +294,23 @@ class Store:
                         "location": location,
                         "driver_type": driver_type,
                         "binding": json.dumps(binding),
+                        # An actuator row must declare its authority — the
+                        # devices CHECK enforces it, and a device bound through
+                        # the API has to satisfy the same constraint as one
+                        # registered by hardware-io. The values come from the
+                        # contract rather than being retyped here, so the row
+                        # and the driver's registration cannot disagree.
+                        "actuator_class": None if kind == "sensor" else "pwm",
+                        "control_authority": None if kind == "sensor" else "authoritative",
+                        "failsafe_capable": None if kind == "sensor" else True,
+                        "transport": None if kind == "sensor" else "local",
+                        "safe_state": (
+                            None if kind == "sensor" else json.dumps({"kind": "pwm", "duty": 0.0})
+                        ),
+                        "max_runtime_s": None if kind == "sensor" else LIGHT_MAX_RUNTIME_S,
+                        "heartbeat_timeout_s": (
+                            None if kind == "sensor" else LIGHT_HEARTBEAT_TIMEOUT_S
+                        ),
                     },
                 )
             else:

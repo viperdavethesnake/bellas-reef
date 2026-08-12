@@ -19,7 +19,13 @@ from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
 
-from bellasreef_contracts import ActuatorLevel, ActuatorRegistration, PwmLevel
+from bellasreef_contracts import (
+    LIGHT_HEARTBEAT_TIMEOUT_S,
+    LIGHT_MAX_RUNTIME_S,
+    ActuatorLevel,
+    ActuatorRegistration,
+    PwmLevel,
+)
 
 __all__ = ["MIN_USABLE_DUTY", "light_registration", "snap_duty"]
 
@@ -52,8 +58,8 @@ def light_registration(
     actuator_id: str,
     driver_id: str,
     safe_state: ActuatorLevel | None = None,
-    max_runtime_s: float = 18 * 3600.0,
-    heartbeat_timeout_s: float = 30.0,
+    max_runtime_s: float = LIGHT_MAX_RUNTIME_S,
+    heartbeat_timeout_s: float = LIGHT_HEARTBEAT_TIMEOUT_S,
 ) -> ActuatorRegistration:
     """Registration for one dimmable light channel, with the full R1 triple.
 

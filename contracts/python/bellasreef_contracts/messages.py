@@ -27,6 +27,8 @@ from pydantic import (
 )
 
 __all__ = [
+    "LIGHT_HEARTBEAT_TIMEOUT_S",
+    "LIGHT_MAX_RUNTIME_S",
     "SCHEMA_VERSION",
     "ActuatorClass",
     "ActuatorCommand",
@@ -83,6 +85,23 @@ ActuatorClass = Literal["binary", "pwm"]
 #: doser R9, outlet R8. Only ``light`` is implemented; the rest are reserved
 #: so adding them later is not another breaking change.
 ActuatorRole = Literal["light", "heater", "pump", "doser", "outlet"]
+
+#: The safety contract every dimmable light registers with, stated once.
+#:
+#: Both PWM drivers use these, and the API writes them onto the device row when
+#: a light is bound — the row's CHECK requires an actuator to declare its
+#: authority, and a device bound through the API must satisfy the same
+#: constraint as one registered by hardware-io. Two copies of these numbers is
+#: two things that can drift, so there is one.
+#:
+#: 18 hours is a runaway bound, not a photoperiod: a reef light legitimately
+#: runs 10-12 hours, and a cap near that trips on an ordinary Tuesday and
+#: teaches the operator to ignore it.
+LIGHT_MAX_RUNTIME_S: Final = 18 * 3600.0
+
+#: Lose the control engine for half a minute and the channel goes dark — a
+#: visible, survivable failure, which is why lighting was the first actuator.
+LIGHT_HEARTBEAT_TIMEOUT_S: Final = 30.0
 
 #: Whether we can actually make the device obey. See docs/device-classes.md §2.
 #:

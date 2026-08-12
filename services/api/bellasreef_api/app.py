@@ -222,6 +222,16 @@ class CapabilityView(BaseModel):
         return self.bound_to is not None
 
 
+#: Which announced source a driver type binds against. A DS18B20 is a probe on
+#: the w1-bus rather than a source of its own, so the two names differ and the
+#: mapping has to be explicit.
+CAPABILITY_SOURCE_FOR_DRIVER: Final[dict[str, str]] = {
+    "pi-pwm": "pi-pwm",
+    "pca9685": "pca9685",
+    "ds18b20": "w1-bus",
+}
+
+
 class BindDeviceRequest(BaseModel):
     """Declare a device by binding it to an announced capability channel."""
 
@@ -980,10 +990,16 @@ def build_app(
         """
         is_sensor = body.driver_type == "ds18b20"
 
-        if not await store.capability_exists(body.driver_type, body.channel):
+        # The driver type is not the capability source. A DS18B20 is a probe on
+        # the w1-bus; the bus is what hardware-io announces, and looking up
+        # source='ds18b20' would 404 every probe on a hub that is working
+        # perfectly.
+        source = CAPABILITY_SOURCE_FOR_DRIVER[body.driver_type]
+
+        if not await store.capability_exists(source, body.channel):
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
-                f"no {body.driver_type} capability announced for channel {body.channel!r}. "
+                f"no {source} capability announced for channel {body.channel!r}. "
                 "hardware-io announces what it can see at startup; a channel that is not "
                 "there cannot be bound.",
             )

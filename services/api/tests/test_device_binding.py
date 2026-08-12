@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 from bellasreef_api.app import build_app
+from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -98,7 +99,7 @@ def test_seeding_over_known_hardware_creates_no_new_rows() -> None:
 
     async def scenario() -> tuple[int, dict[str, Any], dict[str, Any]]:
         engine = await fresh_engine()
-        await announce(engine, "ds18b20", ROM)
+        await announce(engine, "w1-bus", ROM)
 
         # The device as it exists today: named by the operator, thresholds set,
         # history behind it.
@@ -234,6 +235,78 @@ def test_a_rebind_does_not_blank_an_operators_name() -> None:
 # --------------------------------------------------------- the three validations
 
 
+def test_a_probe_binds_against_the_bus_not_a_source_of_its_own() -> None:
+    """A DS18B20 is a probe on the w1-bus, and the two names differ.
+
+    Looking up source='ds18b20' would 404 every probe on a hub that is working
+    perfectly — caught by CI before it reached the tank.
+    """
+
+    async def scenario() -> int:
+        engine = await fresh_engine()
+        await announce(engine, "w1-bus", ROM)
+        c, headers = await client_for(engine)
+        try:
+            response = await c.post(
+                "/api/v1/devices",
+                headers=headers,
+                json={"device_id": "probe", "driver_type": "ds18b20", "channel": ROM},
+            )
+            return response.status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    assert run(scenario) == 200
+
+
+def test_a_bound_light_declares_its_safety_contract() -> None:
+    """The devices CHECK requires it, and the values come from the contract.
+
+    A light bound through the API must satisfy the same constraint as one
+    registered by hardware-io — otherwise the API can write a row the safety
+    framework would have refused.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await c.post(
+                "/api/v1/devices",
+                headers=headers,
+                json={
+                    "device_id": "led-blue",
+                    "driver_type": "pi-pwm",
+                    "channel": "0",
+                    "role": "light",
+                },
+            )
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT control_authority, failsafe_capable, transport, "
+                            "       safe_state, max_runtime_s, heartbeat_timeout_s "
+                            "  FROM devices WHERE device_id = 'led-blue'"
+                        )
+                    )
+                ).mappings()
+                return dict(next(iter(row)))
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    row = run(scenario)
+    assert row["control_authority"] == "authoritative"
+    assert row["failsafe_capable"] is True
+    assert row["transport"] == "local"
+    assert row["safe_state"] == {"kind": "pwm", "duty": 0.0}
+    assert row["max_runtime_s"] == LIGHT_MAX_RUNTIME_S
+    assert row["heartbeat_timeout_s"] == LIGHT_HEARTBEAT_TIMEOUT_S
+
+
 def test_binding_unannounced_hardware_is_refused() -> None:
     """A device bound to hardware nobody reported can never work."""
 
@@ -352,7 +425,7 @@ def test_a_sensor_carrying_a_role_is_refused() -> None:
 
     async def scenario() -> int:
         engine = await fresh_engine()
-        await announce(engine, "ds18b20", ROM)
+        await announce(engine, "w1-bus", ROM)
         c, headers = await client_for(engine)
         try:
             response = await c.post(
@@ -385,7 +458,7 @@ def test_an_announced_probe_is_adopted_not_duplicated() -> None:
 
     async def scenario() -> tuple[int, dict[str, Any]]:
         engine = await fresh_engine()
-        await announce(engine, "ds18b20", ROM)
+        await announce(engine, "w1-bus", ROM)
         async with engine.begin() as conn:
             await conn.execute(
                 text(
