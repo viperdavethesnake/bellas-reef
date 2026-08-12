@@ -27,6 +27,21 @@ __all__ = ["ClientRow", "PairingOutcome", "Store"]
 #: auth.md §2: a pairing request lives 5 minutes.
 PAIRING_TTL_S = 300
 
+#: How long a spent pairing row is kept before the sweeper deletes it.
+#:
+#: Long enough that an operator debugging a failed pairing this morning can
+#: still see it, short enough that an unauthenticated endpoint cannot grow the
+#: table without bound. Approved requests are never swept — see
+#: :meth:`Store.sweep_pairing`.
+PAIRING_RETENTION_S = 24 * 3600
+
+#: How many random six-digit candidates one INSERT considers.
+#:
+#: The insert takes the first candidate not already held by a pending request.
+#: With a handful of requests in flight the first candidate is free with
+#: probability ~1; 64 is headroom, not a plan.
+_CODE_CANDIDATES = 64
+
 
 @dataclass(frozen=True, slots=True)
 class ClientRow:
@@ -449,6 +464,22 @@ class Store:
             )
             return client_id
 
+    async def discard_client(self, client_id: UUID) -> None:
+        """Delete a client row that was minted moments ago and never handed out.
+
+        Rollback only, and deliberately the one place that word is spelled
+        DELETE. A client anybody has ever held is *revoked* — hash cleared, row
+        kept — because ``total_clients_ever`` is what keeps the TOFU window shut,
+        and deleting rows would let an attacker who revoked everything reopen
+        open pairing. That reasoning does not apply to a row whose token never
+        left this process: it has no owner and no history, and leaving it behind
+        would inflate the count that the window is keyed on.
+
+        Mirrors the rollback inside :meth:`approve_pairing`.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(text("DELETE FROM paired_clients WHERE id = :id"), {"id": client_id})
+
     async def is_active(self, client_id: UUID) -> bool:
         async with self._engine.connect() as conn:
             row = (
@@ -774,21 +805,137 @@ class Store:
 
     # ------------------------------------------------------------ pairing
 
-    async def open_pairing_request(self, client_name: str) -> UUID:
-        request_id = uuid4()
+    async def sweep_pairing(self, *, now: datetime | None = None) -> None:
+        """Mark aged-out requests expired, then delete what is spent.
+
+        **On-read, not a timer, and that is a decision.** The only thing that
+        grows these tables is ``POST /pair``, which is unauthenticated and
+        inserts a row per call — so sweeping on that path ties the cleanup rate
+        to the growth rate exactly, with no schedule to tune, no lifespan hook to
+        forget and no second process to notice has died. It also stays honest in
+        tests: the ASGI transport does not run lifespans, so a background task
+        would be the one part of this that nothing ever exercised.
+
+        Writing ``expired`` is the load-bearing half. ``expired`` is a
+        CHECK-permitted state that nothing has ever written, which was cosmetic
+        until now and is not any more: the code's uniqueness index is partial on
+        ``state = 'pending'``, so a request that aged out while still marked
+        pending would hold its six digits out of circulation forever.
+
+        Approved requests are never swept. Each one references the client row it
+        created under ``ondelete=RESTRICT``, and that reference is what keeps
+        ``total_clients_ever`` — the count the TOFU window is keyed on — honest.
+        """
+        moment = now or datetime.now(UTC)
+        cutoff = moment - timedelta(seconds=PAIRING_RETENTION_S)
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO pairing_requests (id, client_name, state, expires_at) "
-                    "VALUES (:id, :name, 'pending', :exp)"
+                    "UPDATE pairing_requests SET state = 'expired' "
+                    " WHERE state = 'pending' AND expires_at <= :now"
                 ),
-                {
-                    "id": request_id,
-                    "name": client_name,
-                    "exp": datetime.now(UTC) + timedelta(seconds=PAIRING_TTL_S),
-                },
+                {"now": moment},
             )
-        return request_id
+            await conn.execute(
+                text(
+                    "DELETE FROM pairing_requests "
+                    " WHERE state IN ('expired', 'denied') AND expires_at < :cutoff"
+                ),
+                {"cutoff": cutoff},
+            )
+            # Used windows are kept: they reference the client they let in, same
+            # RESTRICT reasoning as an approved request. Unused ones let nobody
+            # in and record nothing.
+            await conn.execute(
+                text("DELETE FROM pairing_windows WHERE used_at IS NULL AND expires_at < :cutoff"),
+                {"cutoff": cutoff},
+            )
+
+    async def open_pairing_request(self, client_name: str) -> tuple[UUID, str]:
+        """Create a pending request. Returns ``(request_id, pairing_code)``.
+
+        The code is picked **in the INSERT**, from random candidates anti-joined
+        against the codes currently in play, and the partial unique index is the
+        authority on whether the pick was legal. There is deliberately no retry
+        loop here: a loop in Python is a second, weaker copy of a rule the
+        database already enforces, and the two only have to disagree once. If two
+        requests land on the same six digits in the same instant — one in a
+        million, and only while another request is live — the integrity error
+        surfaces and the device recovers by asking again, which is the behaviour
+        it already has for every other failed call.
+
+        Sweeps first, so codes belonging to aged-out requests are back in
+        circulation before this one picks.
+        """
+        await self.sweep_pairing()
+        request_id = uuid4()
+        async with self._engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        # Explicitly cast, because these placeholders sit in an
+                        # INSERT ... SELECT rather than a VALUES list: the target
+                        # column types do not reach them, and an uncast parameter
+                        # is one Postgres refuses to guess the type of.
+                        "INSERT INTO pairing_requests "
+                        "  (id, client_name, state, expires_at, pairing_code) "
+                        "SELECT CAST(:id AS uuid), CAST(:name AS text), 'pending', "
+                        "       CAST(:exp AS timestamptz), candidate.code "
+                        "  FROM (SELECT lpad(floor(random() * 1000000)::int::text, 6, '0') "
+                        "               AS code "
+                        "          FROM generate_series(1, CAST(:candidates AS integer))"
+                        "       ) AS candidate "
+                        " WHERE NOT EXISTS (SELECT 1 FROM pairing_requests p "
+                        "                    WHERE p.state = 'pending' "
+                        "                      AND p.pairing_code = candidate.code) "
+                        " LIMIT 1 "
+                        "RETURNING id, pairing_code"
+                    ),
+                    {
+                        "id": request_id,
+                        "name": client_name,
+                        "exp": datetime.now(UTC) + timedelta(seconds=PAIRING_TTL_S),
+                        "candidates": _CODE_CANDIDATES,
+                    },
+                )
+            ).first()
+        if row is None:  # pragma: no cover - needs ~10^6 live requests
+            raise RuntimeError("no free pairing code: too many requests are pending")
+        return UUID(str(row[0])), str(row[1])
+
+    async def pairing_request_for_code(self, code: str) -> tuple[UUID, str] | None:
+        """``(request_id, state)`` for the request carrying this code, or None.
+
+        Prefers the claimable one. A code is unique among *pending* requests but
+        the same six digits recur over time, so the ordering picks a live request
+        if there is one and the most recent otherwise. That is what lets `claim`
+        tell "you mistyped" (404) apart from "that one is already decided" (409):
+        collapsing both into 404 would tell an operator to retype a code that was
+        correct.
+
+        Expiry is applied here, the same way :meth:`pairing_state` applies it, so
+        the answer does not depend on whether a sweep has run yet.
+        """
+        moment = datetime.now(UTC)
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT id, state, expires_at FROM pairing_requests "
+                        " WHERE pairing_code = :code "
+                        " ORDER BY (state = 'pending' AND expires_at > :now) DESC, "
+                        "          created_at DESC "
+                        " LIMIT 1"
+                    ),
+                    {"code": code, "now": moment},
+                )
+            ).first()
+        if row is None:
+            return None
+        request_id, state, expires_at = row
+        if state == "pending" and expires_at <= moment:
+            return UUID(str(request_id)), "expired"
+        return UUID(str(request_id)), str(state)
 
     async def pairing_state(self, request_id: UUID) -> tuple[str, UUID | None, str | None]:
         """``(state, client_pk, client_name)``; state ``missing`` if unknown.

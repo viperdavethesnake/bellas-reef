@@ -117,12 +117,25 @@ jobs:
       # The identical script developers run. If it passes locally it passes
       # here — no second, subtly different list of commands to drift out of
       # sync.
+      #
+      # This is also where the spec-drift gate lives (check.sh, "openapi spec
+      # drift"). Deliberately there rather than as a step here: a check that
+      # only exists in CI fails after the push, and the developer who has to
+      # regenerate the spec is the one who just changed the routes. Putting it
+      # in the shared script means it runs in both places, which is the whole
+      # reason this job invokes check.sh instead of listing commands.
       - name: Gate
         run: ./scripts/check.sh
 
       # The spec is a published artefact and the source of truth for every
       # client (PRD §7.3.2). Generated from the app rather than hand-kept, and
       # published from CI so clients pin a build rather than someone's laptop.
+      #
+      # The gate above has already proven this regeneration is byte-identical to
+      # the committed copy, so the artifact and the tree cannot disagree. Before
+      # that gate existed this step was the *only* thing that generated the
+      # spec, compared it to nothing, and uploaded a document that had silently
+      # been three minor versions ahead of the file every client was built from.
       - name: Export client contracts
         run: uv run python scripts/export-openapi.py
 

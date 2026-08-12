@@ -26,6 +26,41 @@ dosing journal, the audit log, paired clients, and the JWT signing key. That
 last one is why a restored hub still recognises your phone. Restore the
 database and existing sessions keep working.
 
+## Handle the archive like a password-manager export
+
+Read the paragraph above again, because it has a second meaning. The signing
+key is what makes a restored hub recognise your phone — and it is in the file,
+in plaintext, along with the id of every client that has ever paired.
+
+**Anyone who can read a backup archive can mint a valid access token for any
+client of the hub it came from.** Not "could eventually brute-force". Mint. The
+archive is not a copy of your settings; it is a key to your tank.
+
+It is not encrypted, and that is a decision rather than an oversight. This is a
+home hub, the archive is a file on your own machine, and an encrypted backup
+needs a key you would then have to back up somewhere — which for most people
+means a passphrase written down next to the thing it protects, or a backup
+nobody can open when they finally need it. So the archive is treated the way you
+would treat a password-manager export:
+
+- Written `0600`, owner-only, from the instant the file exists. It never passes
+  through a world-readable state, and overwriting an older archive tightens its
+  mode rather than inheriting it.
+- Keep it off shared storage, out of chat, and off anything with a public link.
+- There is **no signing-key rotation**, so a leaked archive cannot be cleaned up
+  after the fact. Revoking clients does not help: the key that signs their
+  replacements is the same key that is in the file.
+
+The manifest says all of this in its `contains` list, next to the `omissions`
+list, so the file explains itself to whoever finds it later:
+
+```bash
+tar xzOf backup.tar.gz manifest.json | jq .contains
+```
+
+If you copy an archive off the hub, check the mode survived the trip — `scp`
+preserves it, a drag into a cloud folder does not.
+
 ## Requirements
 
 `pg_dump` and `pg_restore` must be available, and their major version must be

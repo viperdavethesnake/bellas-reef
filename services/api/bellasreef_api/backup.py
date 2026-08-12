@@ -47,19 +47,21 @@ from uuid import UUID
 
 import httpx
 from bellasreef_db.revisions import KNOWN_REVISIONS
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 __all__ = [
+    "ARCHIVE_MODE",
     "DUMP_NAME",
     "MANIFEST_NAME",
     "MANIFEST_VERSION",
     "PG_BIN_ENV",
     "BackupError",
     "BackupResult",
+    "Contains",
     "DumpInfo",
     "HubIdentity",
     "Manifest",
@@ -81,6 +83,18 @@ PG_BIN_ENV: Final = "BELLASREEF_PG_BIN"
 
 MANIFEST_NAME: Final = "manifest.json"
 DUMP_NAME: Final = "postgres.dump"
+
+#: The archive is owner-read/write and nothing else, from the instant it exists.
+#:
+#: The dump covers the whole database, which includes ``signing_keys.secret``
+#: and every paired client id — so the file is not a copy of your tank's
+#: settings, it is a credential that mints a valid JWT for any client. On a
+#: shared box a 0644 archive hands that to every account on it. Encryption was
+#: considered and deliberately not built (see the design's accepted-risk table:
+#: this is a file on the operator's own machine, handled like a password-manager
+#: export), which makes the mode the only thing standing between the archive and
+#: anyone else with a shell.
+ARCHIVE_MODE: Final = 0o600
 
 #: Bump only when the archive layout changes in a way an older restore cannot
 #: read. Adding a field is not that — unknown manifest fields are ignored, so a
@@ -183,6 +197,22 @@ class Omission(_Strict):
     recover: str
 
 
+class Contains(_Strict):
+    """One thing this archive *does* contain that makes the file itself sensitive.
+
+    The mirror of :class:`Omission`, and the more important of the two. The
+    omissions list has always been here because absence is invisible; presence
+    turned out to be invisible in the other direction. An operator who reads a
+    manifest that carefully enumerates what is missing will reasonably conclude
+    that what is present is the boring part, and copy the file to a laptop, a
+    USB stick, or a cloud drive.
+    """
+
+    what: str
+    why: str
+    handling: str
+
+
 class Manifest(_Strict):
     manifest_version: int
     created_at: datetime
@@ -193,15 +223,41 @@ class Manifest(_Strict):
     postgres: DumpInfo
     telemetry: TelemetrySnapshot
     omissions: list[Omission]
+    #: Defaulted rather than required so archives written before this field
+    #: existed still read. They are old, not wrong — the same reasoning as
+    #: ``hub_id``, and the reason adding a field is not a MANIFEST_VERSION bump.
+    contains: list[Contains] = Field(default_factory=list)
 
 
 # -------------------------------------------------------------------- writing
 
 
 def write_archive(path: Path, *, manifest_json: bytes, dump_path: Path) -> None:
-    """Assemble the archive. Manifest first, so a reader meets it first."""
+    """Assemble the archive. Manifest first, so a reader meets it first.
+
+    The file is created at :data:`ARCHIVE_MODE` and never exists at any other
+    mode. ``tarfile.open(path, ...)`` would create it through the process umask,
+    which on a stock Debian or macOS account is 0644 — and chmod-after-write
+    leaves a window, for the whole duration of a ``pg_dump`` of the entire
+    database, in which the most sensitive file this project produces is readable
+    by every account on the box. So the descriptor is opened here with the mode
+    it must have, and the tar is written into it.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(path, "w:gz") as tar:
+
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ARCHIVE_MODE)
+    try:
+        # O_CREAT's mode applies only when the open actually creates the file.
+        # Overwriting last week's 0644 archive would otherwise keep its mode,
+        # which is the case most likely to happen on a real hub, where backups
+        # are written to the same path on a schedule.
+        os.fchmod(descriptor, ARCHIVE_MODE)
+        handle = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    with handle, tarfile.open(fileobj=handle, mode="w:gz") as tar:
         info = tarfile.TarInfo(MANIFEST_NAME)
         info.size = len(manifest_json)
         info.mode = 0o600
@@ -398,6 +454,36 @@ async def _run_pg_tool(
     )
 
 
+# ------------------------------------------------------------- what is present
+
+
+def _contains() -> list[Contains]:
+    """The things in this archive that make the archive itself a credential.
+
+    Short on purpose. This list is not an inventory of the database — it is the
+    set of facts that change how the file must be handled, and a list that grows
+    to twenty entries is a list nobody reads.
+    """
+    return [
+        Contains(
+            what="the JWT signing secret and every paired client id",
+            why=(
+                "the dump covers the whole database, and signing_keys.secret is in it in "
+                "plaintext. Anyone holding this file can mint a valid access token for any "
+                "client of the hub it came from. It is not encrypted: for a home hub this is "
+                "a file on your own machine, so it is mode-restricted and labelled rather "
+                "than wrapped in a key you would also have to back up somewhere."
+            ),
+            handling=(
+                "treat it like a password-manager export. Written 0600 and kept that way; "
+                "do not put it on shared storage or in a chat. There is no signing-key "
+                "rotation, so a leaked archive cannot be remediated after the fact — "
+                "restoring elsewhere and revoking clients does not invalidate it."
+            ),
+        ),
+    ]
+
+
 # -------------------------------------------------------------- what is missing
 
 
@@ -543,6 +629,11 @@ async def create_backup(
     snapshot = await _create_vm_snapshot(vm_url) if vm_url else None
 
     uri, env = _libpq_target(dsn)
+    # The intermediate dump is as sensitive as the archive — same bytes, same
+    # signing secret — and it exists for as long as pg_dump takes. It is safe
+    # for the same reason the archive is: TemporaryDirectory creates the
+    # directory 0700, so nothing under it is reachable by another account
+    # regardless of what mode pg_dump gives its own output file.
     with tempfile.TemporaryDirectory(prefix="bellasreef-backup-") as scratch:
         dump_path = Path(scratch) / DUMP_NAME
         code, _, stderr = await _run_pg_tool(
@@ -601,6 +692,7 @@ async def create_backup(
                 ),
             ),
             omissions=_omissions(snapshot),
+            contains=_contains(),
         )
 
         write_archive(

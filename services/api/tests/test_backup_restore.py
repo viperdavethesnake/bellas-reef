@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
+import tarfile
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
@@ -40,11 +42,15 @@ import httpx
 import pytest
 from bellasreef_api.app import CONTRACTS_VERSION
 from bellasreef_api.backup import (
+    ARCHIVE_MODE,
+    DUMP_NAME,
+    MANIFEST_NAME,
     PG_BIN_ENV,
     RestoreRefusedError,
     create_backup,
     pg_tools_available,
     restore_backup,
+    write_archive,
 )
 from bellasreef_api.security import issue_access_token, verify_access_token
 from bellasreef_api.store import Store
@@ -55,16 +61,19 @@ from sqlalchemy.ext.asyncio import create_async_engine
 _PG = "BELLASREEF_TEST_DATABASE_URL"
 _VM = "BELLASREEF_TEST_VM_URL"
 
-pytestmark = [
-    pytest.mark.skipif(not os.environ.get(_PG), reason=f"{_PG} not set"),
-    pytest.mark.skipif(
-        not pg_tools_available(),
-        reason=(
-            f"pg_dump/pg_restore not found on PATH and {PG_BIN_ENV} not set; "
-            "backup shells out to the real PostgreSQL client tools"
-        ),
+#: Applied per test rather than as a module-level `pytestmark`, because not
+#: every test here needs a database. The archive's file mode is a property of
+#: `write_archive` alone, and it is the one assertion in this file that protects
+#: a secret — so it runs on a laptop with no Postgres and no client tools, where
+#: a module-wide skip would have quietly taken it out of the gate.
+needs_postgres = pytest.mark.skipif(not os.environ.get(_PG), reason=f"{_PG} not set")
+needs_pg_tools = pytest.mark.skipif(
+    not pg_tools_available(),
+    reason=(
+        f"pg_dump/pg_restore not found on PATH and {PG_BIN_ENV} not set; "
+        "backup shells out to the real PostgreSQL client tools"
     ),
-]
+)
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -186,6 +195,8 @@ async def _backup_to(archive: Path) -> Any:
 # ------------------------------------------------------------------ the round trip
 
 
+@needs_postgres
+@needs_pg_tools
 def test_a_client_paired_with_the_old_hub_mints_a_token_on_the_restored_one(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +240,8 @@ def test_a_client_paired_with_the_old_hub_mints_a_token_on_the_restored_one(
     run(scenario)
 
 
+@needs_postgres
+@needs_pg_tools
 def test_the_manifest_records_the_hub_it_came_from_and_what_it_left_behind(
     tmp_path: Path,
 ) -> None:
@@ -260,6 +273,23 @@ def test_the_manifest_records_the_hub_it_came_from_and_what_it_left_behind(
                 assert omission.why and omission.recover, (
                     f"omission {omission.what!r} says what is missing but not how to get it"
                 )
+
+            # And the other direction, which matters more. A manifest that
+            # enumerates what is missing and says nothing about what is present
+            # reads as reassurance: the operator concludes the interesting part
+            # is the absence, and copies a file that mints a JWT for any client
+            # of this hub onto a laptop.
+            assert manifest.contains, (
+                "the manifest documents what the archive lacks and not that it carries the "
+                "JWT signing secret — the one fact that decides how the file must be handled"
+            )
+            carried = " ".join(c.what.lower() for c in manifest.contains)
+            assert "signing" in carried
+            for item in manifest.contains:
+                assert item.why and item.handling, (
+                    f"{item.what!r} is named as present but the operator is not told what to "
+                    "do about it"
+                )
         finally:
             snapshot = manifest.telemetry.snapshot
             if snapshot and (vm := os.environ.get(_VM)):
@@ -268,6 +298,8 @@ def test_the_manifest_records_the_hub_it_came_from_and_what_it_left_behind(
     run(scenario)
 
 
+@needs_postgres
+@needs_pg_tools
 @pytest.mark.skipif(not os.environ.get(_VM), reason=f"{_VM} not set")
 def test_the_telemetry_snapshot_is_really_taken(tmp_path: Path) -> None:
     """`/snapshot/create` against a real VictoriaMetrics, not a recorded name."""
@@ -294,6 +326,8 @@ def test_the_telemetry_snapshot_is_really_taken(tmp_path: Path) -> None:
 # ------------------------------------------------------- damaged archives
 
 
+@needs_postgres
+@needs_pg_tools
 def test_a_truncated_archive_is_refused_and_the_target_is_untouched(tmp_path: Path) -> None:
     async def scenario() -> None:
         result = await _backup_to(tmp_path / "backup.tar.gz")
@@ -320,6 +354,8 @@ def test_a_truncated_archive_is_refused_and_the_target_is_untouched(tmp_path: Pa
     run(scenario)
 
 
+@needs_postgres
+@needs_pg_tools
 def test_a_corrupted_dump_is_refused_by_digest_and_the_target_is_untouched(
     tmp_path: Path,
 ) -> None:
@@ -352,6 +388,8 @@ def test_a_corrupted_dump_is_refused_by_digest_and_the_target_is_untouched(
     run(scenario)
 
 
+@needs_postgres
+@needs_pg_tools
 def test_restoring_over_a_populated_database_is_refused_by_default(tmp_path: Path) -> None:
     """Fresh hardware means an empty database. Anything else needs saying so."""
 
@@ -376,3 +414,44 @@ def test_restoring_over_a_populated_database_is_refused_by_default(tmp_path: Pat
                 await _delete_vm_snapshot(vm, snapshot)
 
     run(scenario)
+
+
+# ------------------------------------------------------------- the file itself
+
+
+def test_the_archive_is_never_readable_by_anyone_but_its_owner(tmp_path: Path) -> None:
+    """The archive is a credential, and its mode is the only thing guarding it.
+
+    `pg_dump` covers the whole database, so every archive carries
+    `signing_keys.secret` in plaintext along with every paired client id. Anyone
+    who can read the file can mint a valid access token for any client of the
+    hub it came from, and there is no signing-key rotation to remediate it with.
+    Encryption was considered and deliberately not built — which leaves the
+    permission bits doing the entire job.
+
+    No Postgres and no client tools: this is a property of `write_archive`, and
+    the assertion that protects a secret is the last one that should be skipped
+    for a missing environment.
+    """
+    archive = tmp_path / "backup.tar.gz"
+    dump = tmp_path / DUMP_NAME
+    dump.write_bytes(b"not really a dump")
+
+    write_archive(archive, manifest_json=b"{}", dump_path=dump)
+    assert stat.S_IMODE(archive.stat().st_mode) == ARCHIVE_MODE, (
+        "a fresh archive was created through the umask rather than at 0600"
+    )
+
+    # Overwriting is the case a real hub hits, because scheduled backups write
+    # to the same path. O_CREAT's mode is ignored when the file already exists,
+    # so an archive written before this rule landed would otherwise keep its
+    # 0644 forever.
+    archive.chmod(0o644)
+    write_archive(archive, manifest_json=b"{}", dump_path=dump)
+    assert stat.S_IMODE(archive.stat().st_mode) == ARCHIVE_MODE, (
+        "overwriting an existing world-readable archive left it world-readable"
+    )
+
+    # And it is readable as an archive, not merely locked down.
+    with tarfile.open(archive, "r:gz") as tar:
+        assert sorted(tar.getnames()) == sorted([MANIFEST_NAME, DUMP_NAME])

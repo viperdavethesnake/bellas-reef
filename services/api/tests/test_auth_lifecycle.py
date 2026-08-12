@@ -12,17 +12,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from bellasreef_api.app import build_app
 from bellasreef_api.security import issue_access_token
+from bellasreef_api.store import Store
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _PG = "BELLASREEF_TEST_DATABASE_URL"
@@ -239,6 +242,399 @@ def test_an_expired_pairing_request_is_gone() -> None:
     assert run(scenario) == 410
 
 
+# ------------------------------------------------------------- pairing by code
+#
+# One rule governs this section, and it is the whole lesson of docs/auth-review:
+#
+#     A journey test may not share state between participants.
+#
+# The v1 approval test above passes while the journey it describes cannot be
+# completed by a real operator, because the test keeps the request_id from the
+# pairing call and hands it to the approver. No approver has ever held one. The
+# two participants below are therefore separate objects over separate HTTP
+# clients, and the only thing that crosses between them is a six-digit string —
+# because the only channel a real operator has is their eyes and their thumbs.
+
+
+class NewDevice:
+    """A device pairing for the first time, restricted to what it can see.
+
+    Its ``request_id`` is private on purpose. It is the asking device's own
+    handle for following its own request; nothing hands it to anyone else,
+    because in production nothing can.
+    """
+
+    def __init__(self, http: httpx.AsyncClient, name: str) -> None:
+        self._http = http
+        self._name = name
+        self._request_id: str | None = None
+
+    async def ask_to_pair(self) -> str:
+        """Pair, and return only what ends up on the screen."""
+        r = await self._http.post("/api/v1/pair", json={"client_name": self._name})
+        assert r.status_code == 202, r.text
+        body = r.json()
+        self._request_id = body["request_id"]
+        return str(body["pairing_code"])
+
+    async def poll(self) -> httpx.Response:
+        assert self._request_id is not None, "this device has not asked to pair"
+        return await self._http.get(f"/api/v1/pair/{self._request_id}")
+
+
+class PairedDevice:
+    """The device already in the operator's hand: System -> Add a device.
+
+    One field, six digits. The assertion in :meth:`add_a_device` is what makes
+    the no-shared-state rule structural rather than a comment — a test that tried
+    to pass a request_id through here would fail on the way in.
+    """
+
+    def __init__(self, http: httpx.AsyncClient, headers: dict[str, str]) -> None:
+        self._http = http
+        self._headers = headers
+
+    async def add_a_device(self, typed: str) -> httpx.Response:
+        assert re.fullmatch(r"[0-9]{6}", typed), (
+            f"an operator can only type six digits into this field, not {typed!r}"
+        )
+        return await self._http.post(
+            "/api/v1/pair/claim", json={"code": typed}, headers=self._headers
+        )
+
+
+def test_a_second_device_pairs_by_code_with_nothing_shared_between_the_two() -> None:
+    """auth.md §2 steps 3 and 3a, walked by two participants who never meet.
+
+    The iPad learns a code. The iPhone learns the same six characters, by the
+    operator reading them off the iPad and typing them in. Neither one is ever
+    given the other's request_id, which is precisely the difference between this
+    test and the one above it.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        out: dict[str, Any] = {}
+        async with h.client() as iphone_http, h.client() as ipad_http:
+            # The operator's existing phone, paired long ago.
+            first = (
+                await iphone_http.post("/api/v1/pair", json={"client_name": "David's iPhone"})
+            ).json()
+            iphone = PairedDevice(iphone_http, await bearer(iphone_http, first["refresh_token"]))
+
+            ipad = NewDevice(ipad_http, "iPad")
+            displayed = await ipad.ask_to_pair()
+            out["displayed"] = displayed
+
+            # Still nobody's business but the iPad's, until a human intervenes.
+            out["poll_while_pending"] = (await ipad.poll()).status_code
+
+            # The human intervention, in full: reading a screen.
+            typed = str(displayed)
+
+            claimed = await iphone.add_a_device(typed)
+            out["claim_code"] = claimed.status_code
+            out["claim_body"] = claimed.json()
+
+            granted = await ipad.poll()
+            out["poll_code"] = granted.status_code
+            out["granted"] = granted.json()
+
+            # And the credential actually works, which is the point of all this.
+            ipad_headers = await bearer(ipad_http, granted.json()["refresh_token"])
+            out["ipad_can_act"] = (
+                await ipad_http.get("/api/v1/clients", headers=ipad_headers)
+            ).status_code
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+    assert re.fullmatch(r"[0-9]{6}", out["displayed"]), (
+        f"the code must be six digits a person can read and type, got {out['displayed']!r}"
+    )
+    assert out["poll_while_pending"] == 202
+    assert out["claim_code"] == 200, out["claim_body"]
+    assert UUID(out["claim_body"]["request_id"])
+    assert out["poll_code"] == 200
+    assert out["granted"]["refresh_token"]
+    assert out["ipad_can_act"] == 200
+    assert "pair.requested" in out["events"]
+    # The same audit event the /approve path emits: claim is a resolver in front
+    # of it, not a second approval path with its own trail.
+    assert "pair.approved" in out["events"]
+    assert "pair.collected" in out["events"]
+
+
+def test_pairing_codes_are_unique_among_pending_requests() -> None:
+    """The partial unique index is the rule, not the endpoint's good manners.
+
+    Asserted twice over: that the endpoint never issues a code already in play,
+    and that a writer which is *not* the endpoint cannot either. The second half
+    is what makes this a database invariant rather than a convention.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        out: dict[str, Any] = {}
+        async with h.client() as c:
+            await c.post("/api/v1/pair", json={"client_name": "first"})
+
+            codes: list[str] = []
+            for n in range(25):
+                r = await c.post("/api/v1/pair", json={"client_name": f"device-{n}"})
+                assert r.status_code == 202, r.text
+                codes.append(r.json()["pairing_code"])
+            out["codes"] = codes
+
+            async def plant(code: str) -> bool:
+                """Insert a pending request carrying ``code``. True if allowed."""
+                try:
+                    async with h.engine.begin() as conn:
+                        await conn.execute(
+                            text(
+                                "INSERT INTO pairing_requests "
+                                "  (id, client_name, state, expires_at, pairing_code) "
+                                "VALUES (:id, 'planted', 'pending', :exp, :code)"
+                            ),
+                            {
+                                "id": uuid4(),
+                                "exp": datetime.now(UTC) + timedelta(seconds=300),
+                                "code": code,
+                            },
+                        )
+                except IntegrityError:
+                    return False
+                return True
+
+            out["duplicate_of_pending"] = await plant(codes[0])
+
+            # Decided, so the six digits go back into circulation. Codes recur
+            # forever — one namespace, no expiry — so a plain UNIQUE would refuse
+            # a request whose twin was approved last month.
+            async with h.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE pairing_requests SET state = 'denied', decided_at = now() "
+                        " WHERE pairing_code = :code"
+                    ),
+                    {"code": codes[0]},
+                )
+            out["reuse_after_decision"] = await plant(codes[0])
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    codes = out["codes"]
+    assert all(re.fullmatch(r"[0-9]{6}", c) for c in codes), codes
+    assert len(set(codes)) == len(codes), f"two pending requests shared a code: {codes}"
+    assert out["duplicate_of_pending"] is False, (
+        "the partial unique index must refuse a second pending request on one code"
+    )
+    assert out["reuse_after_decision"] is True, (
+        "a decided request must not hold its six digits out of circulation forever"
+    )
+
+
+def test_a_code_that_matches_nothing_is_a_404() -> None:
+    """Wrong code: retype it. Distinct from 409, which means start again."""
+
+    async def scenario() -> int:
+        h = await harness()
+        async with h.client() as c:
+            first = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, first["refresh_token"])
+            # No pending request exists at all, so no code can match.
+            r = await c.post("/api/v1/pair/claim", json={"code": "000000"}, headers=headers)
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 404
+
+
+def test_claiming_an_already_approved_code_is_a_409() -> None:
+    """One approval, one credential — including when the operator taps twice."""
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        out: dict[str, Any] = {}
+        async with h.client() as iphone_http, h.client() as ipad_http:
+            first = (await iphone_http.post("/api/v1/pair", json={"client_name": "phone"})).json()
+            headers = await bearer(iphone_http, first["refresh_token"])
+            iphone = PairedDevice(iphone_http, headers)
+            code = await NewDevice(ipad_http, "iPad").ask_to_pair()
+
+            out["first"] = (await iphone.add_a_device(code)).status_code
+            out["second"] = (await iphone.add_a_device(code)).status_code
+            out["clients"] = len((await iphone_http.get("/api/v1/clients", headers=headers)).json())
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    assert out["first"] == 200
+    assert out["second"] == 409
+    assert out["clients"] == 2, "a second claim must not mint a second client"
+
+
+def test_claiming_an_expired_code_is_a_409_not_a_404() -> None:
+    """The code was right; the request aged out.
+
+    404 would tell the operator to check what they typed, which is the wrong
+    advice — what they need to do is start again on the new device. The answer is
+    the same whether or not a sweep has already marked the row `expired`.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        out: dict[str, Any] = {}
+        async with h.client() as iphone_http, h.client() as ipad_http:
+            first = (await iphone_http.post("/api/v1/pair", json={"client_name": "phone"})).json()
+            iphone = PairedDevice(iphone_http, await bearer(iphone_http, first["refresh_token"]))
+            code = await NewDevice(ipad_http, "iPad").ask_to_pair()
+
+            async with h.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE pairing_requests SET expires_at = :past WHERE pairing_code = :code"
+                    ),
+                    {"past": datetime.now(UTC) - timedelta(seconds=1), "code": code},
+                )
+
+            out["unswept"] = (await iphone.add_a_device(code)).status_code
+
+            await Store(h.engine).sweep_pairing()
+            out["swept"] = (await iphone.add_a_device(code)).status_code
+            async with h.engine.connect() as conn:
+                out["state"] = (
+                    await conn.execute(
+                        text("SELECT state FROM pairing_requests WHERE pairing_code = :code"),
+                        {"code": code},
+                    )
+                ).scalar_one()
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    assert out["unswept"] == 409
+    assert out["swept"] == 409
+    assert out["state"] == "expired"
+
+
+def test_claiming_requires_a_bearer_token() -> None:
+    """The reason there is no rate limiter: only a paired client can approve.
+
+    An unauthenticated caller cannot claim its own request, so guessing codes
+    gains an attacker nothing they do not already hold.
+    """
+
+    async def scenario() -> dict[str, int]:
+        h = await harness()
+        async with h.client() as c:
+            await c.post("/api/v1/pair", json={"client_name": "first"})
+            pending = await c.post("/api/v1/pair", json={"client_name": "intruder"})
+            code = pending.json()["pairing_code"]
+            out = {
+                "unauthenticated": (
+                    await c.post("/api/v1/pair/claim", json={"code": code})
+                ).status_code,
+                "malformed": (
+                    await c.post("/api/v1/pair/claim", json={"code": "12345"})
+                ).status_code,
+            }
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    assert out["unauthenticated"] == 401
+    # 401 before 422: an unauthenticated caller learns nothing about the shape of
+    # the field, which is FastAPI's dependency ordering doing the right thing.
+    assert out["malformed"] == 401
+
+
+def test_a_malformed_code_from_a_paired_client_is_a_422() -> None:
+    """Not a 404. "Five digits" is a client bug, not a wrong guess."""
+
+    async def scenario() -> int:
+        h = await harness()
+        async with h.client() as c:
+            first = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, first["refresh_token"])
+            r = await c.post("/api/v1/pair/claim", json={"code": "12345"}, headers=headers)
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 422
+
+
+def test_aged_out_pairing_rows_are_swept_rather_than_accumulating() -> None:
+    """`POST /pair` is unauthenticated and inserts a row per call.
+
+    Without a sweep the table grows without bound and every aged-out request
+    sits as `pending` forever, holding its six digits out of circulation. The
+    sweep runs on the write path, so the cleanup rate tracks the growth rate.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        out: dict[str, Any] = {}
+        async with h.client() as c:
+            await c.post("/api/v1/pair", json={"client_name": "first"})
+            aged = (await c.post("/api/v1/pair", json={"client_name": "aged"})).json()
+
+            ancient = uuid4()
+            async with h.engine.begin() as conn:
+                # Just past its five minutes: to be marked expired, not deleted.
+                await conn.execute(
+                    text("UPDATE pairing_requests SET expires_at = :past WHERE id = :id"),
+                    {
+                        "past": datetime.now(UTC) - timedelta(seconds=1),
+                        "id": UUID(aged["request_id"]),
+                    },
+                )
+                # Long past the retention horizon: to be deleted.
+                await conn.execute(
+                    text(
+                        "INSERT INTO pairing_requests (id, client_name, state, expires_at) "
+                        "VALUES (:id, 'ancient', 'denied', :past)"
+                    ),
+                    {"id": ancient, "past": datetime.now(UTC) - timedelta(days=2)},
+                )
+            await Store(h.engine).open_pairing_window(
+                "david@hub", 300, now=datetime.now(UTC) - timedelta(days=2)
+            )
+
+            # The next pairing is what sweeps.
+            await c.post("/api/v1/pair", json={"client_name": "trigger"})
+
+            async with h.engine.connect() as conn:
+                out["aged_state"] = (
+                    await conn.execute(
+                        text("SELECT state FROM pairing_requests WHERE id = :id"),
+                        {"id": UUID(aged["request_id"])},
+                    )
+                ).scalar_one()
+                out["ancient_rows"] = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM pairing_requests WHERE id = :id"),
+                        {"id": ancient},
+                    )
+                ).scalar_one()
+                out["windows"] = (
+                    await conn.execute(text("SELECT count(*) FROM pairing_windows"))
+                ).scalar_one()
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    assert out["aged_state"] == "expired", (
+        "`expired` is a CHECK-permitted state that nothing used to write, which is "
+        "how a pending request could hold its code forever"
+    )
+    assert out["ancient_rows"] == 0
+    assert out["windows"] == 0, "an unused window past the horizon records nothing"
+
+
 # ------------------------------------------------------------------ revocation
 
 
@@ -427,7 +823,20 @@ def test_the_openapi_schema_is_generated() -> None:
 
     spec = run(scenario)
     paths = set(spec["paths"])
-    assert {"/healthz", "/api/v1/info", "/api/v1/pair", "/api/v1/token", "/api/v1/clients"} <= paths
+    assert {
+        "/healthz",
+        "/api/v1/info",
+        "/api/v1/pair",
+        "/api/v1/pair/claim",
+        "/api/v1/token",
+        "/api/v1/clients",
+    } <= paths
+    # Declared, not merely reachable: a generated client can only MODEL an
+    # outcome the spec names. 404-vs-409 on a claim is the difference between
+    # "retype it" and "start again", and a client that has to guess from a raw
+    # status code will show the wrong one.
+    claim = spec["paths"]["/api/v1/pair/claim"]["post"]["responses"]
+    assert {"200", "401", "404", "409"} <= set(claim)
     # Not this pass.
     assert "/api/v1/stream" not in paths
 
@@ -561,8 +970,6 @@ def test_the_recovery_window_lets_exactly_one_client_in() -> None:
             ).status_code
 
             # SSH to the hub and run `bellasreef pair`.
-            from bellasreef_api.store import Store
-
             await Store(h.engine).open_pairing_window("david@hub", 300)
 
             recovered = await c.post("/api/v1/pair", json={"client_name": "phone"})
@@ -590,6 +997,53 @@ def test_the_recovery_window_lets_exactly_one_client_in() -> None:
     assert "pair.window_used" in out["events"]
 
 
+def test_two_clients_racing_for_one_recovery_window_get_one_credential() -> None:
+    """A window is one credential, under concurrency as well as in sequence.
+
+    `consume_window` was already atomic and already returned False to the loser.
+    The handler discarded that boolean, and it had *already minted the client*
+    on the line above — so two `POST /pair` calls arriving together during one
+    five-minute recovery window both walked away with a permanent refresh token,
+    and the second row was never rolled back.
+
+    Two real requests through `asyncio.gather`, because the bug lives in the
+    interleaving. Calling the store method twice would prove the store, which
+    was never the broken part.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        out: dict[str, Any] = {}
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
+
+            await Store(h.engine).open_pairing_window("david@hub", 300)
+
+            a, b = await asyncio.gather(
+                c.post("/api/v1/pair", json={"client_name": "phone-a"}),
+                c.post("/api/v1/pair", json={"client_name": "phone-b"}),
+            )
+            out["codes"] = sorted([a.status_code, b.status_code])
+            out["tokens"] = [r.json()["refresh_token"] for r in (a, b) if r.status_code == 200]
+        # Revoked rows are kept by design, so the original still counts: one
+        # revoked client plus the single winner.
+        out["clients_ever"] = await Store(h.engine).total_clients_ever()
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+    assert out["codes"] == [200, 409], "exactly one client may ride a recovery window in"
+    assert len(out["tokens"]) == 1
+    assert out["clients_ever"] == 2, "the loser's client row must be rolled back, not left orphaned"
+    assert out["events"].count("pair.window_used") == 1, (
+        "the trail must record one use of the window, by the client that used it"
+    )
+
+
 def test_an_expired_window_does_not_let_anyone_in() -> None:
     async def scenario() -> int:
         h = await harness()
@@ -599,10 +1053,7 @@ def test_an_expired_window_does_not_let_anyone_in() -> None:
             headers = await bearer(c, granted["refresh_token"])
             await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
 
-            from bellasreef_api.store import Store
-
-            store = Store(h.engine)
-            await store.open_pairing_window(
+            await Store(h.engine).open_pairing_window(
                 "david@hub", 300, now=datetime.now(UTC) - timedelta(hours=1)
             )
 
@@ -628,8 +1079,6 @@ def test_recovery_does_not_reopen_the_tofu_window() -> None:
             granted = (await c.post("/api/v1/pair", json={"client_name": "only"})).json()
             headers = await bearer(c, granted["refresh_token"])
             await c.delete(f"/api/v1/clients/{granted['client_id']}", headers=headers)
-
-            from bellasreef_api.store import Store
 
             await Store(h.engine).open_pairing_window("david@hub", 300)
             await c.post("/api/v1/pair", json={"client_name": "recovered"})

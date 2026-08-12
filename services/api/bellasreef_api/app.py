@@ -6,7 +6,10 @@ Stateless front door. This pass implements discovery, pairing, tokens and
 client management only; the WebSocket stream and the sensor/override surface
 land next.
 
-`/info` and `/healthz` are the only unauthenticated endpoints, per auth.md §2.
+The unauthenticated set is exactly `/healthz`, `/api/v1/info`, `POST
+/api/v1/pair`, `GET /api/v1/pair/{id}` and `POST /api/v1/token`, per auth.md §2.
+Note that `POST /api/v1/pair/claim` is NOT in it: approving is what a bearer
+token buys, and it is the whole reason the pairing code needs no rate limiter.
 """
 
 # NOTE: deliberately NOT `from __future__ import annotations`.
@@ -442,8 +445,29 @@ class PairGranted(BaseModel):
 class PairPending(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: UUID
+    #: Six digits, zero-padded, for the operator to read off this device's
+    #: screen and type into an already-paired one. A string, not an int: the
+    #: leading zero in "042913" is part of what they type.
+    #:
+    #: The id above and this code answer different questions. The id is how this
+    #: device follows its own request; the code is how a human points at it. Only
+    #: the second can travel by eye, which is why v1 — approve by id — was
+    #: uncompletable rather than merely unimplemented.
+    pairing_code: str
     poll_after_s: int
     expires_in_s: int
+
+
+class PairClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    #: Validated here so a malformed entry is a 422 naming the field rather than
+    #: a 404 that reads as "wrong code" — different advice to the operator.
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class PairClaimed(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: UUID
 
 
 class TokenRequest(BaseModel):
@@ -742,6 +766,7 @@ def build_app(
             200: {"model": PairGranted, "description": "Paired; credential issued."},
             202: {"model": PairPending, "description": "Awaiting approval; poll."},
             403: {"description": "Nobody can approve; run `bellasreef pair`."},
+            409: {"description": "The recovery window was spent by another client."},
         },
     )
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
@@ -754,6 +779,8 @@ def build_app(
            approve, so the honest answer is to tell the operator to run
            `bellasreef pair` on the hub rather than leave them polling a
            request no one will ever see.
+
+        Outcome 2 has a fifth ending: losing the race for the window is a 409.
         """
         total = await store.total_clients_ever()
 
@@ -772,7 +799,27 @@ def build_app(
         window_id = await store.open_window()
         if window_id is not None:
             client_id, token = await store.create_client(body.client_name)
-            await store.consume_window(window_id, client_id)
+            # The credential is minted before the window is spent, so a lost
+            # race leaves a client row whose token has not left this process.
+            # `consume_window` is atomic and returns False to the loser; the
+            # boolean used to be discarded, which meant two concurrent calls
+            # during one five-minute recovery window both walked away with a
+            # permanent refresh token. The window is one credential (auth.md §1)
+            # — so the loser's row is rolled back and it gets a 409, not a
+            # second key to the tank.
+            if not await store.consume_window(window_id, client_id):
+                await store.discard_client(client_id)
+                log.warning(
+                    "lost the race for a recovery pairing window",
+                    extra={"window_id": str(window_id), "event": "pair_window_race"},
+                )
+                # No `pair.window_used` for the loser: exactly one client used
+                # this window, and the trail must say so once.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "the recovery pairing window was spent by another client. Run "
+                    "`bellasreef pair` on the hub to open another.",
+                )
             await sink(
                 "pair.window_used",
                 {
@@ -796,13 +843,22 @@ def build_app(
                 "recovery window.",
             )
 
-        request_id = await store.open_pairing_request(body.client_name)
+        request_id, code = await store.open_pairing_request(body.client_name)
         await sink(
             "pair.requested",
             {"request_id": str(request_id), "client_name": body.client_name},
         )
         response.status_code = status.HTTP_202_ACCEPTED
-        return PairPending(request_id=request_id, poll_after_s=5, expires_in_s=PAIRING_TTL_S)
+        # The code is deliberately absent from the audit detail. It is a
+        # selector, not a credential, but the trail is readable through
+        # /api/v1/audit and a code sitting in it outlives the five minutes it
+        # means anything for.
+        return PairPending(
+            request_id=request_id,
+            pairing_code=code,
+            poll_after_s=5,
+            expires_in_s=PAIRING_TTL_S,
+        )
 
     @app.get(
         "/api/v1/pair/{request_id}",
@@ -842,19 +898,14 @@ def build_app(
         await sink("pair.collected", {"client_id": str(client_id)})
         return PairGranted(refresh_token=token, client_id=client_id)
 
-    @app.post(
-        "/api/v1/pair/{request_id}/approve",
-        tags=["pairing"],
-        operation_id="approvePairing",
-        responses={
-            401: AUTH_401,
-            409: {"description": "The pairing request is not pending."},
-        },
-    )
-    async def approve(
-        request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
-    ) -> dict[str, str]:
-        """Approve from an already-paired client. The trust anchor is the tap."""
+    async def _approve(request_id: UUID, approver: UUID) -> None:
+        """Approve a pending request and hold its credential for the poller.
+
+        One implementation, two doors: by id (`/approve`) and by code
+        (`/claim`). Claim is a resolver in front of this, not a second approval
+        path — two of them would be two places for the audit event, the
+        one-credential rule and the 409 to drift apart.
+        """
         result = await store.approve_pairing(request_id)
         if result is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "pairing request is not pending")
@@ -868,6 +919,62 @@ def build_app(
                 "approved_by": str(approver),
             },
         )
+
+    @app.post(
+        "/api/v1/pair/claim",
+        response_model=PairClaimed,
+        tags=["pairing"],
+        operation_id="claimPairing",
+        responses={
+            401: AUTH_401,
+            404: {"description": "No pairing request carries that code."},
+            409: {"description": "That pairing request is no longer pending."},
+        },
+    )
+    async def claim(
+        body: PairClaim, approver: Annotated[UUID, Depends(current_client)]
+    ) -> PairClaimed:
+        """Approve by typing the six digits the new device is showing.
+
+        auth.md §2 step 3a. This is the whole second-device journey from the
+        operator's side: they hold the new device, read its code, and type it
+        into the one already paired. Nothing has to tell them a request is
+        waiting, and nothing has to identify the asking device — they are
+        looking at it.
+
+        No rate limiter and no attempt counter, deliberately. The bearer token
+        above is the gate: only an already-paired client can approve anything, so
+        guessing a code gains an attacker nothing they do not already hold. The
+        code is a selector, not a credential.
+        """
+        found = await store.pairing_request_for_code(body.code)
+        if found is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no pairing request carries that code")
+        request_id, state = found
+        if state != "pending":
+            # Including expired. 409 rather than 404 on purpose: the code was
+            # right, so "check what you typed" would be wrong advice — the thing
+            # to do is start again on the new device.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "that pairing request is no longer pending"
+            )
+        await _approve(request_id, approver)
+        return PairClaimed(request_id=request_id)
+
+    @app.post(
+        "/api/v1/pair/{request_id}/approve",
+        tags=["pairing"],
+        operation_id="approvePairing",
+        responses={
+            401: AUTH_401,
+            409: {"description": "The pairing request is not pending."},
+        },
+    )
+    async def approve(
+        request_id: UUID, approver: Annotated[UUID, Depends(current_client)]
+    ) -> dict[str, str]:
+        """Approve from an already-paired client. The trust anchor is the tap."""
+        await _approve(request_id, approver)
         return {"status": "approved"}
 
     @app.post(

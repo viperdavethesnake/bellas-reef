@@ -508,6 +508,12 @@ class PairingRequest(Base):
     The id is what the new client polls. Expiry is stored rather than computed
     so a request cannot be resurrected by moving the clock — which matters on a
     board with no RTC battery.
+
+    ``pairing_code`` is what the *operator* handles: six digits shown on the new
+    device and typed into a paired one. The id and the code answer two different
+    questions — the id is how the asking device follows its own request, the code
+    is how a human points at it — and only the second can be read off a screen,
+    which is why the v1 flow (approve a request by id) was uncompletable.
     """
 
     __tablename__ = "pairing_requests"
@@ -515,6 +521,10 @@ class PairingRequest(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     client_name: Mapped[str] = mapped_column(String(128))
     state: Mapped[str] = mapped_column(String(16), index=True)
+
+    #: Nullable: rows created before migration 0016 have none, and a decided row
+    #: keeps whatever it was shown with.
+    pairing_code: Mapped[str | None] = mapped_column(String(6), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -534,6 +544,25 @@ class PairingRequest(Base):
         CheckConstraint(
             "state <> 'approved' OR (client_pk IS NOT NULL AND decided_at IS NOT NULL)",
             name="approved_has_client",
+        ),
+        CheckConstraint(
+            "pairing_code IS NULL OR pairing_code ~ '^[0-9]{6}$'",
+            name="pairing_code_digits",
+        ),
+        # Unique among requests *currently in play*, and only those. Six digits
+        # are one namespace reused forever, so a plain UNIQUE would refuse a
+        # request whose twin was approved last month. Partial, so the rule is
+        # exactly the one the operator experiences: at any instant, one code
+        # names one request.
+        #
+        # This is also why the sweeper has to write `expired`. A request that
+        # aged out while still marked pending would hold its six digits out of
+        # circulation forever.
+        Index(
+            "uq_pairing_requests_pending_code",
+            "pairing_code",
+            unique=True,
+            postgresql_where=text("state = 'pending'"),
         ),
     )
 

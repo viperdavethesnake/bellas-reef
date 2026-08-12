@@ -44,6 +44,86 @@ run "ruff format --check" uv run ruff format --check .
 run "mypy --strict"       uv run mypy contracts/python db services
 run "pytest"              uv run pytest
 
+# The published spec is the source of truth for every client (CLAUDE.md,
+# "Versioned contracts"), and it is generated from the app rather than kept by
+# hand. That only holds if the generated document and the committed one are the
+# same document.
+#
+# They were not. CI regenerated the spec and uploaded it as a build artifact,
+# and never once compared it to the copy in the tree — so `openapi.json` sat at
+# info.version 3.0.0 while the app derived 3.3.0, with no /capabilities and no
+# POST /devices. The iOS client generates from the committed file, so it was
+# built, faithfully, against a contract three minor versions out of date and had
+# no bindDevice method to call: the whole device-adoption flow missing from the
+# artifact this project calls the source of truth, with every downstream check
+# green. A generated client makes contract drift a compile error only when the
+# spec it generates from is the spec the server serves. This is the check that
+# makes that true.
+#
+# Never behind --quick. Drift is silent by nature; a check you can skip on the
+# way out the door is the check that was not running when it mattered.
+spec_drift() {
+    local tmp rc=0 file
+    tmp="$(mktemp -d)" || return 1
+    if ! uv run python scripts/export-openapi.py \
+            --out "$tmp/openapi.json" \
+            --frames-out "$tmp/stream-frames.schema.json"; then
+        echo "the exporter failed, so the committed spec could not be checked at all"
+        rm -rf "$tmp"
+        return 1
+    fi
+    for file in openapi.json stream-frames.schema.json; do
+        if ! diff -u "$file" "$tmp/$file"; then
+            echo "^^^ ${file} is stale"
+            rc=1
+        fi
+    done
+    rm -rf "$tmp"
+    if [[ $rc -ne 0 ]]; then
+        cat <<'DRIFT'
+
+The committed contract is not what the app generates. Clients — including the
+generated Swift one — are built from the committed file, so whatever the server
+grew since it was last exported does not exist for them. Regenerate and commit
+the result:
+
+    uv run python scripts/export-openapi.py
+DRIFT
+    fi
+    return "$rc"
+}
+run "openapi spec drift" spec_drift
+
+# Step 1 of every client's journey is a Bonjour browse, and the TXT record
+# carries the contracts version a client uses to decide whether it can talk to
+# this hub at all. That value was hardcoded, three minor versions stale, derived
+# from nothing and tested by nothing — the same failure as the spec above, in a
+# file nobody thinks of as a contract.
+#
+# deploy-pi.sh renders the value from the installed package when it installs the
+# record, so the hub advertises the truth. This check keeps the committed file
+# honest as well, because docs/host-setup.md tells an operator to `cp` it by
+# hand and that path has no renderer in it.
+avahi_contracts() {
+    local record declared expected
+    record="deploy/avahi/bellasreef.service"
+    declared="$(sed -n 's|.*<txt-record>contracts=\([^<]*\)</txt-record>.*|\1|p' "$record")"
+    expected="$(uv run python -c 'from importlib.metadata import version
+print(version("bellasreef-contracts"))')" || return 1
+    if [[ -z "$declared" ]]; then
+        echo "${record} advertises no contracts= TXT record; clients cannot tell what this hub speaks"
+        return 1
+    fi
+    if [[ "$declared" != "$expected" ]]; then
+        echo "${record} advertises contracts=${declared}; bellasreef-contracts is ${expected}"
+        echo "A client that refuses a hub it is too old to talk to is reading this number."
+        return 1
+    fi
+    echo "contracts=${declared}"
+    return 0
+}
+run "avahi contracts version" avahi_contracts
+
 # Renders migrations to SQL with no database. Catches a broken revision without
 # needing Postgres; the schema-vs-migration drift check is a separate,
 # Postgres-backed test.

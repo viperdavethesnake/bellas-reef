@@ -13,15 +13,24 @@
 # until it has seen a *fresh sample land in VictoriaMetrics* — the wire, not
 # the gauge.
 #
+# There are two ends to that, and for a long time this script only checked one.
+# Telemetry proved the tank was being watched and proved nothing about anyone
+# being able to look: no request ever reached the API, so discovery or pairing
+# could have been broken on the hub through any number of green deploys. The
+# second verification leg below closes that.
+#
 # Usage:  ./scripts/deploy-pi.sh [--host H] [--no-verify] [--no-verify-ci]
 
 set -uo pipefail
 
 PI_HOST="${BELLASREEF_PI_HOST:-bellasreef.local}"
 PI_DIR="/home/david/bellasreef"
+API_PORT=8000
 VERIFY=1
 SKIP_CI_CHECK=0
 UNITS=(bellasreef-hardware-io bellasreef-control-engine bellasreef-api)
+AVAHI_RECORD="deploy/avahi/bellasreef.service"
+AVAHI_INSTALLED="/etc/avahi/services/bellasreef.service"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,6 +45,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 die() { printf '\033[31mdeploy: %s\033[0m\n' "$1" >&2; exit 1; }
 step() { printf '\033[1m▶ %s\033[0m\n' "$1"; }
+warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
 
 # ---------------------------------------------------------------- preconditions
 
@@ -50,6 +60,22 @@ if ! git merge-base --is-ancestor "$SHA" "origin/${BRANCH}" 2>/dev/null; then
     die "HEAD (${SHA:0:8}) is not on origin/${BRANCH}. Push first."
 fi
 echo "  ${SHA:0:8} on origin/${BRANCH}"
+
+step "reading the contract version this commit ships"
+# Derived exactly the way the API derives it — importlib.metadata against the
+# installed bellasreef-contracts package — so the number checked against /info
+# later is the number the deployed code should be reporting, not a literal
+# somebody kept up to date by hand. That literal is precisely how the avahi TXT
+# record ended up advertising 2.0.0 against a 3.3.0 package.
+#
+# Read from this workspace rather than from the Pi on purpose. Both resolve from
+# the same uv.lock at the same commit, so they agree — and asking the Pi would
+# compare the hub against itself, which is exactly the tautology that lets a
+# unit that never restarted look correct.
+CONTRACTS="$(uv run python -c 'from importlib.metadata import version
+print(version("bellasreef-contracts"))' 2>/dev/null)"
+[[ -n "$CONTRACTS" ]] || die "could not read the bellasreef-contracts version from this workspace. Run 'uv sync' — the deploy has no way to tell what contract the hub is supposed to be serving without it."
+echo "  contracts ${CONTRACTS}"
 
 step "checking CI is green for this commit"
 # The stop condition is CI green AND deployed. Without this check the script
@@ -104,6 +130,30 @@ step "installing unit files"
 ssh "$PI_HOST" "sudo install -m 0644 ${PI_DIR}/deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload" \
     || die "could not install units"
 
+step "installing the discovery record"
+# Step 1 of every client's journey is a Bonjour browse for _bellasreef._tcp, and
+# the TXT record tells the client what contract version this hub speaks. That
+# record was hardcoded in the repo, three minor versions stale, installed by a
+# `cp` in a setup document, and never touched by a deploy again — derived from
+# nothing, verified by nothing, and the first thing a phone reads.
+#
+# So the version is substituted here from the package rather than trusted from
+# the file, and the file is reinstalled on every deploy like any other artefact.
+# Rendered locally and piped: no half-written file on the host, and nothing left
+# in /tmp to be read by the next thing that looks there.
+sed -E "s|(<txt-record>contracts=)[^<]*|\1${CONTRACTS}|" "$AVAHI_RECORD" \
+    | ssh "$PI_HOST" "sudo mkdir -p $(dirname "$AVAHI_INSTALLED") && sudo tee ${AVAHI_INSTALLED} >/dev/null && sudo chmod 0644 ${AVAHI_INSTALLED}" \
+    || die "could not install the avahi service record on ${PI_HOST}"
+
+if ! ssh "$PI_HOST" "sudo systemctl reload avahi-daemon" 2>/dev/null; then
+    warn "avahi-daemon would not reload — the record is installed but not being advertised yet"
+fi
+
+advertised="$(ssh "$PI_HOST" "sed -n 's|.*<txt-record>contracts=\\([^<]*\\)</txt-record>.*|\\1|p' ${AVAHI_INSTALLED}" 2>/dev/null)"
+[[ "$advertised" == "$CONTRACTS" ]] \
+    || die "the hub advertises contracts=${advertised:-<none>} but this build ships ${CONTRACTS}. A client reads that record to decide whether it can talk to this hub at all."
+echo "  advertising contracts=${advertised}"
+
 step "enabling services at boot"
 # Idempotent, and separate from restart on purpose: `systemctl restart` on a
 # disabled unit starts it now and forgets it at the next power cut, which on a
@@ -134,6 +184,46 @@ if [[ $VERIFY -eq 0 ]]; then
     exit 0
 fi
 
+step "checking the API answers and speaks the contract we just shipped"
+# The other half of "verified on the wire". Everything below this comment used
+# to be missing, which meant a deploy could prove the tank was monitored and
+# never prove a single person could log in — discovery or pairing broken on the
+# hub, three units active, green banner.
+#
+# /api/v1/info is the right probe for exactly the reason it is unauthenticated:
+# it is the first request any client makes, before pairing, before a credential
+# exists. If this does not answer, nobody is getting in, and the contract
+# version it reports is what a client compares against before it will speak.
+#
+# Retried briefly rather than asked once: uvicorn has just been restarted, and a
+# connection refused two seconds after `systemctl restart` means nothing.
+AUTH_DEADLINE=$(($(date +%s) + 30))
+info_body=""
+info_code=""
+while :; do
+    probe="$(curl -sS --max-time 10 -w $'\n%{http_code}' \
+        "http://${PI_HOST}:${API_PORT}/api/v1/info" 2>/dev/null || true)"
+    info_code="$(tail -n1 <<<"$probe")"
+    info_body="$(sed '$d' <<<"$probe")"
+    [[ "$info_code" == "200" ]] && break
+    [[ "$(date +%s)" -ge $AUTH_DEADLINE ]] && break
+    sleep 3
+done
+
+if [[ "$info_code" != "200" ]]; then
+    ssh "$PI_HOST" "sudo journalctl -u bellasreef-api -n 40 --no-pager"
+    die "GET /api/v1/info on ${PI_HOST}:${API_PORT} answered '${info_code:-nothing}' after 30s. The unit is active and the front door is shut — no client can discover this hub, pair with it, or refresh a token."
+fi
+
+served_contracts="$(sed -n 's/.*"contracts_version":"\([^"]*\)".*/\1/p' <<<"$info_body")"
+if [[ "$served_contracts" != "$CONTRACTS" ]]; then
+    die "the API reports contracts_version='${served_contracts:-<absent>}' and this build ships ${CONTRACTS}. The unit restarted into code that is not what was just deployed, or /info is not the endpoint this reply came from — either way clients are being told the wrong contract."
+fi
+
+paired="$(sed -n 's/.*"paired_client_count":\([0-9]*\).*/\1/p' <<<"$info_body")"
+echo "  /info 200 · contracts ${served_contracts} · ${paired:-?} paired client(s)"
+[[ "${paired:-1}" == "0" ]] && warn "no client has ever paired — the hub is open for trust-on-first-use"
+
 step "waiting for a fresh sample on the wire"
 # Not a process check and not the metrics endpoint. A reading that reaches
 # VictoriaMetrics has traversed driver -> NATS -> telemetry writer -> VM, which
@@ -162,4 +252,5 @@ if [[ $FOUND -eq 0 ]]; then
 fi
 
 latest="$(sed -n 's/.*"values":\[\([^,]*\).*/\1/p' <<<"$body" | tail -1)"
-printf '\033[32m✓ deployed %s — fresh sample on the wire (%s)\033[0m\n' "${SHA:0:8}" "${latest:-ok}"
+printf '\033[32m✓ deployed %s — API answering at contracts %s, fresh sample on the wire (%s)\033[0m\n' \
+    "${SHA:0:8}" "$CONTRACTS" "${latest:-ok}"
