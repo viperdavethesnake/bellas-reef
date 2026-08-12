@@ -349,6 +349,42 @@ class Store:
                 )
         return target, created
 
+    async def adopted_assignments(self) -> list[dict[str, Any]]:
+        """Every device an operator has claimed, for republishing on startup.
+
+        Postgres is the source of device topology; the retained assignment
+        stream is a cache of it. This is what makes that true rather than
+        aspirational — without it the stream is written once at bind time and
+        never reconciled, so any divergence is permanent and silent.
+
+        Two failures it closes:
+
+        A **restored hub builds nothing.** The archive carries Postgres and
+        deliberately not JetStream, on the grounds that hardware announces
+        itself on boot. That holds for registrations and does not hold for
+        assignments, which only the API publishes and only when someone binds.
+        Restore onto fresh hardware and the devices table is perfect, the
+        stream is empty, and the tank stays dark — the exact scenario R14
+        exists for.
+
+        And a **purged stream never comes back.** I purged BR_REGISTRY by hand
+        twice this week clearing a forked device; the same operation on
+        BR_ASSIGNMENT would have silently unbuilt every device on the next
+        restart.
+        """
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT device_id, role, driver_type, binding "
+                        "  FROM devices "
+                        " WHERE adopted AND driver_type IS NOT NULL AND binding IS NOT NULL "
+                        " ORDER BY device_id"
+                    )
+                )
+            ).mappings()
+            return [dict(row) for row in rows]
+
     # ------------------------------------------------------------ clients
 
     async def total_clients_ever(self) -> int:

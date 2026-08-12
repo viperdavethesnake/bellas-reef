@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 from bellasreef_api.app import build_app
+from bellasreef_api.store import Store
 from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -502,3 +503,97 @@ def test_an_announced_probe_is_adopted_not_duplicated() -> None:
     assert count == 1, "adoption created a second device instead of claiming the one there"
     assert row["adopted"] is True
     assert row["display_name"] == "Sump"
+
+
+# ------------------------------------------------- assignments survive a restore
+
+
+def test_only_adopted_bound_devices_are_reconciled() -> None:
+    """What gets republished at startup, and what must not.
+
+    Postgres is the source of device topology; the retained assignment stream
+    is a cache of it. This is the query that makes that true — without it the
+    stream is written once at bind time and never reconciled, so a restored or
+    purged stream leaves hardware-io building nothing while the devices table
+    looks perfect.
+
+    That is not hypothetical. The R14 archive carries Postgres and deliberately
+    omits JetStream, on the grounds that hardware announces itself on boot —
+    true for registrations, false for assignments, which only the API publishes
+    and only when someone binds. Restore onto fresh hardware without this and
+    the tank stays dark, which is the exact scenario R14 exists for.
+
+    An unadopted device must NOT appear: announce-then-adopt means a probe the
+    hub can see but nobody has claimed stays inert, and reconciliation is
+    exactly the moment that rule would be quietly undone.
+    """
+
+    async def scenario() -> list[str]:
+        engine = await fresh_engine()
+        await announce(engine, "w1-bus", ROM)
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await c.post(
+                "/api/v1/devices",
+                headers=headers,
+                json={
+                    "device_id": "led-blue",
+                    "driver_type": "pi-pwm",
+                    "channel": "0",
+                    "role": "light",
+                },
+            )
+            # Announced but never claimed — the inert state.
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
+                        "  poll_interval_s, transport) "
+                        "VALUES (:id, 'unclaimed-probe', 'sensor', 'ds18b20', 'temp', 5.0, "
+                        "        'local')"
+                    ),
+                    {"id": uuid.uuid4()},
+                )
+
+            store = Store(engine)
+            return [row["device_id"] for row in await store.adopted_assignments()]
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    reconciled = run(scenario)
+    assert reconciled == ["led-blue"]
+    assert "unclaimed-probe" not in reconciled, (
+        "an unadopted device would be built by hardware-io on the next restart, "
+        "undoing announce-then-adopt at exactly the moment nobody is watching"
+    )
+
+
+def test_a_reconciled_assignment_carries_what_the_driver_needs() -> None:
+    """Enough to rebuild the driver, or the republish is decorative."""
+
+    async def scenario() -> dict[str, Any]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "1")
+        c, headers = await client_for(engine)
+        try:
+            await c.post(
+                "/api/v1/devices",
+                headers=headers,
+                json={
+                    "device_id": "led-white",
+                    "driver_type": "pi-pwm",
+                    "channel": "1",
+                    "role": "light",
+                },
+            )
+            return (await Store(engine).adopted_assignments())[0]
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    row = run(scenario)
+    assert row["driver_type"] == "pi-pwm"
+    assert row["binding"] == {"channel": "1"}
+    assert row["role"] == "light"

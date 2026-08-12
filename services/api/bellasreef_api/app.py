@@ -605,6 +605,31 @@ def build_app(
         except Exception:
             log.exception("could not establish hub identity")
 
+        # Republish every assignment from Postgres, which is the source. The
+        # retained stream is a cache of it, and this is the line that makes
+        # that true: without it a restored or purged stream leaves hardware-io
+        # building nothing while the devices table looks perfect.
+        if assignments is not None:
+            try:
+                for row in await store.adopted_assignments():
+                    await assignments.publish(
+                        DeviceAssignment(
+                            message_id=uuid4(),
+                            emitted_at=datetime.now(UTC),
+                            source="api",
+                            device_id=row["device_id"],
+                            adopted=True,
+                            role=row["role"],
+                            driver_type=row["driver_type"],
+                            binding=row["binding"],
+                        )
+                    )
+            except Exception:
+                # Best effort: a hub that cannot reconcile should still serve.
+                # hardware-io keeps whatever the stream already held, which is
+                # the status quo rather than a regression.
+                log.exception("could not reconcile device assignments")
+
         for name, component in (
             ("registry consumer", registry),
             ("capability consumer", capabilities),

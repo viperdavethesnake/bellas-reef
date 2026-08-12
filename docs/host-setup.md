@@ -376,83 +376,39 @@ what has only been ruled.
 
 ## 9. The device file, and the PWM overlay
 
-### `/etc/bellasreef/devices.yaml`
+### Devices are declared in the registry, not in a file
 
-hardware-io is topology-driven. What this hub is wired to is declared in
-`/etc/bellasreef/devices.yaml`, host-owned like the service env files beside
-it, so the code and the unit files stay identical on every hub.
+hardware-io builds its devices from **registry assignments**, read off the NATS
+spine at startup. There is no device file in its startup path and it reads
+nothing from disk.
+
+That is a deliberate reversal. `/etc/bellasreef/devices.yaml` used to be the
+source, and it let a config author choose an id for hardware that already had
+one in the registry — a tank's history forked across two `device_id`s for
+seventy minutes before it was caught. The ROM is the hardware's identity, the
+`device_id` is the registry's, and a file that can mint a third is a file that
+will.
+
+Devices are created by binding an announced capability:
 
 ```bash
-sudo install -m 0644 deploy/config/devices.yaml.example /etc/bellasreef/devices.yaml
-sudo -e /etc/bellasreef/devices.yaml
+# What this hub's hardware can offer, and what is already claimed.
+GET /api/v1/capabilities
+
+# Claim one.
+POST /api/v1/devices
 ```
 
-The service **refuses to start** on a missing, malformed, or unknown-driver
-entry, and names the offending device. Coming up with a light missing is a hub
-that looks healthy and monitors half a tank, which is the failure this project
-keeps meeting in different costumes.
-
-Override the path for testing with `BELLASREEF_DEVICES_FILE`.
+`/etc/bellasreef/devices.import.yaml` on this host is an **input to
+`bellasreef devices import`** and nothing else. Importing it goes through the
+same endpoint with the same validation, including adopt-rather-than-duplicate.
+It is kept for seeding a rebuilt hub; deleting it changes nothing at runtime.
 
 Find probe ROM codes with:
 
 ```bash
 ls /sys/bus/w1/devices/ | grep '^28-'
 ```
-
-### The stack's containers must restart on boot
-
-NATS, PostgreSQL and VictoriaMetrics run as containers started by hand. They had
-**no restart policy**, so the first reboot of this host took the entire stack
-down with it: the services came up, could not reach `localhost:4222`, and sat
-retrying while the tank went unmonitored.
-
-```bash
-docker update --restart unless-stopped nats-dev pg-dev vm-dev
-```
-
-Applied 2026-08-12. `unless-stopped` rather than `always` so a container stopped
-deliberately stays stopped across a reboot.
-
-This is the same class of failure as an unsupervised service — something the hub
-depends on that nothing brings back — and it was invisible until the host was
-actually rebooted, which had not happened since the units were installed.
-
-### Removing a device
-
-Deleting a device is **three things**, and doing fewer leaves it half-gone. This
-is written down because each part was discovered separately, by hand, after a
-device came back from the dead.
-
-1. **The registry rows.**
-
-   ```
-   DELETE FROM sensor_alerts WHERE device_id = '<id>';
-   DELETE FROM devices       WHERE device_id = '<id>';
-   ```
-
-   Episodes are deleted explicitly because `sensor_alerts` has **no foreign key**
-   to `devices` — deliberately, so deleting a device cannot erase the evidence
-   that it misbehaved. That is the right default, and it means a genuine removal
-   has to say so.
-
-2. **The retained announcement.** `BR_REGISTRY` is last-value-per-subject, so
-   the API replays it on every start and **recreates the row**. Deleting the row
-   without this looks like it worked, right up until the next restart.
-
-   ```
-   js.purge_stream("BR_REGISTRY", subject="bellasreef.registry.<id>")
-   ```
-
-   Order matters here and nowhere else: purge before or with the row delete, or
-   an API restart in between brings it back.
-
-3. **The telemetry series.** Otherwise the history of a device that no longer
-   exists stays queryable and keeps counting against retention.
-
-   ```
-   POST /api/v1/admin/tsdb/delete_series?match[]={device_id="<id>"}
-   ```
 
 ### PWM overlay — host mutation, and it needs a reboot
 

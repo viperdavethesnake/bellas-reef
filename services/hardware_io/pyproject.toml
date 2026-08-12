@@ -8,9 +8,6 @@ dependencies = [
     "bellasreef-contracts",
     "bellasreef-service",
     "nats-py>=2.9",
-    # The device file. hardware-io is topology-driven and cannot start without
-    # parsing one, so this is a hard dependency rather than an extra.
-    "pyyaml>=6.0",
     "prometheus-client>=0.21",
     "sqlalchemy>=2.0.36",
 ]

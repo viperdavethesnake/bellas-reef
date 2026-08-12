@@ -1,31 +1,39 @@
-# What this hub is wired to. Copy to /etc/bellasreef/devices.yaml on the host.
+# A device file for `bellasreef devices import`. Copy, edit, import.
 #
-# Host-owned, like the service env files beside it: the code and the unit files
-# are identical on every hub, and this is the part that differs between tanks.
-# Adding a probe or moving a light to different silicon is an edit and a
-# restart, not a commit.
+# **This file does not drive hardware-io.** It used to, and that is exactly why
+# it no longer does: it let a config author choose an id for hardware that
+# already had one in the registry, and a tank's history forked across two
+# device_ids for seventy minutes.
 #
-# hardware-io will NOT start if this file is missing, malformed, or names a
-# driver it does not know. That is deliberate. Coming up with a device missing
-# is a hub that looks healthy and monitors half a tank.
+# The registry is the source of device topology now. Hardware announces what it
+# can offer, an operator binds a channel to a device, and hardware-io builds
+# from those assignments. This file is a convenience for seeding a bench hub and
+# for restoring one from notes — nothing more. Importing it goes through
+# POST /api/v1/devices with the same validation as any client, including the
+# rule that hardware already in the registry is adopted rather than duplicated.
+#
+#   bellasreef devices import devices.yaml --api http://bellasreef.local:8000
+#
+# It needs a credential, because it is a client like any other:
+# --token, or $BELLASREEF_TOKEN.
 #
 # Two rules worth knowing before you edit:
 #
 #   `id` is identity. It is the NATS subject token, the row in the devices
 #   table, the name on the phone, and the key its history is stored under.
-#   Changing an id orphans all of that. Changing a `binding` does not — a light
-#   moved from the Pi's PWM to a PCA9685 board keeps every bit of its past.
+#   Proposing a new id for hardware the registry already knows renames nothing
+#   and creates nothing — the import adopts what is there.
 #
-#   Unknown keys are refused rather than ignored. `chanel: 1` is an error, not
-#   a silent fallback to channel 0.
+#   Unknown keys are refused rather than ignored. `chanel: 1` is an error, not a
+#   silent fallback to channel 0.
 
 version: 1
 
 actuators:
   # David's build: two LED channels on the Pi's own hardware PWM.
   #
-  # `channel` is the pwmchip channel, not a GPIO number. Which pin it lands on
-  # is set by the PWM overlay in config.txt — see docs/host-setup.md §9.
+  # `channel` is the pwmchip channel, not a GPIO number. GPIO12 is channel 0 and
+  # GPIO13 is channel 1, set by the PWM overlay — see docs/host-setup.md §9.
   #
   # `inverted` follows the output stage and is set from bench measurement, not
   # from reasoning. Leave it false until a meter says otherwise.
