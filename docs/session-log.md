@@ -256,3 +256,29 @@ known non-zero duty and take away each guarantee in turn, watching
 shape as the heartbeat and may have the same gap; the drill tells us whether we
 are fixing one leg or three. Reading duty stays inside the bench boundary and
 needs no load connected.
+
+### Correction to the resume point — 2026-08-12 16:05
+
+**Step 3 of the walkthrough above ("adopt the probe and both lights from the
+app") is not possible.** `bindDevice`, `listCapabilities` and `unbindDevice`
+are in the 3.5.0 spec and in the generated Swift client, and **no app code
+calls them.** Wave 3 was scoped from the auth review's findings and adoption
+was not an auth finding, so that screen was never asked for. My error.
+
+**The tank is dark and there is currently no way to restore it from the app.**
+
+Decision pending, not taken:
+
+- **Option A (recommended, and it improves the test).** Take the TOFU grant by
+  curl, adopt the three devices over the API, tank comes back immediately.
+  David's phone then installs wave 3 and pairs as the *second* device via the
+  six-digit code — the journey that has never once worked, which is what we
+  most want to prove. Afterwards remove the curl client with
+  `bellasreef revoke`, which exercises that fix and leaves the audit row the
+  2026-08-12 SQL revocation did not. Cost: spends the one-shot TOFU window on a
+  curl client rather than the phone.
+- **Option B.** Build adoption UI as wave 4 first. Right end state either way,
+  but the tank stays dark while it is built.
+
+Wave 4 (adoption UI: list capabilities, adopt, unbind) is needed regardless of
+which option is taken.
