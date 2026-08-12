@@ -1,23 +1,48 @@
-# Auth & pairing — v1
+# Auth & pairing — v2
 
-**Status:** draft for review · **Owner:** David / Bella's Reef LLC
+**Status:** active · **Owner:** David / Bella's Reef LLC
 **Scope:** how a client (iOS app, web UI) discovers the hub, pairs, and
 authenticates. Single operator, no accounts, no cloud. Paired means trusted.
 
 One page. If a change makes this longer, the change is probably wrong.
 
+### Changelog
+
+- **2.0 (2026-08-12)** — second-device pairing becomes **code-based**. v1
+  specified approve-from-paired and it was never completable: no client could
+  obtain a `request_id` to approve, so `POST /pair/{id}/approve` was unreachable
+  from the published contract by construction. See `docs/auth-review.md` and
+  `docs/superpowers/specs/2026-08-12-auth-end-to-end-design.md`. This version
+  also corrects field names that were wrong in every v1 example — a client
+  written from v1's §2 got a 422 on its first call — and the false claim that
+  only two endpoints are unauthenticated.
+
 ---
 
 ## 1. Model
 
-**TOFU (trust on first use) with approve-from-paired thereafter.**
+**TOFU (trust on first use), then pairing by code.**
 
 - While the hub has **zero** paired devices, the first `POST /pair` on the LAN
   succeeds and the open window closes. The trust assumption is a private home
   LAN for the minutes between first boot and first app launch.
-- Every later device is approved from an **already-paired** device
-  ("Allow 'David's iPad'? → Approve"). The operator's existing device is the
-  trust anchor; physical presence is the approve tap.
+- Every later device shows a **six-digit code**, which the operator types into
+  an already-paired device (System → Add a device). The existing device is the
+  trust anchor; holding the new device and reading its code is the physical
+  presence.
+
+  The code is **not a secret defending the hub** — `POST /pair/claim` requires a
+  bearer token, so only an already-paired device can approve anything, and
+  guessing a code gains an attacker nothing they do not already hold. It is a
+  *selector*, proving the operator is looking at the device that is asking.
+  Hence no rate limiter and no attempt counter.
+
+  v1 had the paired device approve a named request instead. Two things sank it.
+  Nothing told the operator a request was waiting, and `UIDevice.current.name`
+  returns the model on iOS 16+ without an entitlement we do not declare, so the
+  prompt read "Allow 'iPhone'?" and identified nothing. A code inverts the
+  initiative: the operator starts from the device already in their hand, so
+  neither discovery nor identity is a problem to solve.
 - **Recovery (fire escape, not front door):** all clients lost or revoked →
   SSH to the hub, `bellasreef pair` opens a bounded **pairing window**
   (default 5 min). This CLI is the only terminal interaction in the system
@@ -29,6 +54,11 @@ One page. If a change makes this longer, the change is probably wrong.
   reopen open pairing. Deleting revoked clients to "reset" would undo the
   protection the recovery is recovering from. A window is spent by the first
   client that uses it, or expires on its own.
+
+  A window **adds** a client; it does not remove one. Replacing a lost phone is
+  therefore two commands: `bellasreef pair` to let the new device in, and
+  `bellasreef revoke` to turn the old one off. Both run on the hub, and they
+  are the only terminal interactions in the system.
 
 No usernames, no passwords, no scopes, no roles, no OAuth2 authorization flows.
 A paired device has full operator rights. Revocation is the only privilege
@@ -44,35 +74,63 @@ operation, and any paired device can do it.
                                                           registered)
 
 2. IDENTIFY   GET /api/v1/info                     [unauthenticated]
-              → { name, version, paired_device_count }
-              Renders the connect screen before any commitment. /info and
-              /healthz are the ONLY unauthenticated endpoints; /info returns
-              nothing sensitive.
+              → { name, api_version, contracts_version, paired_client_count,
+                  pairing_open, approvers_available }
+              Renders the connect screen before any commitment. /info returns
+              nothing sensitive. Note `paired_client_count` counts clients
+              EVER paired, including revoked ones — that is what keeps the
+              TOFU window shut; `approvers_available` is the live count.
 
-3. PAIR       POST /api/v1/pair { device_name }
-              → count==0 : 200 { refresh_token, device_id }    window closes
-              → count>0  : 202 pending; new device polls GET /api/v1/pair/{req_id}
-                           (~every 5 s, 5-min expiry) while a paired client
-                           shows Approve/Deny. Approve → poller gets 200+token.
-                           Poll, not push: push infra does not exist yet (Q1)
-                           and a 30 s wait during a once-ever pairing is fine.
+              The unauthenticated set is exactly: /healthz, /api/v1/info,
+              POST /api/v1/pair, GET /api/v1/pair/{id}, POST /api/v1/token.
+              Everything else requires a bearer. (v1 claimed two. It listed
+              three of the other three itself, two lines later.)
+
+3. PAIR       POST /api/v1/pair { client_name }
+              → count==0 : 200 { refresh_token, client_id }    window closes
+              → count>0  : 202 { request_id, pairing_code, poll_after_s,
+                                 expires_in_s }
+                           New device DISPLAYS pairing_code and polls
+                           GET /api/v1/pair/{request_id} (~every 5 s, 5-min
+                           expiry). Operator types the code into a paired
+                           device, which calls POST /api/v1/pair/claim.
+                           Approved → poller gets 200 + token, once.
+                           A second poll gets 410: one credential per approval.
+                           Poll, not push: push infra does not exist and a
+                           30 s wait during a once-ever pairing is fine.
               → recovery window open : 200 + token, window spent
               → clients exist but ALL revoked, no window : 403
                            nobody can approve, so say so rather than leave
                            the app polling a request no one will ever see.
                            app shows: "run `bellasreef pair` on the hub"
 
+3a. CLAIM     POST /api/v1/pair/claim { code }              [authenticated]
+              → 200 { request_id }   matched a pending request; approved
+              → 404                  no pending request carries that code
+              → 409                  that request is no longer pending
+              Thin resolver in front of POST /api/v1/pair/{id}/approve, which
+              (with /deny) remains the underlying operation.
+
 4. TOKEN      POST /api/v1/token { refresh_token }
               → { access_token, expires_in }
               access_token: JWT, ~15 min. refresh_token: long-lived, bound to
-              the device row, stored in iOS Keychain, dies only on revocation.
+              the client row, stored in iOS Keychain, dies only on revocation.
               Every app launch: silent step 4, then authenticated traffic.
 
 5. USE        Authorization: Bearer <jwt> on all other endpoints.
               GET  /api/v1/clients                list paired clients by name
-              DELETE /api/v1/clients/{id}         revoke (lost phone = one tap)
+              DELETE /api/v1/clients/me           unpair this device
+              DELETE /api/v1/clients/{id}         revoke another device
               WS   /api/v1/stream                 live state+sensor fan-out
               ... (remaining surface per the OpenAPI spec)
+
+              Revoking someone else needs a live token of your own. An
+              operator whose ONLY device is lost has none, so recovery is
+              `bellasreef revoke` on the hub. Opening a recovery window and
+              pairing a replacement does NOT revoke the lost device — the
+              window adds a client rather than clearing state, deliberately
+              (§1), so the two commands are the two halves of replacing a
+              phone.
 ```
 
 Steps 1–4 happen once per device, ever. Every subsequent launch is a silent
@@ -85,9 +143,18 @@ token refresh and straight to the dashboard.
 - Access JWT: short-lived (~15 min), signed with a server-side key generated at
   first boot and stored in Postgres. Claims: `device_id`, `exp`, `iat`. Nothing
   else — there are no roles to claim.
-- Revoking a device deletes its refresh-token hash; outstanding JWTs die at
-  `exp` (≤15 min exposure). No token introspection endpoint, no denylist —
-  that machinery buys nothing at this scale.
+- Revoking a client deletes its refresh-token hash, so no new JWTs can be
+  minted. **As built, revocation is also immediate**, not `exp`-bounded:
+  `current_client` and the WebSocket handshake both check liveness, so an
+  outstanding JWT stops working on the next request. v1 documented the weaker
+  ≤15-minute guarantee; the code is the safer side and this records it.
+  No introspection endpoint and no denylist — that machinery buys nothing when
+  a liveness check is one query.
+
+  **One exception, accepted:** a WebSocket that was already open keeps
+  streaming until the socket drops, because liveness is checked at connect and
+  the send loop does not re-check. In a home the revoked client is your own old
+  phone. See the accepted-risk table in the auth design spec.
 - All auth events publish to `bellasreef.audit.auth` per the existing audit
   contract. **As built:** `pair.tofu_granted`, `pair.requested`,
   `pair.approved`, `pair.denied`, `pair.collected`, `pair.no_approver`,

@@ -1,240 +1,392 @@
 # Bella's Reef — Product Requirements Document
 
-**Version:** 1.4
+**Version:** 2.0
 **Owner:** David / Bella's Reef LLC
-**Date:** 2026-08-09
-**Status:** Active
+**Date:** 2026-08-12
+**Status:** Draft for David's manual review — supersedes v1.4 on approval
 
 ### Changelog
 
-- **1.4 (2026-08-12)** — records the R1 rescoping of 2026-08-10, which changed a
-  P0 requirement's meaning with no version bump at the time. R1 previously
-  required *every* actuator registration to declare safe state, maximum runtime
-  and heartbeat timeout. It now requires that triple only of `authoritative`
-  registrations, and **rejects** a declared safe state on `advisory` or
-  `observe_only` ones, because the system cannot enforce what it cannot command.
-  Under the unscoped wording an advisory device was unregisterable — refused by
-  R1 for lacking a triple and by device-classes.md §2.2 for carrying one. No
-  implementation change accompanies this entry: the code has matched the amended
-  wording since 2026-08-10, and only the version record was missing.
-- **1.3 (2026-08-09)** — stream frame schema published alongside openapi.json.
-- **1.2 (2026-08-09)** — contracts 2.0.0 adds the required actuator `role`.
-- **1.1 (2026-08-09)** — licensing structure (Q3).
-
-**Changelog:**
-- **1.3 (2026-08-09):** G3 footnoted for the WebSocket. The REST client stays 100% generated. The stream's *transport* (connect, first-message auth, reconnect/backoff) is hand-written as a documented exception, because WebSockets are not expressible in OpenAPI 3.1 — but frame **decoding** must use types generated from the published frame JSON Schema. Hand-written frame structs are forbidden. Drift in frame shape stays a compile error, which is the property G3 exists to protect; the transport carries no contract knowledge.
-- **1.2 (2026-08-09):** Auth row restated as device-bound refresh + short-lived JWT, and "no local-trust mode" restated as "no unauthenticated operation" with the TOFU bootstrap window per `docs/contracts/auth.md`. The original wording forbade the pairing bootstrap the auth design requires; the intent — nothing operates unauthenticated — is unchanged. Client-device endpoints renamed `/api/v1/clients` to stop "devices" meaning both sensors/actuators and paired phones.
-- **1.1 (2026-08-09):** Q3 resolved — AGPL-3.0 backend with dual commercial licensing, Apache-2.0 contracts/OpenAPI, closed-source paid iOS app in private repo, CLA-or-no-contributions policy. Q4 partially resolved earlier — Day-1 driver slice (R10a: PCA9685 + DS18B20).
-- **1.0 (2026-08-09):** Initial draft.
+- **2.0 (2026-08-12)** — Identity correction. This version records what the
+  product actually is, correcting drift in both directions: things built with
+  no PRD requirement behind them (device management / PWM discovery, §8 R-PWM
+  block) and things the PRD asserted that the product abandoned (Pi-5-only
+  platform, Docker Compose runtime, open-drain PCA9685 output). Material
+  changes: platform target restated as ARM SBCs with the Pi 5 as the current
+  test platform and deliberate outlier (RP1); PWM discovery/management
+  codified as the core of Phase 1; deployment corrected to native systemd
+  services as-deployed; R10a corrected to the ruled electrical design
+  (totem-pole into an external N-FET stage) and to Pi-native PWM as the
+  first source with PCA9685 as the many-channel option. No new scope: every
+  requirement added here transcribes a ruling already made and, in most
+  cases, code already built. Anything in this document that is neither built
+  nor ruled is marked as such.
+- **1.4 (2026-08-12)** — R1 rescoped to `control_authority: authoritative`
+  (records the 2026-08-10 change; advisory/observe_only must not carry the
+  safety triple).
+- **1.3 (2026-08-09)** — G3 footnoted for the WebSocket: REST client 100%
+  generated; stream transport hand-written as documented exception; frame
+  decoding via types generated from published frame JSON Schema.
+- **1.2 (2026-08-09)** — Auth restated: device-bound refresh + short-lived
+  JWT; "no local-trust mode" → "no unauthenticated operation" with TOFU
+  bootstrap per `docs/contracts/auth.md`; paired phones renamed `/clients`.
+- **1.1 (2026-08-09)** — Licensing (Q3): AGPL-3.0 backend + dual commercial,
+  Apache-2.0 contracts, closed-source paid iOS app.
+- **1.0 (2026-08-09)** — Initial draft.
 
 ---
 
 ## 1. Problem Statement
 
-Reef aquarium automation on open hardware is effectively dead. The incumbent open-source option (reef-pi) is a 2022-era Go monolith with a bus factor of one: its GPIO layer assumes deprecated sysfs interfaces broken by the Raspberry Pi 5's RP1 I/O controller, its frontend is unmaintained, its last major release predates the Pi 5 entirely, and its architecture provides no fail-safe behavior when the host crashes — the failure mode that actually kills livestock. Commercial controllers (Neptune Apex, GHL) are closed, cloud-dependent, and expensive.
+Reef aquarium automation on open hardware is effectively dead. The incumbent
+open-source option (reef-pi) is a 2022-era Go monolith with a bus factor of
+one: its GPIO layer assumes deprecated sysfs interfaces broken by modern
+boards, its frontend is unmaintained, and its architecture provides no
+fail-safe behavior when the host crashes — the failure mode that actually
+kills livestock. Commercial controllers (Neptune Apex, GHL) are closed,
+cloud-dependent, and expensive.
 
-Reefkeepers with technical skills have no modern, safe, maintained, open platform to run on current hardware. The cost of not solving it: tanks run on abandonware, or hobbyists pay $800+ for closed ecosystems, or they hand-roll one-off scripts with no safety engineering.
+Reefkeepers with technical skills have no modern, safe, maintained, open
+platform to run on current hardware. The cost of not solving it: tanks run on
+abandonware, hobbyists pay $800+ for closed ecosystems, or they hand-roll
+one-off scripts with no safety engineering.
 
 ## 2. Product Vision
 
-Bella's Reef is a production-grade, open reef automation platform published by Bella's Reef LLC. Modern stack only, no legacy accommodation, safety as a first-class architectural concept. Phase 1 runs entirely on a single Raspberry Pi 5-class board; the architecture is hub-and-spoke from day 1 so that distributed edge nodes are a deployment change, not a rewrite.
+Bella's Reef is a production-grade, open reef automation platform published by
+Bella's Reef LLC: an open (AGPL) backend running on commodity ARM single-board
+computers, controlled by a paid native iOS app, with safety as a first-class
+architectural concept.
+
+**Platform identity (corrected in v2.0):** the backend targets **ARM SBCs
+running modern Linux (kernel 6.x+)** — not one board. The Raspberry Pi 5 is
+the *current test platform* and is deliberately the outlier: its RP1 I/O
+controller is unlike anything else on the market, so a system proven against
+it and against a conventional SoC board (Raspberry Pi 3B+, BananaPi M64, or
+similar) is proven portable. Hardware access goes through current kernel
+interfaces only (libgpiod v2 character device, `/sys/class/pwm`, kernel w1) —
+never board-specific libraries or deprecated sysfs GPIO — because that is
+what makes one codebase serve many boards.
+
+**Phase 1 in one sentence:** prove the full vertical — sensing, PWM device
+management, lighting control, alerting, history, fail-safety, iOS app — on
+the reference tank, where **PWM discovery/management/operation is the core
+deliverable** (lighting is its vehicle) and 1-wire temperature is the solved,
+portable sensing baseline. Phase 2 extends the same machinery to pumps,
+relays/heat, ATO, and dosing, and to distributed spokes.
 
 **Product principles (non-negotiable):**
 
-1. **Build once, build right.** Every component is the production choice from the first commit. No staging-grade stand-ins anywhere in the stack, no "swap it later."
-2. **Modern floor, no legacy tax.** Linux kernel 6.x+, Raspberry Pi 5+ class hardware, iOS 26+, current stable toolchains. Old platforms are unsupported, stated plainly.
-3. **Fail-safe is architecture, not a feature.** Every actuator has a declared safe state and hardware-enforceable interlocks. Software bugs must not be able to kill a tank.
-4. **API-first.** The API contract is the product. Every client (iOS, web, future integrations) consumes the same versioned, self-documenting API. Nothing reaches around it.
+1. **Build once, build right.** Every component is the production choice from
+   the first commit. No staging-grade stand-ins, no "swap it later."
+2. **Modern floor, no legacy tax.** Kernel 6.x+, arm64, current stable
+   toolchains, iOS 26+. Old platforms unsupported, stated plainly.
+3. **Fail-safe is architecture, not a feature.** Every authoritative actuator
+   has a declared safe state and enforceable interlocks below the control
+   logic. Software bugs must not be able to kill a tank.
+4. **API-first.** The API contract is the product. Every client consumes the
+   same versioned, self-documenting API. Nothing reaches around it.
+5. **The PRD is the ceiling.** Scope enters this document only by the owner's
+   explicit decision — never from review, archaeology, or "while we're in
+   there." (The predecessor projects died of accretion; see
+   docs/prior-art-review.md header.)
 
 ## 3. Goals
 
 | # | Goal | Measure |
 |---|------|---------|
-| G1 | A complete tank (temp, ATO, lighting, equipment scheduling, dosing) runs on one Pi 5 with no external services | Full control of reference tank; 30 consecutive days without manual intervention |
-| G2 | Provable fail-safety | Kill the hub process, kill the container runtime, pull power to the Pi mid-cycle: all actuators reach declared safe state within their timeout in every test |
-| G3 | Generated, drift-free iOS client | REST client 100% generated from the OpenAPI spec. Stream frames decoded via types generated from the published frame JSON Schema. Contract changes surface as compile errors. Only the WebSocket *transport* is hand-written — see the v1.3 footnote |
-| G4 | Phase 2 requires no contract changes | An ESP32 spoke joins the running system by publishing on the existing NATS subject schema, with zero changes to control engine, API, or clients |
-| G5 | Installable by a stranger | Fresh Pi 5 + NVMe to fully running system via documented steps + `docker compose up` in under 30 minutes |
+| G1 | Phase-1 tank (temperature monitoring + alerting, managed PWM lighting) runs unattended on one SBC hub | Reference tank, 30 consecutive days without manual intervention |
+| G2 | Provable fail-safety | Kill the hub process, kill services, pull power mid-cycle: all authoritative actuators reach declared safe state within their timeout, every drill |
+| G3 | Generated, drift-free iOS client | REST client 100% generated from OpenAPI; stream frames decoded via types generated from published frame schema; contract drift = compile error. Only the WS transport is hand-written (v1.3 footnote) |
+| G4 | Adding hardware sources or spokes requires no contract changes | A new PWM source (or, Phase 2, an ESP32 spoke) joins by implementing the existing driver contract / publishing on the existing subjects — zero changes to engine, API, clients |
+| G5 | Installable by a stranger | Fresh supported SBC to running system via documented steps in under 30 minutes |
+| G6 | Portability proven, not claimed | The identical codebase runs the Phase-1 vertical on the Pi 5 (RP1) **and** one conventional-SoC ARM board, differing only in host setup documentation |
 
 ## 4. Non-Goals (v1)
 
-- **ESP32/Pico edge nodes.** Phase 2. Phase 1 designs the message contract they will use, builds nothing for them.
-- **Home Assistant integration.** Valuable, not day-1 priority. The NATS/API surface makes it a clean later add.
-- **Android app.** iOS first. The generated-client approach makes Android a future decision, not a debt.
-- **Cloud service / hosted accounts.** v1 is self-hosted and local-network + user-managed remote access. (Push notification relay is an open question — see §11.)
-- **Support for Pi 4 or earlier, 32-bit OSes, kernel <6.x, SD-card storage, iOS <26.** Explicitly unsupported. Documented as hard requirements, not recommendations.
-- **Built-in charting/dashboard suite.** VictoriaMetrics is Grafana-compatible; power users point Grafana at it. The web UI and iOS app show operational state and focused charts, not a BI tool. Reef-pi spent years rebuilding a worse Grafana; we will not.
-- **Multi-user roles/permissions.** Single-operator token auth in v1. Real auth from day 1, but no RBAC.
+- **ESP32/Pico edge nodes.** Phase 2. The contracts they will speak are
+  designed now; nothing is built for them.
+- **Home Assistant integration.** Clean later add off the spine.
+- **Android app.** iOS first; generated-client approach keeps it a future
+  decision, not a debt.
+- **Cloud service / hosted accounts.** Self-hosted, local-network +
+  user-managed remote access. (Push relay is Q1.)
+- **32-bit OSes, kernel <6.x, SD-card primary storage, iOS <26.** Unsupported,
+  stated plainly. (v2.0 note: the v1.x "Pi 4 or earlier unsupported" line is
+  withdrawn — conventional-SoC boards including Pi 3B-class are validation
+  targets per G6. What is unsupported is old kernels and 32-bit userlands,
+  not board families.)
+- **Built-in charting/BI suite.** VictoriaMetrics is Grafana-compatible;
+  the apps show operational state and focused charts only.
+- **Multi-user roles/RBAC.** Single operator; paired clients are fully
+  trusted. Real auth from the first endpoint, no role system.
+- **Vendor-cloud light control (Kessil K-Link etc.).** Advisory/vendor-bridge
+  territory, Phase 2+; see docs/device-classes.md.
 
 ## 5. Users
 
-- **Primary (v1):** Technical reefkeeper. Comfortable with Docker, SSH, and wiring a relay board. Currently on reef-pi, a dead fork, or hand-rolled scripts.
-- **Secondary (post-v1):** Capable hobbyist who can follow precise documentation. Drives the "installable by a stranger" goal but is not the design center for v1 UX.
+- **Primary (v1):** technical reefkeeper, comfortable with SSH and wiring.
+  Currently on reef-pi, a dead fork, or hand-rolled scripts.
+- **Secondary (post-v1):** capable hobbyist following precise documentation.
+  Drives G5; not the v1 UX design center.
 
 ## 6. User Stories
 
 **Safety (highest priority)**
-- As a reefkeeper, I want every actuator to revert to its declared safe state when the controller stops responding, so that a software crash cannot cook or flood my tank.
-- As a reefkeeper, I want the ATO pump limited by a hard maximum-runtime interlock enforced below the control logic, so that a stuck float/optical sensor cannot cause a salinity crash or flood.
-- As a reefkeeper, I want to run the platform in shadow mode against my current controller — logging every decision, actuating nothing — so I can validate its logic on my real tank before trusting it.
+- Every actuator the system commands reverts to its declared safe state when
+  the controller stops responding, so a crash cannot cook, flood, or blind a
+  tank.
+- (Phase 2) The ATO pump is limited by a hard max-runtime interlock enforced
+  below control logic, so a stuck sensor cannot cause a flood.
+- (Phase 2 gate) Shadow mode: the full pipeline runs and journals every
+  intended actuation while actuating nothing, to validate logic on a real
+  tank before trusting it.
+
+**Device management (v2.0 — the Phase-1 core)**
+- As an operator, I can see what controllable hardware my hub has — PWM
+  channels by source, the 1-wire bus — without editing files over SSH.
+- As an operator, I assign a channel a name, a location, and a role ("Blue
+  LEDs / Display tank / light"), because no bus can discover what a human
+  wired; the app then surfaces the device where its role belongs.
+- As an operator, discoverable hardware (1-wire probes, each carrying its
+  own ROM identity) announces itself and I adopt it; undiscoverable slots
+  (PWM channels) exist only by my declaration, and a taken channel refuses a
+  second declaration.
+- A device keeps its identity — name, thresholds, history, alert episodes —
+  when its wiring moves to different silicon. Rebinding is not re-creation.
 
 **Core control**
-- As a reefkeeper, I want temperature control with configurable heater/chiller hysteresis so the tank holds setpoint without equipment short-cycling.
-- As a reefkeeper, I want ATO driven by sensor input with consumption tracking, so top-off is automatic and drift from baseline is visible.
-- As a reefkeeper, I want multi-channel LED scheduling (diurnal/ramp profiles) so lighting follows a natural photoperiod without manual switching.
-- As a reefkeeper, I want equipment scheduling (return, skimmer, wavemakers) with per-device schedules and manual override, so maintenance mode is one action, not five.
-- As a reefkeeper, I want dosing executed as journaled transactions with reconciliation against container level, so a doser cannot silently drift for months.
+- Multi-channel LED scheduling with diurnal/ramp profiles so lighting follows
+  a photoperiod without manual switching; manual override with visible
+  auto-revert.
+- (Phase 2) Temperature control with hysteresis; equipment scheduling;
+  journaled dosing with reconciliation; ATO with consumption tracking.
 
 **Monitoring & alerting**
-- As a reefkeeper, I want alerts on derived signals — pH rate-of-change, heater duty-cycle creep, ATO consumption trend — so I learn about a failing heater or a leak before it becomes an emergency.
-- As a reefkeeper, I want live sensor state and alert history in the iOS app so I can check the tank from anywhere I have connectivity to the hub.
-- As a reefkeeper, I want a complete audit log of every command, config change, and actuator state transition, so post-incident analysis is reconstruction, not guesswork.
+- Live sensor state and alert history on my phone, anywhere I can reach the
+  hub.
+- Threshold alerts with hysteresis, and silence alerts when a sensor stops
+  reporting — "nobody knows" is its own alarm, distinct from "out of band."
+- A complete append-only audit record of commands, config changes, auth
+  events, and state transitions, queryable via API.
 
 **Operations**
-- As an operator, I want the entire system deployed and upgraded via pinned Compose images, so upgrades are atomic and rollback is a tag change.
-- As an operator, I want full backup/restore of config and journals, so hardware replacement is an hour, not a rebuild.
+- Deploy and upgrade with one verified command; rollback is a revision
+  change.
+- One-command backup producing a restorable archive; restore onto fresh
+  hardware is an hour, not a rebuild.
 
-## 7. Architecture (decided)
+## 7. Architecture (decided, as-deployed)
 
 ### 7.1 Topology
 
-Phase 1: single Pi 5-class hub. Five services + message spine, all containerized:
+Phase 1: single SBC hub. Three Python services + spine + stores, running as
+**native systemd services** with per-service `EnvironmentFile` configuration
+(v2.0 correction: the v1.x containerized-topology description never matched
+the deployed system; supervision, watchdog restart, and the deploy gate are
+built on systemd):
 
-```
-┌────────────────────────── Pi 5 hub (Linux 6.x+, NVMe) ─────────────────────────┐
-│                                                                                │
-│  web-ui (SPA)   ios app (external)                                             │
-│        │             │                                                         │
-│        ▼             ▼                                                         │
-│  ┌──────────────────────────┐        ┌──────────────┐   ┌──────────────────┐   │
-│  │ api  (FastAPI, stateless)│◄──────►│ postgres 17  │   │ victoria-metrics │   │
-│  └────────────┬─────────────┘        └──────▲───────┘   └────────▲─────────┘   │
-│               │  NATS + JetStream           │                    │             │
-│  ┌────────────▼─────────────┐               │                    │             │
-│  │ control-engine           │───────────────┘ (journal/audit)    │ (metrics)   │
-│  └────────────┬─────────────┘                                    │             │
-│               │  same subject contract future spokes speak       │             │
-│  ┌────────────▼─────────────┐────────────────────────────────────┘             │
-│  │ hardware-io  (sole owner │                                                  │
-│  │ of /dev/gpiochip*, i2c,  │                                                  │
-│  │ 1-wire, serial)          │                                                  │
-│  └──────────────────────────┘                                                  │
-└────────────────────────────────────────────────────────────────────────────────┘
-```
+- **hardware-io** — sole owner of hardware interfaces (`/dev/gpiochip*`,
+  I2C, `/sys/class/pwm`, kernel w1). Announces capabilities, instantiates
+  drivers from registry assignments, enforces interlocks and heartbeat-loss
+  safe-state locally. Knows nothing about reef logic. Must run with the
+  database dead.
+- **control-engine** — all control loops, scheduling, interlock supervision.
+  Sole command publisher. Emits nothing while system time is untrusted.
+- **api** — stateless FastAPI front door: REST + WebSocket bridge to NATS,
+  registry writes, telemetry and audit writers (spine consumers with
+  Postgres/VM access live here, keeping hardware-io store-free).
+- **postgres 17** — devices/registry, auth, alert episodes, audit (append-only
+  by trigger), hub identity, dosing journal (Phase 2). Alembic, forward-only.
+- **victoria-metrics** — all telemetry and derived series, push-based writer,
+  retention/downsampling, Grafana-compatible.
+- **NATS + JetStream** — durable commands with expiry and idempotency;
+  retained registry/capability announcements; core pub/sub telemetry fan-out.
 
-- **hardware-io** is the only container with device access. It exposes sensors/actuators over the versioned NATS subject schema and knows nothing about reef logic.
-- **control-engine** holds all control loops, interlock supervision, and scheduling. It is the sole command publisher to actuators. It does not run inside the API process.
-- **api** (FastAPI + Pydantic v2) is a stateless front door: REST + WebSocket bridge to NATS subjects. Publishes commands, never touches hardware or control state directly.
-- **Phase 2** = ESP32/Pico spokes publishing on the same subjects over the network. Deployment topology change only (Goal G4).
+Phase 2 = spokes (another SBC's hardware-io, or ESP32 firmware) publishing on
+the same subjects over the network; deployment topology change only (G4).
 
 ### 7.2 Locked technology decisions
 
 | Layer | Decision | Notes |
 |---|---|---|
-| Host | Raspberry Pi 5+ class, arm64, Linux kernel 6.x+ | Hard floor |
-| Storage | NVMe **required** | SD unsupported; Postgres WAL + metrics ingest will destroy SD media |
-| Runtime | Docker Compose, pinned multi-arch (arm64/amd64) images | Least-privilege: specific devices passed to hardware-io only; no privileged containers; no k8s |
-| Relational | PostgreSQL 17 | Config, dosing journal, calibration records, audit log. Alembic migrations from schema v1 |
-| Time-series | VictoriaMetrics | Telemetry + derived metrics; PromQL; built-in retention/downsampling; Grafana-compatible |
-| Message spine | NATS + JetStream | JetStream for durable command delivery (commands survive restarts or explicitly expire — never silently vanish); core pub/sub for live telemetry fan-out |
-| API | FastAPI + Pydantic v2, OpenAPI-first | OpenAPI spec is a published, versioned artifact |
-| iOS client | Swift/SwiftUI, iOS 26+, client generated via swift-openapi-generator | Zero hand-written bindings |
-| Web UI | Standalone SPA container consuming the same API + WebSocket as iOS | Two independent clients keep the contract honest |
-| Auth | Token auth (device-bound refresh + short-lived JWT) from the first endpoint | No unauthenticated operation; TOFU bootstrap window per `docs/contracts/auth.md`. No retrofit |
-| GPIO/I2C | libgpiod v2 / kernel character device | No sysfs, no RPi.GPIO shims |
-| Observability | Structured JSON logs + metrics from every service, day 1 | |
-| CI | Multi-arch builds + API contract tests from repo creation | |
+| Host | ARM SBC, arm64, Linux kernel 6.x+ | Pi 5 = current test platform (RP1 outlier); one conventional-SoC board required for G6. Per-board facts live in host docs, never in code |
+| Storage | NVMe/SSD required for production hubs | SD unsupported for production (WAL + metrics ingest). Dev-box deviations recorded in Verified host facts |
+| Runtime | Native systemd services, EnvironmentFile config, journald logs | v2.0 as-deployed correction. `deploy-pi.sh`: CI-green → deploy → telemetry verified, all three |
+| Relational | PostgreSQL 17, Alembic forward-only | |
+| Time-series | VictoriaMetrics, push-based writer | |
+| Spine | NATS + JetStream | Durable commands (expiry + idempotency, dedup at terminal stores); retained announcements; telemetry fan-out |
+| API | FastAPI + Pydantic v2, OpenAPI-first | Spec + frame schemas published as one CI artifact |
+| iOS | Swift/SwiftUI, iOS 26+, swift-openapi-generator | Native platform conventions are requirements, not debates |
+| Web UI | Deferred to Phase 5 (hardening); structural config via API/Swagger meanwhile | v2.0 records the standing deferral ruling |
+| Auth | Device-bound refresh + short-lived JWT; TOFU bootstrap per docs/contracts/auth.md | No unauthenticated operation; /info and /healthz only public endpoints |
+| Hardware access | libgpiod v2 char device; `/sys/class/pwm` (the kernel PWM ABI); kernel w1 | No deprecated sysfs GPIO, no board-specific libraries |
+| Observability | Structured JSON logs + Prometheus metrics per service; hub telemetry in VM | |
+| CI | Lint, mypy --strict, tests, multi-arch build; env-dependent skips fail the gate; integration tests use ephemeral infra with a production-endpoint guard | |
 
-### 7.3 Versioned contracts (published artifacts from day 1)
+### 7.3 Versioned contracts (published artifacts)
 
-1. **NATS subject schema + payload models** — e.g. `bellasreef.sensor.temp.<probe_id>`, `bellasreef.cmd.outlet.<device_id>`, `bellasreef.state.<device_id>`. This contract is the phase-2 enabler and the third-party integration surface. Semantic versioning; breaking changes are migrations.
-2. **OpenAPI spec** — source of truth for all clients.
-3. **Hardware driver interface** — the abstraction hardware-io implementations satisfy. Documented and stable even with one implementation in v1; this is the piece that cannot be retrofitted once drivers accumulate (reef-pi's driver-zoo failure in origin form).
+1. **NATS subjects + Pydantic payload models** (`bellasreef.*`): sensors,
+   commands, state, heartbeats, alerts, silence, registry/capability
+   announcements. Semver; the versioning table in
+   docs/contracts/nats-subjects.md governs bump class. The pre-1.0 exception
+   closes permanently at the first tagged release.
+2. **OpenAPI spec + stream frame JSON Schemas** — one artifact; source of
+   truth for all clients.
+3. **Hardware driver interface** — async reads with per-driver cadence,
+   calibration hook, chip-label addressing; the seam that makes G4/G6 true.
 
 ## 8. Requirements
 
-### P0 — v1 does not ship without these
+### P0 — Phase 1 does not ship without these
 
-**Safety framework**
-- R1. Every actuator registration declares a `control_authority`. Registrations with `control_authority: authoritative` must additionally declare safe state, maximum continuous runtime, and heartbeat timeout; registration without all three is rejected. Registrations with `control_authority: advisory` or `observe_only` must not declare a safe state; a declared safe state is rejected rather than ignored, because the system cannot enforce it.
-  - *AC:* Given a registered heater outlet, when control-engine heartbeat is absent for the declared timeout, then hardware-io drives the outlet to safe state and emits an audit event. Verified for process kill, container kill, and NATS outage.
-- R2. ATO hard interlock: maximum pump runtime per window enforced in hardware-io (below control logic), independent of sensor state.
-  - *AC:* Given a stuck-on ATO sensor reading, when cumulative pump runtime hits the cap, then the pump is forced off, latched, and an alert fires; latch clears only by explicit operator action.
-- R3. Shadow mode: full pipeline runs, every intended actuation is journaled, zero actuation occurs.
-  - *AC:* Given shadow mode enabled, when any control loop decides an action, then the decision is journaled with full context and no device state changes. Mode transition is a logged, authenticated operation.
-- R4. Command lifecycle: every actuator command is durable (JetStream), idempotent, and carries an expiry. Expired commands are dropped and audited, never executed late.
+**Safety framework** *(built; drills verified except where noted)*
+- R1. Every actuator registration declares `control_authority`.
+  `authoritative` registrations must declare safe state, max continuous
+  runtime, and heartbeat timeout — missing any is rejected. `advisory` /
+  `observe_only` must **not** declare a safe state — one is rejected, because
+  the system cannot enforce what it cannot command.
+  - *AC:* heartbeat absent past timeout → hardware-io drives safe state +
+    audit event; verified for process kill, service kill, NATS outage.
+- R2. *(Phase 2, stays P0 for its module)* ATO hard interlock below control
+  logic, latch-until-operator.
+- R3. *(Phase 2 gate)* Shadow mode: journal every intended actuation,
+  actuate nothing; mode transition logged and authenticated.
+- R4. Command lifecycle: durable, idempotent, expiring; expired commands are
+  dropped-and-audited at the consumer, never executed late. *(built,
+  wire-tested)*
+
+**Device management (v2.0 — codifies the built registry)**
+- R-DM1. **Capabilities are discovered facts.** hardware-io announces what
+  controllable hardware exists (PWM sources with channel counts from the
+  kernel, the w1 bus) on retained subjects; the API stores and serves them
+  with per-channel bound state. The hub never assumes a channel count.
+- R-DM2. **Devices are operator decisions.** A device binds a capability
+  channel (or a discovered probe) with a stable id plus operator-owned name,
+  location, and role. Role (`light` now; `heater`/`pump`/`doser`/`outlet`
+  reserved) determines where clients surface the device.
+- R-DM3. **Adopt vs declare.** Hardware with intrinsic identity (1-wire ROM)
+  announces and is adopted; identity-less slots (PWM channels) exist only by
+  declaration, and a taken channel returns conflict, never a second identity.
+- R-DM4. **Identity survives rebinding.** Matching is on binding identity
+  before creation; moving a device to different silicon changes only its
+  driver binding — name, thresholds, episodes, and series continue.
+  Removing a device removes all its representations: row, retained
+  announcements, series.
+- R-DM5. **PWM sources are interchangeable drivers** behind one contract:
+  native SoC PWM (`/sys/class/pwm`) and PCA9685-class I2C expanders,
+  selectable per channel, invisible above hardware-io. Board pin mappings
+  are host documentation, not code.
+- R-DM6. Operator flow is API-first (find capabilities → assign), with a
+  seeding CLI that writes through the same API. *(App find/assign screens:
+  staged, not yet built.)*
 
 **Control modules**
-- R5. Temperature: heater + optional chiller, hysteresis control, probe-loss handling (probe loss → safe state + alert, never last-known-value control).
-- R6. ATO: sensor-driven top-off with consumption metering and baseline-drift tracking.
-- R7. Lighting: multi-channel PWM scheduling with diurnal/ramp profiles per channel.
-- R8. Equipment: named outlets, cron-style schedules, manual override with automatic reversion timer, one-action maintenance mode (grouped overrides).
-- R9. Dosing: journaled transactions in Postgres (intent → execution → confirmation), per-dose and per-day volume caps, reconciliation workflow against measured/entered container level, drift alerting.
+- R5–R6, R8–R9. Temperature control, ATO, equipment, dosing: **Phase 2**,
+  gated behind relay drivers + drills + shadow mode. Wording unchanged from
+  v1.4; sequencing corrected in §10.
+- R7. Lighting: multi-channel PWM scheduling, diurnal/ramp profiles per
+  channel, per-profile timezone, midnight-wrap interpolation, converge-with-
+  slew on restart, overrides as monotonic durations with lapse-on-wake,
+  clock-trust gating. *(built and tested; has never driven a real light —
+  see §12 status)*
 
-**Sensors/drivers (v1 hardware-io)**
-- R10a. **Day-1 driver slice:** PCA9685 PWM over I2C (LED dimming; open-drain mode, parallel Mean Well XLG-AB-class drivers) and DS18B20 1-wire temperature. These two prove the full vertical: driver contract → hardware-io → NATS subjects → control-engine → telemetry → API → clients. Both implemented against the driver interface contract (§7.3.3).
-- R10b. **Remaining v1 drivers:** GPIO out (relays), GPIO digital in (float/optical), ADS1115 ADC path (pH/analog), Atlas Scientific EZO (I2C). Same contract; landed after the Day-1 vertical is proven. Calibration records for all drivers stored in Postgres. Heater and ATO circuits wire on normally-open relay contacts so coil de-energize = load off — power loss itself is the ultimate safe state.
+**Drivers (Phase 1)**
+- R10a *(corrected v2.0)*. **Day-1 slice:** DS18B20 1-wire temperature
+  (multi-probe, CRC/fault discipline, measured-latency timeout floor) and
+  PWM dimming from **two sources behind one contract** — native RP1 PWM
+  (GPIO12/13 on the test platform) and PCA9685 over I2C. Output stage per
+  the 2026-08-11 ruling: PCA9685 runs totem-pole into an **external N-FET
+  per channel** (LEDn pins are 5.5 V-max; the withdrawn open-drain/10 V
+  pull-up design is recorded in Verified host facts); polarity constants are
+  set by bench measurement, not derivation. Sub-8% duty snaps to 0 (XLG-AB
+  undefined band). Safe state = dark, proven by measurement before any hub
+  wired to lights registers the driver.
+- R10b. **Phase 2 drivers:** GPIO relays (normally-open contacts so
+  de-energize = off), digital inputs, ADS1115, Atlas EZO. Same contract.
 
 **Platform**
-- R11. Telemetry: all sensor readings and actuator states into VictoriaMetrics with per-metric retention policy.
-- R12. Alerting: rule engine over raw and derived signals (rate-of-change, duty-cycle, consumption trend) with at minimum webhook + email delivery in v1.
-- R13. Audit log: append-only record of every command, config change, auth event, and state transition, queryable via API.
-- R14. Backup/restore: one command produces a restorable archive of Postgres + config; documented restore path onto fresh hardware.
-- R15. API completeness: every capability above is exposed via the OpenAPI-documented API; web UI and iOS use only that API.
-- R16. iOS app (iOS 26+, SwiftUI): live dashboard, alert list + acknowledgement, manual overrides, shadow-mode review. Generated client only.
-- R17. Web UI: full configuration surface (device registration, calibration, schedules, dosing setup, alert rules) + operational dashboard.
+- R11. All readings and actuator states into VictoriaMetrics with the
+  authority/transport label set from first write; envelope-preserving
+  downsampled history via API.
+- R12. Alerting: per-device thresholds with hysteresis **and per-device
+  silence detection** (6× cadence, 30 s floor) as distinct episode classes
+  that coexist; episodes persisted before publish; in-app delivery now,
+  webhook/email before Phase-1 ship *(webhook/email: not built)*.
+- R13. Append-only audit (trigger-enforced), exactly-once at rest via
+  message-id dedup, queryable via API.
+- R14. One-command backup (Postgres + VM snapshot + manifest with schema
+  revision, contracts version, hub identity, explicit omissions);
+  restore refuses forward schemas and corrupt archives loudly; restore
+  round-trip proven including auth continuity.
+- R15. API completeness: every capability above via the OpenAPI-documented
+  API; clients use only that API.
+- R16. iOS app: live dashboard, sensor management (rename/thresholds/
+  primary), alert display per the design brief's semantic-color law,
+  History with honest gaps and alert bands, System/clients management.
+  §7 of docs/ios-design-brief.md is review law.
+- R17. Web UI: full structural-config surface — **deferred to Phase 5**;
+  structural config via API/Swagger until then (standing ruling, recorded).
 
-### P1 — fast-follow candidates
+### P1 — fast-follow candidates (unchanged; enter only by owner decision)
 
-- Salinity-aware ATO: conductivity probe closes the loop; dual-reservoir (RODI/saltwater) top-off corrects salinity drift in both directions.
-- APNs push notifications (dependent on cloud-relay decision, §11).
-- Leak detection (moisture sensors + ATO-trend correlation).
-- Feed mode / additional macro-style grouped actions beyond maintenance mode.
-- Grafana dashboard pack shipped as importable JSON.
+Salinity-aware ATO · APNs push (Q1) · leak detection · feed mode ·
+Grafana dashboard pack.
 
 ### P2 — architectural insurance (design for, do not build)
 
-- ESP32/Pico W spoke firmware speaking the subject contract (build-vs-adopt-ESPHOME decision deferred, §11).
-- Home Assistant integration (MQTT bridge or native integration off the NATS spine).
-- Multi-tank support under one hub (subject schema already namespaces per device; keep tank-scoping in mind in config schema).
-- Android client (generated from the same OpenAPI spec).
+ESP32/Pico spokes (Q5) · Home Assistant · multi-tank scoping · Android ·
+vendor-bridge for advisory devices (Kessil et al., per device-classes.md,
+with encrypted credential storage mandatory when it exists).
 
 ## 9. Success Metrics
 
-**Leading (first 60 days of reference-tank operation)**
-- Fail-safe drill pass rate: 100% across all drill types (G2), run weekly.
-- Shadow-mode disagreement rate vs. incumbent controller: <2% of decisions after tuning, with every disagreement explained.
-- Uptime of control-engine decisions delivered on schedule: ≥99.9% (measured from its own metrics).
-- Install-from-scratch time (G5): <30 min, tested by someone who is not the author.
+- Fail-safe drill pass rate 100%, run weekly (G2).
+- G6 portability run: Phase-1 vertical green on a second, conventional-SoC
+  board with only host-doc changes.
+- Install-from-scratch < 30 min by someone who is not the author (G5).
+- ≥ 99.9% on-schedule engine decision delivery, self-measured.
+- 30 unattended days on the reference tank (G1).
+- Post-publication: external installs; third-party drivers/spokes against the
+  published contracts; **zero livestock-loss incidents attributable to
+  controller logic** — the metric that matters.
 
-**Lagging (post-publication)**
-- External installs reporting successful 30-day runs.
-- Third-party driver or spoke implementations against the published contracts (the real signal the contract-first bet paid off).
-- Zero livestock-loss incidents attributable to controller logic. This is the metric that matters.
+## 10. Phasing (dependency-driven; no external deadline)
 
-## 10. Timeline & Phasing
-
-No hard external deadline. Sequencing is dependency-driven:
-
-1. **Contracts first:** NATS subject schema, driver interface, OpenAPI skeleton, Postgres schema v1 + Alembic. CI + multi-arch builds live before feature code.
-2. **Spine + safety + Day-1 vertical:** hardware-io with safety framework (R1–R4) and the Day-1 driver slice (R10a: PCA9685 dimming + DS18B20 temp). Fail-safe drills passing before any control logic ships. Lighting schedules (R7) and temperature monitoring land first because they exercise the entire stack end-to-end with the lowest-risk actuator class — a dimmed light failing safe is a non-event; a heater is not.
-3. **Control modules:** temperature *control* (R5, heater actuation) waits for GPIO relay drivers (R10b) and passed drills; then R6, R8, R9 individually, each entering service via shadow mode on the reference tank.
-4. **Clients:** API completeness (R15), web UI (R17), iOS app (R16) — iOS starts as soon as the OpenAPI spec stabilizes for the dashboard surface.
-5. **Hardening + publication:** backup/restore, docs, stranger-install test, LLC publication under the licensing structure in Q3 (resolved).
-
-Gate between 2→3 is explicit: no control loop actuates a real tank until safety drills pass.
+1. **Done:** contracts; spine + safety framework + drills; sensing vertical
+   (probe → app); alerting (threshold + silence); history; auth/pairing;
+   backup/restore; supervision + verified deploy; capabilities tier +
+   identity-safe registry.
+2. **Current:** registry-driven hardware-io (retiring file topology), seeding
+   CLI, device find/assign in the app; then the **bench session** — output
+   stage measured, polarity constants set from volts, first light, drills
+   against the real channel. Gate unchanged: no control loop actuates a real
+   tank until its drills pass.
+3. **Steady-state tag (v0.1.0):** docs consolidated to as-built, stranger
+   install run, status.md from verified evidence only; external review
+   begins. Closes the contracts pre-1.0 exception.
+4. **G6 portability run** on a conventional-SoC board.
+5. **Phase 2:** relays + temperature control via shadow mode, ATO, equipment,
+   dosing; spokes; vendor-bridge — each entering by owner decision.
 
 ## 11. Open Questions
 
 | # | Question | Blocks | Owner |
 |---|---|---|---|
-| Q1 | **Cloud relay for push:** APNs requires a hosted relay — does Bella's Reef LLC run minimal notification infrastructure, or does v1 ship webhook/email only and defer push? Weight increased by Q3 resolution: a paid App Store app makes push table stakes. | P1 push work; iOS alert UX design | David (business + architecture) |
-| Q2 | **Remote access story:** Tailscale-first documented pattern vs. anything built-in. Leaning documented-pattern; confirm. | Docs, iOS connectivity UX | David |
-| Q3 | **RESOLVED (2026-08-09):** Backend AGPL-3.0 with dual commercial licensing offered by Bella's Reef LLC (bundlers/OEMs buy out of the AGPL disclosure obligations). Contracts package + OpenAPI spec: Apache-2.0, same public repo, so third-party clients stay unencumbered. iOS app: closed-source, paid App Store product, separate private repo (`clients/ios/` in the public tree becomes a README pointer). Contribution policy: CLA required or contributions not accepted — LLC must retain relicensing rights for the commercial side; policy set before the repo goes public. Commercial license text to be reviewed by an IP attorney before first sale. | — | Closed |
-| Q4 | **Reference tank inventory — partially resolved:** Day-1 slice decided (PCA9685 dimming + DS18B20 temp, R10a). Remaining: relay channel count, float/optical sensor count, and pH probe strategy (ties to Q6) for R10b ordering. | R10b build order | David |
-| Q5 | **Phase 2 spoke firmware:** custom minimal firmware speaking the subject contract vs. adopting ESPHome and bridging. No v1 work either way; decision influences how strictly the subject schema mirrors ESPHome concepts. | Nothing in v1 (non-blocking) | David |
-| Q6 | **pH/probe strategy:** ADS1115 + analog boards vs. standardizing on Atlas EZO across the board (cost vs. calibration workflow quality). | R10 details (non-blocking, both supported by driver contract) | David |
+| Q1 | Push relay: LLC-hosted APNs infrastructure vs webhook/email-only v1. Weight raised by paid-app decision | P1 push; iOS alert UX | David |
+| Q2 | Remote access: documented Tailscale-first pattern vs anything built-in | Docs; iOS connectivity UX | David |
+| Q3 | **RESOLVED** — licensing structure (see v1.1 changelog) | — | Closed |
+| Q4 | Phase-2 hardware inventory: relay channel count, float/optical count, pH strategy (ties Q6) | R10b ordering | David |
+| Q5 | Spoke firmware: custom minimal vs ESPHome-bridge | Nothing in Phase 1 | David |
+| Q6 | pH probe strategy: ADS1115+analog vs Atlas EZO | R10b detail | David |
+| Q7 | **(new)** Second validation board for G6: Pi 3B+ (on hand) vs BananaPi M64 vs other | G6 scheduling only | David |
 
----
+## 12. Status honesty (v2.0)
 
-*Next artifacts on request: engineering ticket breakdown from R1–R17, NATS subject schema draft, or Postgres schema v1 draft.*
+This section exists so the PRD cannot silently claim more than the tree:
+**verified** = sensing, alerting, history, auth, ops, registry tier per §10
+item 1. **Built-unverified** = the entire lighting/PWM control path — no
+photon has ever moved; PCA9685 polarity awaits the meter. **Absent** = all
+Phase-2 modules, web UI, push delivery, app find/assign screens, G6 run.
+The independent evidence audit (docs/review/, in progress) is the source of
+record; where this section and that audit disagree, the audit wins.
