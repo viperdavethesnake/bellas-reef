@@ -221,3 +221,38 @@ Ledger of completed items. One line each: timestamp, item, commit, result.
 | 2026-08-12 15:10 | `DELETE /api/v1/devices/{device_id}` — soft unbind, tombstone published, `device.unbound` audited. A mis-bound PWM channel was taken forever | — | green |
 | 2026-08-12 15:10 | Found while building it: `Store.bind_device` matches an existing row on `(driver_type, channel)` **regardless of adopted**, so rebinding a freed channel returns the old `device_id` and silently discards the operator's proposed one. Right for a probe, where the ROM is identity; not obviously right for a PWM slot, which has no identity of its own. Left unchanged and pinned by assertion — it is the path that produced the identity fork and cannot be verified without a database. Next person meets it as a decision, not a surprise | — | — |
 | 2026-08-12 15:10 | `bellasreef pair` and `bellasreef revoke` documented as procedures for the first time. The command existed in three places repo-wide, all narrative; no doc said how to invoke it or which env vars it needs. The fire escape is now written down | — | green |
+| 2026-08-12 16:00 | S30.4 Wave 3 (iOS) built by agent: poller, code display with live countdown, Add a device, Keychain pre-flight, 401 route back to pairing, paired-devices list with Revoke, editable device names. Agent reports BUILD SUCCEEDED and 36 tests green on iPhone 17 Pro / iOS 26.5. **Not independently verified — this Mac's `xcode-select` points at CommandLineTools, so `xcodebuild` refuses to run.** Work is UNCOMMITTED in `../bellasreef-ios` pending David's review in Xcode | uncommitted | unverified |
+| 2026-08-12 16:00 | The spec resync is why the app work was possible at all: both vendored copies were byte-identical at 3.0.0 and are now 3.5.0. The regenerated client produced `listCapabilities`, `bindDevice`, `unbindDevice`, `claimPairing`, `pollPairing`, `revokeClient` — six operations that had no Swift method to call this morning. Note the operationId is `claimPairing`, not `claim` | — | — |
+| 2026-08-12 16:00 | **R14's backup does not work on the hub.** `bellasreef backup` shells out to `pg_dump`, which is not installed on the Pi — Postgres runs in a container, so the client tools live inside it. The command passes CI, where the tools exist, and had never once run on the machine it exists to protect. Safety net taken manually via `docker exec pg-dev pg_dump`; the CLI path is unfixed | — | — |
+| 2026-08-12 16:00 | Container storage inspected before the wipe, and two things are worth fixing on their own account: **`nats-dev` has no mounts**, so `--store_dir=/data` writes to the container's writable layer and every JetStream stream and durable consumer dies with the container; **`pg-dev` uses an anonymous volume** with a hash name, the kind `compose down -v` removes without asking. All three containers are named `-dev` and are what the tank runs on | — | — |
+| 2026-08-12 16:00 | **Full wipe, at David's explicit direction after being told the telemetry loss is permanent.** Postgres dropped and recreated (16 migrations from scratch), JetStream store emptied, VictoriaMetrics storage emptied. Pre-wipe dump at `bellasreef.local:/home/david/pre-wipe-20260812-1556.sql.gz`, mode 600, 13 tables. VM history is gone and is not in that dump | — | — |
+| 2026-08-12 16:00 | Hub verified factory-fresh: `paired_client_count: 0`, `pairing_open: true`, `approvers_available: false`, contracts 3.5.0, 0 sensors / 0 actuators built, both PWM channels at 0. TOFU reopened for the first time since 2026-08-10. Capabilities announcing, so the probe and both channels are discoverable and unclaimed | — | — |
+| 2026-08-12 16:00 | Unexplained and worth chasing: `"msg":"safety event"` appears in hardware-io's startup logs with **zero actuators registered**. Not investigated | — | — |
+
+## Resume point — 2026-08-12 16:00
+
+The tank is dark and unmanaged by design: nothing is adopted, so hardware-io
+builds nothing. Adopting the devices is what brings lighting back.
+
+**State:** hub wiped to factory, contracts 3.5.0, TOFU window open, no clients,
+no adopted devices. App deleted from the simulator by David. iOS wave-3 work is
+uncommitted in `../bellasreef-ios` and unverified by Claude.
+
+**The walkthrough to run, in order:**
+
+1. Reinstall the app from the wave-3 build in Xcode, reviewing the diff.
+2. Pair. TOFU grants immediately, no code needed, and the window shuts behind it.
+3. **Adopt the probe and both lights from the app.** This has never been
+   possible: `bindDevice` was absent from the spec the client generates from
+   until today. This step is also what turns the lights back on.
+4. Pair a second device, read its six-digit code, type it into the first under
+   System -> Add a device. This is the journey that has never once worked.
+
+**Then:** the interlock. `supervisor.heartbeat()` has no production caller, so
+the heartbeat leg of the R1 safety triple has never been armed (task #24).
+Suggested start is a drill rather than a code read — put a real actuator at a
+known non-zero duty and take away each guarantee in turn, watching
+`/sys/class/pwm`. Max runtime and safe-state-on-command-loss have the same
+shape as the heartbeat and may have the same gap; the drill tells us whether we
+are fixing one leg or three. Reading duty stays inside the bench boundary and
+needs no load connected.
