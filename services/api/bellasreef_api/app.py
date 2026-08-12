@@ -27,8 +27,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
 from typing import Annotated, Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from bellasreef_contracts import DeviceAssignment
 from bellasreef_db import AlertRecord, ClockUntrustedError, OverrideStore, PostgresAlertStore
 from bellasreef_service import configure_logging, get_logger
 from fastapi import (
@@ -48,7 +49,7 @@ from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
 from bellasreef_api.history import DEFAULT_BUCKETS, MAX_BUCKETS, HistoryReader
-from bellasreef_api.registry import CapabilityConsumer, RegistryConsumer
+from bellasreef_api.registry import AssignmentPublisher, CapabilityConsumer, RegistryConsumer
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -572,6 +573,7 @@ def build_app(
 
     registry = RegistryConsumer(nats_url, store) if nats_url else None
     capabilities = CapabilityConsumer(nats_url, store) if nats_url else None
+    assignments = AssignmentPublisher(nats_url) if nats_url else None
     telemetry = (
         TelemetryWriter(nats_url, vm_url, store, durable_suffix=durable_suffix)
         if nats_url and vm_url
@@ -1062,6 +1064,22 @@ def build_app(
             sensor_type="temp" if is_sensor else None,
             poll_interval_s=body.poll_interval_s if is_sensor else None,
         )
+
+        # Announced after the row is stored. A binding that is stored and not
+        # announced is recoverable; announced and not stored is not.
+        if assignments is not None:
+            await assignments.publish(
+                DeviceAssignment(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="api",
+                    device_id=device_id,
+                    adopted=True,
+                    role=body.role,
+                    driver_type=body.driver_type,
+                    binding=binding,
+                )
+            )
 
         await sink(
             "device.bound",

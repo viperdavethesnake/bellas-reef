@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import os
@@ -92,6 +93,121 @@ async def _open_window(dsn: str, ttl_s: float, nats_url: str | None) -> dict[str
         "clients_ever": total,
         "clients_active": active,
     }
+
+
+def _devices_import(args: Any) -> int:
+    """Bind everything a device file declares, through the API.
+
+    Explicitly **not** the product mechanism. The registry is: hardware
+    announces its capabilities, an operator binds them, and the app is the
+    surface for that. This exists for seeding a bench hub and for restoring one
+    from notes, and it earns its place only by going through the same endpoint
+    with the same validation — including the rule that matching hardware is
+    adopted rather than duplicated.
+
+    A file that binds nothing is reported as such rather than as success. "0
+    devices imported" and "imported" look the same in a terminal at 1am.
+    """
+    import yaml
+
+    token = args.token or os.environ.get("BELLASREEF_TOKEN")
+    if not token:
+        print(
+            "no token. Pass --token or set BELLASREEF_TOKEN — this writes through "
+            "the API like any other client, so it needs a credential like one.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        raw = yaml.safe_load(args.file.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"could not read {args.file}: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(raw, dict):
+        print(f"{args.file} must be a mapping at the top level", file=sys.stderr)
+        return 2
+
+    requests: list[dict[str, Any]] = []
+    for entry in raw.get("actuators") or []:
+        binding = entry.get("binding") or {}
+        requests.append(
+            {
+                "device_id": entry.get("id"),
+                "driver_type": binding.get("driver"),
+                "channel": str(binding.get("channel")),
+                "role": entry.get("role", "light"),
+                "display_name": entry.get("display_name"),
+                "location": entry.get("location"),
+            }
+        )
+    for entry in raw.get("sensors") or []:
+        binding = entry.get("binding") or {}
+        requests.append(
+            {
+                "device_id": entry.get("id"),
+                "driver_type": binding.get("driver"),
+                "channel": binding.get("rom"),
+                "display_name": entry.get("display_name"),
+                "location": entry.get("location"),
+                "poll_interval_s": binding.get("poll_interval_s", 5.0),
+            }
+        )
+
+    if not requests:
+        print(f"{args.file} declares no devices", file=sys.stderr)
+        return 2
+
+    results = asyncio.run(_post_bindings(args.api, token, requests))
+    failures = [r for r in results if r["status"] >= 400]
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for result in results:
+            if result["status"] >= 400:
+                print(f"  FAIL  {result['device_id']}: {result['detail']}")
+            else:
+                verb = "created" if result.get("created") else "bound existing"
+                print(f"  ok    {result['device_id']} -> {verb}")
+        print()
+        print(f"{len(results) - len(failures)}/{len(results)} bound")
+
+    return 1 if failures else 0
+
+
+async def _post_bindings(
+    api: str, token: str, requests: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    import httpx
+
+    results: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        for request in requests:
+            payload = {k: v for k, v in request.items() if v is not None}
+            try:
+                response = await http.post(
+                    f"{api}/api/v1/devices",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                results.append(
+                    {"device_id": request["device_id"], "status": 599, "detail": str(exc)}
+                )
+                continue
+            body: dict[str, Any] = {}
+            with contextlib.suppress(ValueError):
+                body = response.json()
+            results.append(
+                {
+                    "device_id": request["device_id"],
+                    "status": response.status_code,
+                    "created": body.get("created"),
+                    "detail": body.get("detail", response.text[:200]),
+                }
+            )
+    return results
 
 
 def _tool_version() -> str:
@@ -278,12 +394,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     restore.add_argument("--json", action="store_true", help="machine-readable output")
 
+    devices = sub.add_parser(
+        "devices",
+        help="device registry conveniences",
+        description=(
+            "Seeding and restore aid. The registry is the product mechanism; "
+            "this writes through the same API a client would."
+        ),
+    )
+    device_sub = devices.add_subparsers(dest="device_command", required=True)
+
+    imp = device_sub.add_parser(
+        "import",
+        help="bind devices declared in a YAML file",
+        description=(
+            "Reads a devices.yaml and binds each entry through POST "
+            "/api/v1/devices. Convenience only: identical to doing it from the "
+            "app, and subject to the same validation — including matching "
+            "existing hardware rather than creating beside it."
+        ),
+    )
+    imp.add_argument("file", type=Path, help="a devices.yaml")
+    imp.add_argument("--api", default="http://localhost:8000", help="hub API base URL")
+    imp.add_argument("--token", help="access token (default: $BELLASREEF_TOKEN)")
+    imp.add_argument("--json", action="store_true", help="machine-readable output")
+
     args = parser.parse_args(argv)
 
     dsn = os.environ.get("BELLASREEF_DATABASE_URL")
     if not dsn:
         print("BELLASREEF_DATABASE_URL is not set", file=sys.stderr)
         return 2
+
+    if args.command == "devices":
+        return _devices_import(args)
 
     if args.command == "backup":
         return _backup_command(args, dsn)

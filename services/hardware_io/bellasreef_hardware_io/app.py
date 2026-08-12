@@ -19,7 +19,6 @@ import signal
 import subprocess
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Final
 from uuid import uuid4
 
@@ -37,10 +36,9 @@ from prometheus_client import CollectorRegistry, Counter, Gauge
 
 from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
 from bellasreef_hardware_io.drivers.onewire import DS18B20
-from bellasreef_hardware_io.factory import build_actuators, build_sensors
+from bellasreef_hardware_io.factory import build_from_assignments
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
-from bellasreef_hardware_io.topology import DEVICES_PATH, load_topology
 
 __all__ = ["HardwareIO", "clock_is_trusted", "main"]
 
@@ -162,44 +160,33 @@ class HardwareIO:
 
     # ------------------------------------------------------------- lifecycle
 
-    def load_devices(self, path: Path | None = None) -> None:
-        """Build every device this hub declares. Nothing here is hardcoded.
+    async def _build_from_registry(self) -> None:
+        """Instantiate the devices the registry says this hub owns.
 
-        Replaces a `discover()` that enumerated whatever the kernel had found on
-        the 1-Wire bus and constructed a DS18B20 for each. Two problems with
-        that, and the second is the serious one.
-
-        It could only ever build one kind of thing, so a second driver type
-        meant another branch in this file.
-
-        And discovery cannot tell "no second probe" from "the second probe
-        fell off the bus". A hub that enumerates one probe where yesterday it
-        found two comes up perfectly healthy and monitors half the tank.
-        Declared devices do not have that failure: a probe named in the file
-        and not reporting is a probe the silence watcher raises an alert about.
-
-        A bad entry raises. hardware-io does not start with a device missing —
-        see topology.py.
+        Replaces the device file as the source of topology. The file's epitaph
+        is the identity fork it caused: it let a config author mint a new id for
+        hardware that already had one, and a tank's history ran down two
+        device_ids for seventy minutes.
         """
-        topology = load_topology(path or DEVICES_PATH)
+        if self.spine is None:
+            return
+        assignments = await self.spine.read_assignments()
+        actuators, sensors = build_from_assignments(assignments, open_i2c=self._open_i2c)
 
-        for sensor in build_sensors(topology):
+        for sensor in sensors:
             self.sensors.append(sensor)
-            log.info(
-                "sensor attached",
-                extra={"driver_id": sensor.driver_id, "sensor_type": sensor.sensor_type},
-            )
-
-        for built in build_actuators(topology, open_i2c=self._open_i2c):
+        for built in actuators:
             self.supervisor.register(built.registration, built.driver)
             self._registrations.append(built.registration)
-            log.info(
-                "actuator attached",
-                extra={
-                    "actuator_id": built.registration.actuator_id,
-                    "driver_id": built.registration.driver_id,
-                },
-            )
+
+        log.info(
+            "devices built from registry",
+            extra={
+                "assignments": len(assignments),
+                "sensors": len(sensors),
+                "actuators": len(actuators),
+            },
+        )
 
     async def _announce_capabilities(self) -> None:
         """Tell the registry what this hub's hardware can offer.
@@ -358,6 +345,12 @@ class HardwareIO:
         self.spine = Spine(url)
         await self.spine.connect()
         await self.spine.provision()
+
+        # The registry is the source of topology. Built here rather than before
+        # the spine connects, because the assignments come *over* the spine —
+        # which is the whole point: hardware-io holds no credential and needs
+        # none to learn what it owns.
+        await self._build_from_registry()
 
         # Capabilities before registrations: what the hardware can offer is
         # true whether or not anyone has bound it, and a client opening a "find
@@ -564,10 +557,10 @@ async def _amain() -> int:
         liveness_timeout_s=float(os.environ.get("BELLASREEF_LIVENESS_TIMEOUT_S", "15")),
         metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9101")),
     )
-    # Topology-driven. A missing or invalid device file raises here and the
-    # service does not start — deliberately louder than coming up with nothing
-    # attached, which is a hub that looks healthy and monitors an empty room.
-    service.load_devices(Path(os.environ.get("BELLASREEF_DEVICES_FILE", str(DEVICES_PATH))))
+    # Devices are built from the registry once the spine is up — see
+    # HardwareIO._build_from_registry. Nothing is read from disk: the device
+    # file was retired as a source of topology after it forked a device's
+    # identity, and it survives only as an input to `bellasreef devices import`.
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

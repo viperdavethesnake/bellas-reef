@@ -12,6 +12,7 @@ Layout follows docs/contracts/nats-subjects.md.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime
 from typing import Final
@@ -23,6 +24,7 @@ from bellasreef_contracts import (
     ActuatorRegistration,
     ActuatorState,
     CapabilityAnnouncement,
+    DeviceAssignment,
     Heartbeat,
     SensorReading,
     SensorRegistration,
@@ -34,6 +36,7 @@ from nats.js import JetStreamContext
 from nats.js.api import (
     AckPolicy,
     ConsumerConfig,
+    DeliverPolicy,
     DiscardPolicy,
     RetentionPolicy,
     StorageType,
@@ -53,6 +56,7 @@ STATE_STREAM: Final = "BR_STATE"
 AUDIT_STREAM: Final = "BR_AUDIT"
 REGISTRY_STREAM: Final = "BR_REGISTRY"
 CAPABILITY_STREAM: Final = "BR_CAPABILITY"
+ASSIGNMENT_STREAM: Final = "BR_ASSIGNMENT"
 
 STREAMS: Final = (
     StreamConfig(
@@ -93,6 +97,16 @@ STREAMS: Final = (
     StreamConfig(
         name=CAPABILITY_STREAM,
         subjects=[subjects.ALL_CAPABILITIES],
+        retention=RetentionPolicy.LIMITS,
+        storage=StorageType.FILE,
+        max_msgs_per_subject=1,
+    ),
+    # Assignments: what the operator has decided each device is bound to.
+    # Retained last-value per subject so a hardware-io restarting alone rebuilds
+    # every driver, rather than waiting for someone to re-save each device.
+    StreamConfig(
+        name=ASSIGNMENT_STREAM,
+        subjects=[subjects.ALL_ASSIGNMENTS],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
         max_msgs_per_subject=1,
@@ -201,6 +215,48 @@ class Spine:
             subjects.registry(registration.sensor_id),
             registration.model_dump_json().encode(),
         )
+
+    async def read_assignments(self) -> list[DeviceAssignment]:
+        """Every current assignment, read once at startup.
+
+        A drain of the retained stream rather than a subscription: hardware-io
+        builds its drivers once and a binding change is a restart, which keeps
+        driver construction off the hot path and out of the supervisor loop.
+
+        An unreadable message is skipped and logged rather than fatal. One
+        malformed assignment must not stop a hub bringing up the devices that
+        are fine — the opposite of the device file, where a bad entry stopped
+        everything, because there the file was the whole topology and here it is
+        one device among several.
+        """
+        try:
+            sub = await self.js.pull_subscribe(
+                subjects.ALL_ASSIGNMENTS,
+                durable=None,
+                config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+            )
+        except NotFoundError:
+            log.warning("assignment stream not provisioned; no devices to build")
+            return []
+
+        found: list[DeviceAssignment] = []
+        while True:
+            try:
+                msgs = await sub.fetch(32, timeout=1.0)
+            except (TimeoutError, nats.errors.TimeoutError):
+                break
+            for msg in msgs:
+                try:
+                    found.append(DeviceAssignment.model_validate_json(msg.data))
+                except ValidationError:
+                    log.warning(
+                        "assignment did not validate; skipped",
+                        extra={"subject": msg.subject},
+                    )
+                await msg.ack()
+        with contextlib.suppress(Exception):
+            await sub.unsubscribe()
+        return found
 
     async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
         """Announce what one hardware source can offer.

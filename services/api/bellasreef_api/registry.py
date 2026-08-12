@@ -19,7 +19,12 @@ import contextlib
 from typing import Any
 
 import nats
-from bellasreef_contracts import CapabilityAnnouncement, SensorRegistration, subjects
+from bellasreef_contracts import (
+    CapabilityAnnouncement,
+    DeviceAssignment,
+    SensorRegistration,
+    subjects,
+)
 from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
@@ -30,6 +35,50 @@ from pydantic import ValidationError
 from bellasreef_api.store import Store
 
 log = get_logger(__name__)
+
+
+class AssignmentPublisher:
+    """Publishes a device's binding for hardware-io to build from.
+
+    One retained message per device. hardware-io reads them at startup and
+    instantiates exactly the drivers they describe — which is what retires the
+    device file as a source of topology.
+
+    Best effort by design. A binding that is stored and not announced is
+    recoverable (the next hardware-io start re-reads nothing, but the next bind
+    republishes); a binding that is announced and not stored is not. So the
+    database write happens first and this cannot fail it.
+    """
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+        self._nc: Client | None = None
+
+    async def publish(self, assignment: DeviceAssignment) -> None:
+        try:
+            if self._nc is None or not self._nc.is_connected:
+                self._nc = await nats.connect(self._url)
+            js = self._nc.jetstream()
+            await js.publish(
+                subjects.assignment(assignment.device_id),
+                assignment.model_dump_json().encode(),
+            )
+            log.info(
+                "assignment published",
+                extra={"device_id": assignment.device_id, "adopted": assignment.adopted},
+            )
+        except Exception:
+            log.exception(
+                "could not publish assignment; the binding is stored and will be "
+                "announced on the next bind",
+                extra={"device_id": assignment.device_id},
+            )
+
+    async def close(self) -> None:
+        if self._nc is not None:
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
 
 
 class CapabilityConsumer:

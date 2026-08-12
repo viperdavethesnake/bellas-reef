@@ -14,7 +14,7 @@ validation error should not depend on whether a bus happens to be readable.
 
 from __future__ import annotations
 
-from bellasreef_contracts import ActuatorRegistration
+from bellasreef_contracts import ActuatorRegistration, DeviceAssignment
 from bellasreef_contracts.driver import ActuatorDriver
 from bellasreef_service import get_logger
 
@@ -107,6 +107,91 @@ def build_actuators(
         )
 
     return built
+
+
+def build_from_assignments(
+    assignments: list[DeviceAssignment],
+    *,
+    open_i2c: object | None = None,
+    sysfs: SysfsWriter | None = None,
+) -> tuple[list[BuiltActuator], list[DS18B20]]:
+    """Instantiate exactly what the registry says this hub owns.
+
+    The registry is the source of topology. The device file was, and its epitaph
+    is the identity fork it caused: it let a config author mint a new id for
+    hardware that already had one, and a tank's history ran down two device_ids
+    for seventy minutes.
+
+    Unadopted assignments build nothing. That is the announce-then-adopt state
+    made real — a probe the hub can see but nobody has claimed is visible
+    through the API and inert, rather than publishing under a name nobody chose.
+
+    A single bad assignment is skipped and logged, not fatal. Unlike the device
+    file — where a bad entry stopped the service because the file was the whole
+    topology — here it is one device among several, and taking a tank offline
+    over one malformed row would be the larger failure.
+    """
+    actuators: list[BuiltActuator] = []
+    sensors: list[DS18B20] = []
+    chips: dict[tuple[int, int], Pca9685Device] = {}
+
+    for assignment in assignments:
+        if not assignment.adopted:
+            log.info(
+                "assignment not adopted; nothing built",
+                extra={"device_id": assignment.device_id},
+            )
+            continue
+        binding = assignment.binding or {}
+        try:
+            if assignment.driver_type == "ds18b20":
+                from bellasreef_contracts.driver import OneWireDevice
+
+                sensors.append(
+                    DS18B20(
+                        OneWireDevice(device_id=binding["rom"]),
+                        driver_id=assignment.device_id,
+                    )
+                )
+            elif assignment.driver_type == "pi-pwm":
+                actuators.append(
+                    BuiltActuator(
+                        PiPwmChannel(int(binding["channel"]), assignment.device_id, sysfs=sysfs),
+                        light_registration(actuator_id=assignment.device_id, driver_id="rp1-pwm"),
+                    )
+                )
+            elif assignment.driver_type == "pca9685":
+                bus_no = int(binding.get("bus", 1))
+                address = int(binding.get("address", 0x40))
+                key = (bus_no, address)
+                if key not in chips:
+                    if open_i2c is None:
+                        raise TopologyError("no I²C bus provided to the factory")
+                    chips[key] = Pca9685Device(open_i2c(bus_no), address)  # type: ignore[operator]
+                actuators.append(
+                    BuiltActuator(
+                        Pca9685Channel(chips[key], int(binding["channel"]), assignment.device_id),
+                        light_registration(actuator_id=assignment.device_id, driver_id="pca9685"),
+                    )
+                )
+            else:
+                raise TopologyError(f"unknown driver type {assignment.driver_type!r}")
+        except (KeyError, ValueError, TopologyError) as exc:
+            log.error(
+                "assignment could not be built; device skipped",
+                extra={"device_id": assignment.device_id, "error": str(exc)},
+            )
+            continue
+
+        log.info(
+            "device built from registry",
+            extra={
+                "device_id": assignment.device_id,
+                "driver_type": assignment.driver_type,
+            },
+        )
+
+    return actuators, sensors
 
 
 def build_sensors(topology: Topology) -> list[DS18B20]:
