@@ -269,19 +269,18 @@ class Store:
             if created:
                 await conn.execute(
                     text(
-                        "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
-                        "                     poll_interval_s, transport, role, display_name, "
-                        "                     location, "
-                        "                     driver_type, binding, adopted, actuator_class, "
-                        "                     control_authority, failsafe_capable, transport, "
-                        "                     safe_state, max_runtime_s, heartbeat_timeout_s) "
-                        "VALUES (:id, :device_id, :kind, :driver_id, :sensor_type, "
-                        "        :poll_interval_s, :transport, :role, :display_name, :location, "
-                        "        :driver_type, CAST(:binding AS jsonb), true, :actuator_class, "
-                        "        :control_authority, :failsafe_capable, :transport, "
-                        "        CAST(:safe_state AS jsonb), :max_runtime_s, "
-                        "        :heartbeat_timeout_s) "
-                        "ON CONFLICT (device_id) DO NOTHING"
+                        "INSERT INTO devices ("
+                        "  id, device_id, kind, driver_id, sensor_type, poll_interval_s, "
+                        "  transport, role, display_name, location, driver_type, binding, "
+                        "  adopted, actuator_class, control_authority, failsafe_capable, "
+                        "  safe_state, max_runtime_s, heartbeat_timeout_s"
+                        ") VALUES ("
+                        "  :id, :device_id, :kind, :driver_id, :sensor_type, :poll_interval_s, "
+                        "  :transport, :role, :display_name, :location, :driver_type, "
+                        "  CAST(:binding AS jsonb), true, :actuator_class, :control_authority, "
+                        "  :failsafe_capable, CAST(:safe_state AS jsonb), :max_runtime_s, "
+                        "  :heartbeat_timeout_s"
+                        ") ON CONFLICT (device_id) DO NOTHING"
                     ),
                     {
                         "id": uuid4(),
