@@ -651,3 +651,22 @@ curl -sH "Authorization: Bearer $TOKEN" \
 Look for `pair.window_opened` and `client.revoked`. If the CLI warned that
 `BELLASREEF_NATS_URL` was unset, they will not be there, and there is no way to
 add them after the fact: `audit_log` is append-only by trigger.
+
+## 11. PostgreSQL client tools — for `bellasreef backup`
+
+`bellasreef backup` and `bellasreef restore` spawn `pg_dump`/`pg_restore` as
+host binaries. Postgres itself runs in a container, but its copy of the tools
+cannot be borrowed: `pg_dump --file` writes inside whatever filesystem the
+binary runs in, so a `docker exec` detour leaves the dump in the container, not
+in the archive. The host needs its own client package:
+
+```bash
+sudo apt-get install -y postgresql-client-17
+```
+
+Debian ships one PostgreSQL major per release and the compose spine pins
+`postgres:17`, so the versions track each other across `apt upgrade`. The rule
+that matters: the client's major version must be **at least** the server's — an
+older `pg_dump` refuses a newer server outright. Installed and verified on this
+host 2026-08-12 (client 17.10, server 17.10; backup + restore drill both
+passed against the live spine).

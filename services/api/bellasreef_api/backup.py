@@ -141,9 +141,9 @@ class HubIdentity(_Strict):
     one is sufficient on its own.
 
     ``database_host`` is the Postgres server as it was addressed. Run on the
-    hub the documented way (``docker compose exec api bellasreef backup``) that
-    is the compose service name ``postgres``, which identifies nothing. Run
-    from a laptop it is ``bellasreef.local``, which identifies everything.
+    hub the documented way (the host-unit CLI with ``api.env`` sourced) that is
+    ``localhost``, which identifies nothing. Run from a laptop it is
+    ``bellasreef.local``, which identifies everything.
 
     ``taken_on`` is the machine that ran the tool, and has the mirror-image
     problem: on the hub it is the hub, from a laptop it is the laptop.
