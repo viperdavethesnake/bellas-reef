@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final
 from uuid import uuid4
 
 from bellasreef_contracts import CapabilityAnnouncement, CapabilityChannel
@@ -30,9 +31,12 @@ log = get_logger(__name__)
 __all__ = [
     "PWM_CHANNEL_GPIO",
     "PWM_CHIP",
+    "RP1_PWM0_DEVICE",
+    "RP1_PWM_COMPATIBLE",
     "W1_DEVICES",
     "discover_pwm",
     "discover_w1",
+    "find_pwm_chip",
 ]
 
 PWM_CHIP = Path("/sys/class/pwm/pwmchip0")
@@ -49,6 +53,47 @@ W1_DEVICES = Path("/sys/bus/w1/devices")
 #: out. Changing the overlay therefore means updating this map in the same
 #: commit, the same discipline the pinned PWM frequency follows.
 PWM_CHANNEL_GPIO: dict[int, int] = {0: 12, 1: 13}
+
+#: The RP1's first PWM block — the one the overlay muxes to header pins.
+#: The SECOND instance (1f0009c000.pwm) drives the fan header; announcing it
+#: would offer the fan as lighting. Both measured on this board 2026-08-13.
+RP1_PWM0_DEVICE: Final = "1f00098000.pwm"
+RP1_PWM_COMPATIBLE: Final = "raspberrypi,rp1-pwm"
+
+
+def find_pwm_chip(pwm_class: Path = Path("/sys/class/pwm")) -> Path | None:
+    """Locate the RP1 PWM0 chip by hardware identity, never by index.
+
+    The pwmchipN index has moved between kernel releases (CLAUDE.md, verified
+    host facts), so each class entry is resolved to the device it fronts and
+    matched on the block name plus the device-tree compatible.
+    """
+    if not pwm_class.is_dir():
+        return None
+    for entry in sorted(pwm_class.iterdir()):
+        try:
+            device = (entry / "device").resolve()
+        except OSError:
+            continue
+        if device.name != RP1_PWM0_DEVICE:
+            continue
+        try:
+            compatible = (device / "of_node" / "compatible").read_bytes()
+        except OSError:
+            log.critical(
+                "RP1 PWM0 block found but its compatible is unreadable",
+                extra={"chip": str(entry)},
+            )
+            return None
+        if RP1_PWM_COMPATIBLE not in compatible.decode(errors="replace"):
+            log.critical(
+                "the device at the RP1 PWM0 address is not an rp1-pwm",
+                extra={"chip": str(entry), "compatible": compatible.decode(errors="replace")},
+            )
+            return None
+        return entry
+    log.critical("no RP1 PWM0 block under %s — pi-pwm will not be announced", pwm_class)
+    return None
 
 
 def discover_pwm(chip: Path = PWM_CHIP) -> CapabilityAnnouncement | None:
