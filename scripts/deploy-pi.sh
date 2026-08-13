@@ -114,18 +114,6 @@ step "syncing dependencies"
 ssh "$PI_HOST" "cd ${PI_DIR} && uv sync --frozen 2>&1 | tail -3" \
     || die "uv sync failed on ${PI_HOST}"
 
-step "applying migrations"
-# Before the restart, so the new code never meets the old schema. Caught the
-# hard way: a deploy that shipped code reading `sensor_alerts.alert_class` to a
-# database that had never heard of it, and control-engine crash-looped on boot.
-#
-# Migrations here are additive by policy, so the *old* code running during this
-# window is fine. Note that the restore flow deliberately does NOT do this —
-# see docs/backup-restore.md, where migrating before a restore is exactly the
-# mistake that gets an archive refused.
-ssh "$PI_HOST" "cd ${PI_DIR}/db && set -a && . /etc/bellasreef/api.env && set +a && uv run alembic upgrade head 2>&1 | tail -5" \
-    || die "alembic upgrade failed on ${PI_HOST}"
-
 step "installing unit files"
 ssh "$PI_HOST" "sudo install -m 0644 ${PI_DIR}/deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload" \
     || die "could not install units"
@@ -158,7 +146,28 @@ step "enabling services at boot"
 # Idempotent, and separate from restart on purpose: `systemctl restart` on a
 # disabled unit starts it now and forgets it at the next power cut, which on a
 # tank is the outage you find out about from a thermometer.
-ssh "$PI_HOST" "sudo systemctl enable ${UNITS[*]} 2>&1 | tail -1" || die "could not enable units"
+ssh "$PI_HOST" "sudo systemctl enable ${UNITS[*]} bellasreef-spine.service 2>&1 | tail -1" || die "could not enable units"
+
+step "starting the spine"
+# The spine is started, never restarted, by a deploy: restarting it would
+# bounce Postgres and NATS under every code push for no reason. `start` on an
+# already-active oneshot with RemainAfterExit is a no-op.
+ssh "$PI_HOST" "sudo systemctl start bellasreef-spine.service" || die "spine failed to start"
+
+step "applying migrations"
+# Before the restart, so the new code never meets the old schema. Caught the
+# hard way: a deploy that shipped code reading `sensor_alerts.alert_class` to a
+# database that had never heard of it, and control-engine crash-looped on boot.
+#
+# Migrations here are additive by policy, so the *old* code running during this
+# window is fine. Note that the restore flow deliberately does NOT do this —
+# see docs/backup-restore.md, where migrating before a restore is exactly the
+# mistake that gets an archive refused.
+#
+# Run after the spine starts, not before: the spine brings up Postgres, and a
+# fresh checkout has no database to migrate until it does.
+ssh "$PI_HOST" "cd ${PI_DIR}/db && set -a && . /etc/bellasreef/api.env && set +a && uv run alembic upgrade head 2>&1 | tail -5" \
+    || die "alembic upgrade failed on ${PI_HOST}"
 
 step "restarting services"
 # Restarted oldest-dependency-first. hardware-io provisions the streams the
