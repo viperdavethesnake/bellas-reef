@@ -18,6 +18,9 @@ must never change what it is doing.
 
 from __future__ import annotations
 
+import re
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -29,30 +32,25 @@ from bellasreef_service import get_logger
 log = get_logger(__name__)
 
 __all__ = [
-    "PWM_CHANNEL_GPIO",
-    "PWM_CHIP",
+    "PINCTRL",
     "RP1_PWM0_DEVICE",
     "RP1_PWM_COMPATIBLE",
     "W1_DEVICES",
     "discover_pwm",
     "discover_w1",
     "find_pwm_chip",
+    "parse_pinctrl",
+    "read_pwm_mux",
 ]
 
-PWM_CHIP = Path("/sys/class/pwm/pwmchip0")
 W1_DEVICES = Path("/sys/bus/w1/devices")
 
-#: Which GPIO each PWM channel reaches. **Verified on this board 2026-08-12**
-#: (CLAUDE.md, Verified host facts): ``dtoverlay=pwm-2chan,pin=12,func=4,
-#: pin2=13,func2=4`` muxes channel 0 -> GPIO12 and channel 1 -> GPIO13,
-#: confirmed with ``pinctrl get 12,13``.
-#:
-#: This map is also the announcement filter: a channel absent from it reaches
-#: no pin, and a pinless channel is not something the hub can offer — it
-#: exports in sysfs and drives nothing, which is the trap the host notes call
-#: out. Changing the overlay therefore means updating this map in the same
-#: commit, the same discipline the pinned PWM frequency follows.
-PWM_CHANNEL_GPIO: dict[int, int] = {0: 12, 1: 13}
+#: Absolute because the service PATH does not include /usr/sbin (CLAUDE.md,
+#: "PATH trap").
+PINCTRL: Final = "/usr/sbin/pinctrl"
+
+#: One pinctrl line: "12: a0    pd | lo // GPIO12 = PWM0_CHAN0"
+_PINCTRL_LINE = re.compile(r"//\s*GPIO(\d+)\s*=\s*PWM0_CHAN(\d+)\s*$")
 
 #: The RP1's first PWM block — the one the overlay muxes to header pins.
 #: The SECOND instance (1f0009c000.pwm) drives the fan header; announcing it
@@ -92,22 +90,59 @@ def find_pwm_chip(pwm_class: Path = Path("/sys/class/pwm")) -> Path | None:
             )
             return None
         return entry
-    log.critical("no RP1 PWM0 block under %s — pi-pwm will not be announced", pwm_class)
+    log.critical(
+        "no RP1 PWM0 block found — pi-pwm will not be announced",
+        extra={"pwm_class": str(pwm_class)},
+    )
     return None
 
 
-def discover_pwm(chip: Path = PWM_CHIP) -> CapabilityAnnouncement | None:
-    """The Pi's own pin-backed PWM channels.
+def parse_pinctrl(output: str) -> dict[int, int]:
+    """channel -> gpio for every pin the mux ties to the RP1 PWM0 block."""
+    mux: dict[int, int] = {}
+    for line in output.splitlines():
+        if match := _PINCTRL_LINE.search(line):
+            mux[int(match.group(2))] = int(match.group(1))
+    return mux
 
-    ``npwm`` bounds the count (our Pi reports 4 where the archived HAL states
-    2 — recorded in CLAUDE.md, and why this asks the hardware instead of
-    hardcoding a number), and :data:`PWM_CHANNEL_GPIO` filters it: only
-    channels the overlay muxes to a pin are announced. The RP1's other
-    channels export in sysfs and drive nothing; announcing them offered the
-    operator a device the engine would command, with green telemetry, and no
-    output — met in the app on 2026-08-13 as two adoptable ghosts.
+
+def read_pwm_mux() -> dict[int, int] | None:
+    """The live pin mux, from ``pinctrl get``. None means it could not be
+    read — which callers must treat as "announce nothing", never as "nothing
+    is muxed": a hub that cannot see the mux must not guess at it.
     """
-    if not chip.is_dir():
+    try:
+        result = subprocess.run(
+            [PINCTRL, "get"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.critical("pinctrl could not run: %s — pi-pwm will not be announced", exc)
+        return None
+    if result.returncode != 0:
+        log.critical(
+            "pinctrl exited %d: %s — pi-pwm will not be announced",
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+    return parse_pinctrl(result.stdout)
+
+
+def discover_pwm(
+    pwm_class: Path = Path("/sys/class/pwm"),
+    mux_reader: Callable[[], dict[int, int] | None] = read_pwm_mux,
+) -> CapabilityAnnouncement | None:
+    """The RP1's pin-backed PWM channels, read from the live mux.
+
+    The announcement mirrors the operator's overlay: whatever ``pinctrl``
+    says is muxed to the PWM0 block is what the hub offers, bounded by the
+    chip's ``npwm``. There is no hand-maintained map to drift — an overlay
+    change is reflected at the next startup, and a mux that cannot be read
+    announces nothing rather than guessing (the two pinless RP1 channels
+    shipped as adoptable ghosts on 2026-08-13; never again by construction).
+    """
+    chip = find_pwm_chip(pwm_class)
+    if chip is None:
         return None
     try:
         npwm = int((chip / "npwm").read_text().strip())
@@ -115,13 +150,17 @@ def discover_pwm(chip: Path = PWM_CHIP) -> CapabilityAnnouncement | None:
         log.warning("pwm chip present but npwm unreadable", extra={"chip": str(chip)})
         return None
 
-    channels = []
-    for index in range(npwm):
-        gpio = PWM_CHANNEL_GPIO.get(index)
-        if gpio is None:
-            continue
-        detail: dict[str, str | int | float | bool] = {"chip": chip.name, "gpio": gpio}
-        channels.append(CapabilityChannel(channel=str(index), detail=detail))
+    mux = mux_reader()
+    if mux is None:
+        return None
+    channels = [
+        CapabilityChannel(channel=str(index), detail={"chip": chip.name, "gpio": mux[index]})
+        for index in sorted(mux)
+        if index < npwm
+    ]
+    if not channels:
+        log.critical("the RP1 PWM0 block has no pins muxed — pi-pwm not announced")
+        return None
 
     return CapabilityAnnouncement(
         message_id=uuid4(),
