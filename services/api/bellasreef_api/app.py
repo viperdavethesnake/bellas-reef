@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
+from time import monotonic
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -82,6 +83,12 @@ CONTRACTS_VERSION: Final = version("bellasreef-contracts")
 AUTH_401: Final[dict[str, str]] = {
     "description": "Missing, invalid, expired, or revoked credential."
 }
+
+#: How stale an open stream's authorization may get. Checked in the send
+#: loop, so a revoked device stops receiving within one frame or this many
+#: seconds, whichever is later. A recheck is one indexed SELECT; at ~1 Hz
+#: telemetry this is one extra query per client per ten seconds.
+STREAM_REVOKE_RECHECK_S: Final = 10.0
 
 #: Every auth event goes here, per auth.md §3 and the existing audit contract.
 AuditSink = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -1707,9 +1714,20 @@ def build_app(
             ReadyFrame(received_at=datetime.now(UTC), client_id=client_id).model_dump_json()
         )
         queue = await bridge.subscribe()
+        last_authorized = monotonic()
         try:
             while True:
-                await websocket.send_text(await queue.get())
+                frame = await queue.get()
+                # Revocation must reach an open socket, not just the next
+                # handshake — a revoked phone kept watching live telemetry
+                # (2026-08-13). Same close code and reason as the handshake
+                # refusal, so a client sees one vocabulary.
+                if monotonic() - last_authorized > STREAM_REVOKE_RECHECK_S:
+                    if not await store.is_active(client_id):
+                        await websocket.close(code=1008, reason="client revoked")
+                        return
+                    last_authorized = monotonic()
+                await websocket.send_text(frame)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
