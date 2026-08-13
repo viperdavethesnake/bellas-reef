@@ -163,14 +163,27 @@ class LightingScheduler:
     def forget(self, channel_id: str) -> None:
         """Forget emission history for one channel.
 
-        Called the moment a channel becomes unadopted. hardware-io tears the
-        driver down and rebuilds it dark on the next adoption, so the duty this
-        scheduler last emitted stops being true the instant the tombstone
-        lands — it describes hardware that no longer exists. Left unforgotten,
-        the *next* adopt would see a non-``None`` ``_last_duty`` for this
-        channel and treat the following tick as a continuation ("ramp" /
-        "converge") of the old run instead of a fresh cold start, jumping the
-        newly-rebuilt-dark channel straight to whatever duty was last emitted
+        Driven by the tombstone EVENT (``AssignmentLedger.on_tombstone``,
+        wired in ``ControlEngine.__init__``), not by a tick. A tick-timed
+        forget can only ever act on a channel ``due()`` actually surfaces —
+        which happens only when it is cold, mid-slew, past the deadband, or
+        past the refresh window — so a tombstone landing outside all four
+        (adopt, publish, unadopt shortly after, re-adopt shortly after, all
+        well inside the deadband/refresh windows) would never trigger it.
+        Firing straight off the tombstone has no such gap, and firing on
+        every tombstone rather than only ones for previously-adopted channels
+        is deliberate: forgetting an already-cold channel is a no-op, and
+        that is simpler and more robust than re-deriving "was this adopted"
+        here.
+
+        hardware-io tears the driver down and rebuilds it dark on the next
+        adoption, so the duty this scheduler last emitted stops being true
+        the instant the tombstone lands — it describes hardware that no
+        longer exists. Left unforgotten, the *next* adopt would see a
+        non-``None`` ``_last_duty`` for this channel and treat the following
+        tick as a continuation ("ramp" / "converge") of the old run instead
+        of a fresh cold start, jumping the newly-rebuilt-dark channel
+        straight to whatever duty was last emitted
         before the tombstone — with no slew, because nothing marks this as a
         cold start once ``_last_duty`` is populated. Clearing it here forces
         the first post-readoption intent back to "initial", converging from

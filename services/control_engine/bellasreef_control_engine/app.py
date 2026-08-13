@@ -133,6 +133,17 @@ class ControlEngine:
         self._held: dict[str, ActiveOverride] = {}
         self.publisher = CommandPublisher(nats_url) if nats_url else None
         self.assignments = AssignmentLedger()
+        # Forget on the tombstone EVENT, not on a tick's timing. due() only
+        # surfaces a channel when it is cold, mid-slew, past the deadband, or
+        # past the refresh window — a tombstone landing outside all four of
+        # those (e.g. unadopt 30s after publish, re-adopt 30s after that, well
+        # inside the deadband and refresh windows) would never appear in
+        # _tick's `intents`, so a forget() tied to that loop would silently
+        # never run. Wiring it straight to the ledger's own notification
+        # covers both the live subscription and the drain/re-drain paths —
+        # both go through AssignmentLedger.apply — with no dependency on
+        # whether the scheduler happened to have anything due at that moment.
+        self.assignments.on_tombstone = self.scheduler.forget
         self._assignments_loaded = False
         self._suppressed_unassigned: set[str] = set()
 
@@ -392,15 +403,14 @@ class ControlEngine:
                 self.metrics.suppressed.labels("unassigned").inc()
                 if intent.channel_id not in self._suppressed_unassigned:
                     self._suppressed_unassigned.add(intent.channel_id)
-                    # The transition into unadopted: forget what the scheduler
-                    # last emitted for this channel. hardware-io rebuilds the
-                    # driver dark on the next adoption, so remembered duty is
-                    # stale the instant the tombstone lands — left in place, a
-                    # re-adoption would resume as "ramp"/"converge" from the
-                    # old level instead of cold-starting from SAFE_DUTY, and
-                    # the newly-dark channel would pop straight to it with no
-                    # slew.
-                    self.scheduler.forget(intent.channel_id)
+                    # Forgetting the scheduler's memory of this channel is NOT
+                    # done here. due() only surfaces a channel when it is
+                    # cold, mid-slew, past the deadband, or past the refresh
+                    # window, so a forget() tied to this loop could miss a
+                    # tombstone that lands outside all four — see
+                    # ControlEngine.__init__, which wires
+                    # self.assignments.on_tombstone = self.scheduler.forget so
+                    # forgetting happens on the tombstone event instead.
                     log.warning(
                         "channel has a schedule but no adoption; holding",
                         extra={"channel_id": intent.channel_id},
