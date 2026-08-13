@@ -78,13 +78,31 @@ Mac the tools are installed and `PATH` does not have them:
 export BELLASREEF_PG_BIN=/usr/local/opt/libpq/bin   # or /opt/homebrew/... on Apple silicon
 ```
 
-## Taking a backup
-
-On the hub:
+On the hub, Postgres runs in a container but the CLI runs on the host, so the
+host needs its own copy of the tools (`docker exec` is not a path `pg_dump`'s
+`--file` output can cross). Debian ships the matching major:
 
 ```bash
-docker compose exec api bellasreef backup --out /backups/bellasreef.tar.gz
+sudo apt-get install -y postgresql-client-17
 ```
+
+See `docs/host-setup.md` §11 — this was verified against the live spine on
+2026-08-12 (host 17.10 dumping server 17.10).
+
+## Taking a backup
+
+On the hub, the CLI runs from the deployed clone the same way `bellasreef
+revoke` does (host-setup §10): source the service environment, then run it.
+
+```bash
+cd /home/david/bellasreef
+set -a; . /etc/bellasreef/api.env; set +a
+uv run bellasreef backup --out ~/backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
+```
+
+(`docker compose exec api bellasreef backup` is the form for a hub whose app
+services run containerized — phase 1 runs them as host units, so there is no
+`api` container to exec into.)
 
 From a workstation, pointing at the hub:
 
@@ -152,17 +170,17 @@ gives you a database full of empty tables, and restore will refuse it with
 `target-not-empty`. Which is correct behaviour, but it is easier to just not
 migrate.
 
-**5. Restore.**
+**5. Restore.** From the clone on the new host, with `postgresql-client-17`
+installed (host-setup §11) and the DSN pointing at the empty database:
 
 ```bash
-docker compose run --rm api bellasreef restore /backups/bellasreef.tar.gz
+cd /home/david/bellasreef
+set -a; . /etc/bellasreef/api.env; set +a
+uv run bellasreef restore /home/david/backups/bellasreef-<timestamp>.tar.gz
 ```
 
-**6. Start the rest of the stack.**
-
-```bash
-docker compose up -d
-```
+**6. Start the rest of the stack** — the spine unit, then the app units
+(host-setup §7).
 
 hardware-io re-announces its devices on boot, so the spine rebuilds itself.
 Your paired phones keep working, because the signing key came back with the
@@ -234,11 +252,11 @@ carried through a restore with the rest of the data, so an archive names the hub
 rather than the circumstances of its own creation.
 
 The other three fields corroborate and none of them is sufficient alone.
-`database_host` is Postgres as it was addressed — `postgres` when you run the
-documented `docker compose exec api bellasreef backup`, which identifies
-nothing; `bellasreef.local` when you run it from a laptop, which identifies
-everything. `taken_on` is the machine that ran the tool and has the
-mirror-image problem. `database` is almost always `bellasreef`.
+`database_host` is Postgres as it was addressed — `localhost` when you run the
+documented on-hub flow, which identifies nothing; `bellasreef.local` when you
+run it from a laptop, which identifies everything. `taken_on` is the machine
+that ran the tool and has the mirror-image problem. `database` is almost always
+`bellasreef`.
 
 One case leaves `hub_id` null: a database that has been migrated but has never
 had a service start against it, because the id is minted at startup rather than
