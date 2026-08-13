@@ -601,7 +601,7 @@ ssh <pi> 'docker exec bellasreef-postgres-1 psql -U bellasreef -d bellasreef -c 
 #   expect: 0 — no command_refused rows, ever, on the fresh database
 curl -s http://bellasreef.local:9102/metrics 2>/dev/null | grep 'suppressed.*unassigned' \
   || ssh <pi> 'curl -s http://localhost:9102/metrics | grep unassigned'
-#   expect: bellasreef_commands_suppressed_total{reason="unassigned"} climbing — suppressed, visibly, not refused
+#   expect: bellasreef_commands_suppressed_total{cause="unassigned"} climbing — suppressed, visibly, not refused
 ```
 
 - [ ] **Step 6 (only on failure): Rollback**
