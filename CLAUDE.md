@@ -99,6 +99,36 @@ alternative.
 - Logs are in journald (`journalctl -u bellasreef-hardware-io`). A log in
   `/tmp` gets overwritten by the next start, which destroyed the evidence for
   the first half of that outage.
+- The spine (NATS, Postgres, VictoriaMetrics) runs as `bellasreef-spine.service`
+  — oneshot+RemainAfterExit, `docker compose up -d --wait nats postgres
+  victoria-metrics` against an explicit service list (compose.yaml also
+  declares the app services; those run as host units in phase 1, so an
+  unqualified `up` would start a second BR_CMD consumer and collide on port
+  8000). Deploys **start** the unit, never restart it — the spine is shared
+  broker/DB state, not a redeployable artifact, and restarting it on every
+  deploy would recreate the exact durable-contention risk the environment
+  boundary rule above exists to prevent. Host state for the Pi is now two
+  files, not one: `/etc/bellasreef/<service>.env` (as above) **and**
+  `/home/david/bellasreef/deploy/.env` — the compose interpolation source for
+  `POSTGRES_*`, `VM_RETENTION`, `I2C_GID`/`GPIO_GID`. The GIDs are needed in
+  it even though no app container starts, because compose interpolates the
+  whole file up front.
+- A fresh registry means no devices. After any factory wipe, sensors must be
+  re-imported (`bellasreef devices import /etc/bellasreef/devices.import.yaml`,
+  which needs an API token via the TOFU-pair-a-seed-CLI-then-revoke dance)
+  before the deploy telemetry gate can pass — no devices, no readings, no
+  wire traffic to verify. The 2026-08-12 cutover hit exactly this.
+
+- FLAG (2026-08-12, unresolved): compose.yaml declares containerized app
+  services; the operative deployment is systemd host units. One of the two is
+  the future; David decides which, deliberately, not mid-task.
+- FLAG (2026-08-12, unresolved): the ad-hoc `-dev` spine ran LAN-exposed
+  (0.0.0.0:5432/4222/8428) since Aug 9; the compose spine is loopback-only.
+  If anything off-Pi was talking to those ports directly, it broke at cutover
+  — nothing is known to, but the exposure existed for three days.
+- FLAG (2026-08-12, unresolved): app units could be ordered After=bellasreef-spine.service now that
+  the spine is a unit; today they crash-loop briefly at boot until the spine is up (Restart=always
+  self-heals). Deliberate change, not urgent.
 
 ## Bench boundary (non-negotiable)
 
@@ -403,6 +433,17 @@ if `bellasreef.local` ever stops resolving, check this file first.
 
 WiFi power save is **off**, persisted in the NetworkManager connection profile.
 No firewall is active (`nftables`/`ufw` both inactive).
+
+## Spine — cutover 2026-08-12
+
+The spine moved from ad-hoc `pg-dev`/`nats-dev`/`vm-dev` containers to
+`bellasreef-spine.service` (compose, see Deployment discipline above).
+Containers: `bellasreef-nats-1`, `bellasreef-postgres-1`,
+`bellasreef-victoria-metrics-1`. Named volumes:
+`bellasreef_{nats,postgres,vm}-data`. All spine ports are loopback-only
+(`127.0.0.1:4222/8222/5432/8428`) — the old `-dev` containers were
+LAN-exposed (`0.0.0.0`) since 2026-08-09; see the standing flag below. The
+old containers are stopped, not yet removed — removal is gated on David.
 
 ## Installed tooling
 

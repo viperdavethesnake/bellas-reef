@@ -38,6 +38,26 @@ ls /dev/i2c-1
 gpiodetect | grep rp1       # expect gpiochip0 [pinctrl-rp1] (54 lines)
 ```
 
+## 1b. `deploy/.env` — the second host-state file
+
+Alongside the dtoverlays above, `/home/david/bellasreef/deploy/.env` is host
+state, not repo state: it is gitignored (`deploy/.env.example` is the
+template committed instead) and holds the values `bellasreef-spine.service`
+interpolates into `deploy/compose.yaml` — `POSTGRES_USER`,
+`POSTGRES_PASSWORD`, `POSTGRES_DB`, `BELLASREEF_DATABASE_URL`, `NATS_URL`,
+`VM_RETENTION`, `I2C_GID`, `GPIO_GID`.
+
+`I2C_GID`/`GPIO_GID` are required in this file even though the spine service
+starts no container with hardware access — compose interpolates the whole
+file before evaluating which services `up` targets, so a missing variable
+here fails the spine's `docker compose up`, not just an app container that
+never runs.
+
+Never committed, and never reset by `deploy-pi.sh` — a git reset touches the
+repo clone, not this file. Verify it exists and is current after any change
+to Postgres credentials, retention, or the host's `i2c`/`gpio` group GIDs
+(`getent group i2c gpio`).
+
 ## 2. Headless stripping
 
 The reference host runs with no display stack: `vc4-kms-v3d` removed, audio off,
