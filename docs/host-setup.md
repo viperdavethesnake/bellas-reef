@@ -260,6 +260,23 @@ Mode `0640`, group `david`. They hold the database DSN, which contains a
 password, and `Environment=` lines in a unit file are readable by any user
 through `systemctl show`.
 
+These files are deliberately not in the archive `bellasreef backup` writes, so
+on fresh hardware they are authored by hand. The full `api.env`, as the live
+hub runs it — the password is the one you put in `deploy/.env` (§1b):
+
+```
+BELLASREEF_NATS_URL=nats://localhost:4222
+BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:<password>@localhost:5432/bellasreef
+BELLASREEF_VM_URL=http://localhost:8428
+BELLASREEF_LOG_LEVEL=INFO
+BELLASREEF_ASSUME_CLOCK_TRUSTED=1
+```
+
+`BELLASREEF_VM_URL` is not optional decoration: `bellasreef backup` refuses to
+run without it (or an explicit `--no-telemetry-snapshot`), so an `api.env`
+missing it breaks backups, not just dashboards. The other two service files
+carry the same DSN/NATS pair minus the VM URL.
+
 `BELLASREEF_NATS_URL` is the entry that bites. Leave it out and hardware-io
 reads the probe, serves metrics, logs a clean startup, and publishes nothing at
 all. Nothing about the process looks wrong; the tank is simply not monitored.
@@ -285,8 +302,14 @@ bring-up.
 ```bash
 sudo install -m 0644 deploy/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now bellasreef-spine
 sudo systemctl enable --now bellasreef-hardware-io bellasreef-control-engine bellasreef-api
 ```
+
+The spine first: the app units crash-loop (harmlessly, `Restart=always`) until
+NATS and Postgres answer, and on a machine being *restored* rather than
+deployed, `docs/backup-restore.md` needs the spine up steps before the app
+units exist to start.
 
 The unit is ordered `After=time-sync.target` / `Wants=time-sync.target`. On a
 board with no RTC battery that ordering is the difference between a scheduler
@@ -665,8 +688,11 @@ sudo apt-get install -y postgresql-client-17
 ```
 
 Debian ships one PostgreSQL major per release and the compose spine pins
-`postgres:17`, so the versions track each other across `apt upgrade`. The rule
+`postgres:17`, so today the two coincide — but nothing couples them. The rule
 that matters: the client's major version must be **at least** the server's — an
-older `pg_dump` refuses a newer server outright. Installed and verified on this
-host 2026-08-12 (client 17.10, server 17.10; backup + restore drill both
-passed against the live spine).
+older `pg_dump` refuses a newer server outright. A compose bump to
+`postgres:18` therefore requires installing the matching newer client on the
+host in the same change, or every subsequent backup fails with that refusal
+until someone notices. Installed and verified on this host 2026-08-12 (client
+17.10, server 17.10; backup + restore drill both passed against the live
+spine).

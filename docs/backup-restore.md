@@ -79,36 +79,38 @@ export BELLASREEF_PG_BIN=/usr/local/opt/libpq/bin   # or /opt/homebrew/... on Ap
 ```
 
 On the hub, Postgres runs in a container but the CLI runs on the host, so the
-host needs its own copy of the tools (`docker exec` is not a path `pg_dump`'s
-`--file` output can cross). Debian ships the matching major:
-
-```bash
-sudo apt-get install -y postgresql-client-17
-```
-
-See `docs/host-setup.md` §11 — this was verified against the live spine on
-2026-08-12 (host 17.10 dumping server 17.10).
+host needs its own client package — `sudo apt-get install -y
+postgresql-client-17`. Host-setup §11 is the authority on which package, why
+the container's own copy cannot be borrowed, and what happens when the server
+major moves.
 
 ## Taking a backup
 
 On the hub, the CLI runs from the deployed clone the same way `bellasreef
-revoke` does (host-setup §10): source the service environment, then run it.
+revoke` does (host-setup §10): source the service environment, then run the
+installed script. `api.env` must carry `BELLASREEF_VM_URL` as well as the DSN
+— see the variable table in host-setup §7.
 
 ```bash
 cd /home/david/bellasreef
 set -a; . /etc/bellasreef/api.env; set +a
-uv run bellasreef backup --out ~/backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
+.venv/bin/bellasreef backup --out ~/backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
 ```
 
-(`docker compose exec api bellasreef backup` is the form for a hub whose app
-services run containerized — phase 1 runs them as host units, so there is no
-`api` container to exec into.)
+`.venv/bin/bellasreef`, not `uv run bellasreef`: the script form runs what the
+last deploy synced, while a bare `uv run` may re-resolve and rewrite the venv
+the live services are executing from.
 
-From a workstation, pointing at the hub:
+From a workstation there is no direct path: the spine's ports are
+loopback-only on the hub since the 2026-08-12 cutover, and `bellasreef.local:5432`
+refuses connections *by design* — do not "fix" that by re-exposing the ports.
+Either run the command over ssh as above and `scp` the archive off, or tunnel:
 
 ```bash
-export BELLASREEF_DATABASE_URL="postgresql+asyncpg://bellasreef:***@bellasreef.local:5432/bellasreef"
-export BELLASREEF_VM_URL="http://bellasreef.local:8428"
+ssh -L 5432:localhost:5432 -L 8428:localhost:8428 bellasreef.local
+# then, in another shell, with the password from the hub's api.env:
+export BELLASREEF_DATABASE_URL="postgresql+asyncpg://bellasreef:***@localhost:5432/bellasreef"
+export BELLASREEF_VM_URL="http://localhost:8428"
 bellasreef backup
 ```
 
@@ -152,15 +154,23 @@ The order matters, and one step is easy to get wrong.
 **1. Prepare the host.** Follow `docs/host-setup.md`. Overlays, chrony, avahi
 and the systemd units are host configuration, and none of it is in the archive.
 
-**2. Recreate `deploy/.env`** from `deploy/.env.example`. The database
-password and the `i2c`/`gpio` group IDs are deployment inputs. They are kept
-out of the archive so a file you copy to a laptop is not also a credential.
+**2. Recreate the two host-state files** — neither is in the archive, on
+purpose, so that a file you copy to a laptop is not also a credential:
 
-**3. Bring up Postgres alone.**
+- `deploy/.env` from `deploy/.env.example` — the database password and the
+  `i2c`/`gpio` group IDs (host-setup §1b).
+- `/etc/bellasreef/<service>.env` — the service environment, including the
+  DSN the restore command itself will read. Variable-by-variable recipe in
+  host-setup §7; the password must match what you put in `deploy/.env`.
+
+**3. Start the spine.** The unit files were installed in step 1 (host-setup
+§7), so the spine comes up supervised rather than as hand-run containers:
 
 ```bash
-docker compose up -d postgres
+sudo systemctl start bellasreef-spine.service
 ```
+
+NATS and VictoriaMetrics idle harmlessly; what this step is for is Postgres.
 
 **4. Create an empty database. Do not migrate it.**
 
@@ -171,16 +181,21 @@ gives you a database full of empty tables, and restore will refuse it with
 migrate.
 
 **5. Restore.** From the clone on the new host, with `postgresql-client-17`
-installed (host-setup §11) and the DSN pointing at the empty database:
+installed (host-setup §11), the venv synced (`uv sync --frozen` — deploy-pi.sh
+has not run yet on a machine being restored), and the DSN pointing at the
+empty database:
 
 ```bash
 cd /home/david/bellasreef
 set -a; . /etc/bellasreef/api.env; set +a
-uv run bellasreef restore /home/david/backups/bellasreef-<timestamp>.tar.gz
+.venv/bin/bellasreef restore /home/david/backups/bellasreef-<timestamp>.tar.gz
 ```
 
-**6. Start the rest of the stack** — the spine unit, then the app units
-(host-setup §7).
+**6. Start the app units.**
+
+```bash
+sudo systemctl start bellasreef-hardware-io bellasreef-control-engine bellasreef-api
+```
 
 hardware-io re-announces its devices on boot, so the spine rebuilds itself.
 Your paired phones keep working, because the signing key came back with the
@@ -252,10 +267,10 @@ carried through a restore with the rest of the data, so an archive names the hub
 rather than the circumstances of its own creation.
 
 The other three fields corroborate and none of them is sufficient alone.
-`database_host` is Postgres as it was addressed — `localhost` when you run the
-documented on-hub flow, which identifies nothing; `bellasreef.local` when you
-run it from a laptop, which identifies everything. `taken_on` is the machine
-that ran the tool and has the mirror-image problem. `database` is almost always
+`database_host` is Postgres exactly as the DSN addressed it — a loopback name
+(`localhost`, `127.0.0.1`, a tunnel) identifies nothing, a network name like
+`bellasreef.local` identifies everything. `taken_on` is the machine that ran
+the tool and has the mirror-image problem. `database` is almost always
 `bellasreef`.
 
 One case leaves `hub_id` null: a database that has been migrated but has never
