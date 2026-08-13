@@ -15,49 +15,93 @@ from __future__ import annotations
 from pathlib import Path
 
 from bellasreef_hardware_io.capabilities import (
-    PWM_CHANNEL_GPIO,
     discover_pwm,
     find_pwm_chip,
 )
+from bellasreef_hardware_io.capabilities import (
+    parse_pinctrl as _parse,
+)
 
 
-def _chip(tmp_path: Path, npwm: str) -> Path:
-    chip = tmp_path / "pwmchip0"
-    chip.mkdir()
-    (chip / "npwm").write_text(npwm)
-    return chip
+def _rp1_class(tmp_path: Path) -> Path:
+    devices = tmp_path / "devices"
+    chip = devices / "1f00098000.pwm" / "pwm" / "pwmchip0"
+    chip.mkdir(parents=True)
+    (chip / "npwm").write_text("4\n")
+    of_node = devices / "1f00098000.pwm" / "of_node"
+    of_node.mkdir()
+    (of_node / "compatible").write_bytes(b"raspberrypi,rp1-pwm\x00")
+    (chip / "device").symlink_to(devices / "1f00098000.pwm")
+    pwm_class = tmp_path / "class-pwm"
+    pwm_class.mkdir()
+    (pwm_class / "pwmchip0").symlink_to(chip)
+    return pwm_class
+
+
+#: pinctrl output exactly as this board prints it (2026-08-13).
+TWO_MUXED = """\
+12: a0    pd | lo // GPIO12 = PWM0_CHAN0
+13: a0    pd | lo // GPIO13 = PWM0_CHAN1
+18: no    pd | -- // GPIO18 = none
+19: no    pd | -- // GPIO19 = none
+"""
+
+FOUR_MUXED = TWO_MUXED.replace(
+    "18: no    pd | -- // GPIO18 = none", "18: a3    pd | lo // GPIO18 = PWM0_CHAN2"
+).replace("19: no    pd | -- // GPIO19 = none", "19: a3    pd | lo // GPIO19 = PWM0_CHAN3")
 
 
 class TestDiscoverPwm:
-    def test_only_pin_backed_channels_are_announced(self, tmp_path: Path) -> None:
-        """npwm says 4; the overlay muxes 2. The announcement is the 2."""
-        announcement = discover_pwm(_chip(tmp_path, "4\n"))
-        assert announcement is not None
-        assert [c.channel for c in announcement.channels] == ["0", "1"]
+    """The announcement mirrors the operator's overlay, read from the live
+    mux. Two channels muxed -> two announced; the full four-channel setup ->
+    four announced, zero code change. Unreadable mux -> honest absence."""
 
-    def test_every_announced_channel_names_its_pin(self, tmp_path: Path) -> None:
-        """The gpio in detail is the operator's physical-identity cue at the
-        moment of adoption; a pin-backed channel must always carry it."""
-        announcement = discover_pwm(_chip(tmp_path, "4\n"))
+    def test_two_muxed_channels_announce_two(self, tmp_path: Path) -> None:
+        announcement = discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: _parse(TWO_MUXED))
         assert announcement is not None
-        gpios = {c.channel: c.detail["gpio"] for c in announcement.channels}
-        assert gpios == {str(i): g for i, g in PWM_CHANNEL_GPIO.items()}
+        assert [(c.channel, c.detail["gpio"]) for c in announcement.channels] == [
+            ("0", 12),
+            ("1", 13),
+        ]
 
-    def test_npwm_smaller_than_the_map_announces_only_real_channels(self, tmp_path: Path) -> None:
-        """The kernel's count still bounds the announcement — a mapping entry
-        for a channel the chip does not report must not invent one."""
-        announcement = discover_pwm(_chip(tmp_path, "1\n"))
+    def test_four_muxed_channels_announce_four(self, tmp_path: Path) -> None:
+        announcement = discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: _parse(FOUR_MUXED))
+        assert announcement is not None
+        assert [(c.channel, c.detail["gpio"]) for c in announcement.channels] == [
+            ("0", 12),
+            ("1", 13),
+            ("2", 18),
+            ("3", 19),
+        ]
+
+    def test_channels_beyond_npwm_are_never_announced(self, tmp_path: Path) -> None:
+        """npwm still bounds the mux: a pin claiming a channel the chip does
+        not report must not conjure one."""
+        pwm_class = _rp1_class(tmp_path)
+        chip = (pwm_class / "pwmchip0").resolve()
+        (chip / "npwm").write_text("1\n")
+        announcement = discover_pwm(pwm_class, mux_reader=lambda: _parse(FOUR_MUXED))
         assert announcement is not None
         assert [c.channel for c in announcement.channels] == ["0"]
 
-    def test_a_missing_chip_announces_nothing(self, tmp_path: Path) -> None:
-        assert discover_pwm(tmp_path / "absent") is None
+    def test_an_unreadable_mux_announces_nothing(self, tmp_path: Path) -> None:
+        assert discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: None) is None
 
-    def test_an_unreadable_npwm_announces_nothing(self, tmp_path: Path) -> None:
-        chip = tmp_path / "pwmchip0"
-        chip.mkdir()
-        (chip / "npwm").write_text("not a number")
-        assert discover_pwm(chip) is None
+    def test_a_readable_mux_with_nothing_muxed_announces_nothing(self, tmp_path: Path) -> None:
+        assert discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: {}) is None
+
+    def test_a_missing_chip_announces_nothing(self, tmp_path: Path) -> None:
+        empty = tmp_path / "class-pwm"
+        empty.mkdir()
+        assert discover_pwm(empty, mux_reader=lambda: _parse(TWO_MUXED)) is None
+
+
+class TestReadPwmMux:
+    def test_this_boards_output_parses(self) -> None:
+        assert _parse(TWO_MUXED) == {0: 12, 1: 13}
+
+    def test_garbage_yields_no_reading(self) -> None:
+        assert _parse("not pinctrl output at all\n") == {}
 
 
 class TestFindPwmChip:
