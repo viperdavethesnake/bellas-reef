@@ -363,6 +363,15 @@ class ControlEngine:
                 self.metrics.suppressed.labels("unassigned").inc()
                 if intent.channel_id not in self._suppressed_unassigned:
                     self._suppressed_unassigned.add(intent.channel_id)
+                    # The transition into unadopted: forget what the scheduler
+                    # last emitted for this channel. hardware-io rebuilds the
+                    # driver dark on the next adoption, so remembered duty is
+                    # stale the instant the tombstone lands — left in place, a
+                    # re-adoption would resume as "ramp"/"converge" from the
+                    # old level instead of cold-starting from SAFE_DUTY, and
+                    # the newly-dark channel would pop straight to it with no
+                    # slew.
+                    self.scheduler.forget(intent.channel_id)
                     log.warning(
                         "channel has a schedule but no adoption; holding",
                         extra={"channel_id": intent.channel_id},

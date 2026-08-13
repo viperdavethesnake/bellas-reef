@@ -152,10 +152,29 @@ class LightingScheduler:
         self._last_emitted_at[intent.channel_id] = at
 
     def reset(self) -> None:
-        """Forget emission history.
+        """Forget emission history for every channel.
 
         Used after a clock-trust gap: what was emitted against a clock we no
         longer believe tells us nothing about what to emit now.
         """
         self._last_duty.clear()
         self._last_emitted_at.clear()
+
+    def forget(self, channel_id: str) -> None:
+        """Forget emission history for one channel.
+
+        Called the moment a channel becomes unadopted. hardware-io tears the
+        driver down and rebuilds it dark on the next adoption, so the duty this
+        scheduler last emitted stops being true the instant the tombstone
+        lands — it describes hardware that no longer exists. Left unforgotten,
+        the *next* adopt would see a non-``None`` ``_last_duty`` for this
+        channel and treat the following tick as a continuation ("ramp" /
+        "converge") of the old run instead of a fresh cold start, jumping the
+        newly-rebuilt-dark channel straight to whatever duty was last emitted
+        before the tombstone — with no slew, because nothing marks this as a
+        cold start once ``_last_duty`` is populated. Clearing it here forces
+        the first post-readoption intent back to "initial", converging from
+        :data:`SAFE_DUTY` like any other cold start.
+        """
+        self._last_duty.pop(channel_id, None)
+        self._last_emitted_at.pop(channel_id, None)

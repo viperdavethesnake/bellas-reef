@@ -152,6 +152,40 @@ class TestAssignmentGate:
         asyncio.run(engine._tick(datetime.now(UTC)))
         assert published[0].reason == "lighting:initial"
 
+    def test_readoption_after_tombstone_starts_cold_not_from_stale_duty(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """A channel that was adopted, published to, then unadopted, then
+        re-adopted must cold-start again — not jump straight to the duty the
+        scheduler remembers from before the tombstone.
+
+        hardware-io rebuilds the driver dark on adoption, so a scheduler that
+        still remembers the pre-tombstone duty would command a pop from 0 to
+        whatever it last emitted, with no slew, the instant a channel is
+        re-adopted. Timestamps are spread across the ramp (08:00 -> 08:30 ->
+        14:00): the 08:00 -> 08:30 gap must move the duty past the scheduler's
+        deadband, or the tombstone tick produces no "due" intent at all — and
+        the suppression transition (where `forget` is called) only runs for
+        channels the scheduler actually flags as due. A stale ``_last_duty``
+        would land on "ramp"/"converge" at 14:00, not "initial".
+        """
+        engine, published = engine_with_fake_publisher
+        first = datetime(2026, 6, 1, 8, tzinfo=UTC)
+        second = datetime(2026, 6, 1, 8, 30, tzinfo=UTC)
+        third = datetime(2026, 6, 1, 14, tzinfo=UTC)
+
+        engine.assignments.apply(_assignment("led-blue", adopted=True))
+        asyncio.run(engine._tick(first))  # cold "initial" publish
+        assert published[0].reason == "lighting:initial"
+
+        engine.assignments.apply(_assignment("led-blue", adopted=False))
+        asyncio.run(engine._tick(second))  # tombstoned; suppressed
+
+        engine.assignments.apply(_assignment("led-blue", adopted=True))
+        asyncio.run(engine._tick(third))  # re-adopted, hours later on the ramp
+
+        assert published[-1].reason == "lighting:initial"
+
 
 class TestProfileLoading:
     def test_loads_the_shipped_example(self) -> None:

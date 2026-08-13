@@ -102,6 +102,32 @@ class TestClockTrustReset:
         assert [i.reason for i in s.due(at(12, 1))] == ["initial"]
 
 
+class TestForget:
+    def test_forget_clears_one_channel_only(self) -> None:
+        """The re-adoption pop: a channel torn down and rebuilt dark must
+        cold-start again, not resume from what the scheduler last emitted —
+        and forgetting one channel must not disturb another's history."""
+        blue = ramp("blue")
+        white = ChannelProfile(
+            channel_id="white",
+            anchor="clock",
+            points=(RampPoint(at=time(8), duty=0.0), RampPoint(at=time(18), duty=1.0)),
+        )
+        s = LightingScheduler([blue, white], deadband=0.5, refresh_s=3600)
+        for intent in s.due(at(12)):
+            s.mark_emitted(intent, at(12))
+        assert s.due(at(12, 1)) == []
+
+        s.forget("blue")
+        reasons = {i.channel_id: i.reason for i in s.due(at(12, 1))}
+        assert reasons["blue"] == "initial"
+        assert "white" not in reasons
+
+    def test_forget_an_unknown_channel_is_a_no_op(self) -> None:
+        s = LightingScheduler([ramp()])
+        s.forget("no-such-channel")  # must not raise
+
+
 class TestValidation:
     @pytest.mark.parametrize(("deadband", "refresh"), [(-0.1, 60.0), (0.01, 0.0)])
     def test_invalid_tuning_is_refused(self, deadband: float, refresh: float) -> None:
