@@ -355,3 +355,62 @@ class TestWebSocketStream:
             assert frame["override"]["expires_in_s"] > 0
 
         run(engine.dispose)
+
+    def test_a_revoked_client_is_disconnected_at_the_next_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Revocation reaches an open socket, not just the next handshake.
+
+        Found live 2026-08-13: a revoked device's Tank tab kept rendering
+        telemetry because the only is_active check ran at the handshake.
+        The recheck is time-gated at STREAM_REVOKE_RECHECK_S; zero here so
+        the very next frame carries the check.
+        """
+        import bellasreef_api.app as app_module
+
+        monkeypatch.setattr(app_module, "STREAM_REVOKE_RECHECK_S", 0.0)
+        app, token, engine = self._app_and_token()
+
+        async def revoke_self_and_publish() -> None:
+            from bellasreef_contracts import ActuatorState, BinaryLevel
+            from bellasreef_hardware_io.spine import Spine
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                response = await c.delete(
+                    "/api/v1/clients/me",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert response.status_code == 200, response.text
+
+            spine = Spine(os.environ[_NATS])
+            await spine.connect()
+            await asyncio.sleep(0.4)  # let the bridge's subscription settle
+            await spine.publish_state(
+                ActuatorState(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    actuator_id="led-blue",
+                    level=BinaryLevel(on=False),
+                    reason="commanded",
+                    since=datetime.now(UTC),
+                )
+            )
+            await spine.close()
+
+        with TestClient(app) as client, client.websocket_connect("/api/v1/stream") as ws:
+            ws.send_text(json.dumps({"token": token}))
+            ready = json.loads(ws.receive_text())
+            assert ready["kind"] == "ready"
+
+            worker = threading.Thread(target=lambda: asyncio.run(revoke_self_and_publish()))
+            worker.start()
+            worker.join(timeout=30)
+
+            # The frame that would have been sent instead carries the close.
+            with pytest.raises(Exception):  # noqa: B017
+                ws.receive_text()
+
+        run(engine.dispose)
