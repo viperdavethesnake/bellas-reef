@@ -47,6 +47,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from bellasreef_control_engine.alerts import AlertSupervisor, SilenceWatcher, Thresholds
+from bellasreef_control_engine.assignments import AssignmentLedger
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import Intent, LightingScheduler
@@ -131,6 +132,9 @@ class ControlEngine:
         self.overrides = override_store
         self._held: dict[str, ActiveOverride] = {}
         self.publisher = CommandPublisher(nats_url) if nats_url else None
+        self.assignments = AssignmentLedger()
+        self._assignments_loaded = False
+        self._suppressed_unassigned: set[str] = set()
 
         self._loop_interval_s = loop_interval_s
         self._liveness_timeout_s = liveness_timeout_s
@@ -162,6 +166,8 @@ class ControlEngine:
         )
         if self.publisher is not None:
             await self.publisher.connect()
+            await self.publisher.subscribe_assignments(self.assignments.apply)
+            self._assignments_loaded = await self.publisher.load_assignments(self.assignments)
 
         await self._rearm_overrides()
         await self._start_alerting()
@@ -198,6 +204,17 @@ class ControlEngine:
             self.metrics.loop_stall.set(self.liveness.age_s())
 
             self._refresh_clock_trust()
+
+            if (
+                self.publisher is not None
+                and self.publisher.connected
+                and not self._assignments_loaded
+            ):
+                # A drain that found no stream yet — the assignment stream may
+                # provision after this service starts. The live subscription
+                # (started in run(), before this ever ran) alone would miss
+                # anything published before it attached.
+                self._assignments_loaded = await self.publisher.load_assignments(self.assignments)
 
             if self._clock_trusted:
                 if mono >= next_ping:
@@ -337,6 +354,25 @@ class ControlEngine:
         held = {t: o.duty for t, o in self._held.items()}
         intents = self.scheduler.due(now, held)
         for intent in intents:
+            if not self.assignments.is_adopted(intent.channel_id):
+                # Not an error and not silent: the schedule is config-in-git,
+                # adoption is operator state, and the two are allowed to
+                # disagree — a profile for a channel nobody has adopted waits.
+                # One log per channel, a metric forever, zero commands: the
+                # alternative was a command_refused audit row every 5 minutes.
+                self.metrics.suppressed.labels("unassigned").inc()
+                if intent.channel_id not in self._suppressed_unassigned:
+                    self._suppressed_unassigned.add(intent.channel_id)
+                    log.warning(
+                        "channel has a schedule but no adoption; holding",
+                        extra={"channel_id": intent.channel_id},
+                    )
+                continue
+            if intent.channel_id in self._suppressed_unassigned:
+                self._suppressed_unassigned.discard(intent.channel_id)
+                log.info(
+                    "channel adopted; scheduling resumes", extra={"channel_id": intent.channel_id}
+                )
             await self._publish(intent, now)
 
     async def _sweep_silence(self, now: datetime) -> None:
