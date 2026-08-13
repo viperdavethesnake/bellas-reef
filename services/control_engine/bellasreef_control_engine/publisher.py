@@ -240,16 +240,23 @@ class CommandPublisher:
         hears every bind/unbind the API publishes — no durable, deliberately:
         a durable here would contend with nothing but would still be broker
         state to leak. Malformed payloads are dropped with a log, same contract
-        as subscribe_sensors.
+        as subscribe_sensors: parsing and handling are guarded separately, so a
+        handler that raises cannot escape this callback and kill the
+        subscription silently.
         """
         if self._nc is None:
             raise RuntimeError("publisher not connected")
 
         async def _on_message(msg: Msg) -> None:
             try:
-                handler(DeviceAssignment.model_validate_json(msg.data))
+                assignment = DeviceAssignment.model_validate_json(msg.data)
             except ValidationError:
                 log.warning("dropping an undecodable assignment", extra={"subject": msg.subject})
+                return
+            try:
+                handler(assignment)
+            except Exception:  # broad by design - see docstring
+                log.exception("assignment handling failed", extra={"subject": msg.subject})
 
         await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_on_message)
         log.info("subscribed to assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
