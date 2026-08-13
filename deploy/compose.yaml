@@ -48,6 +48,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?set in .env}
       # Deterministic collation; avoids index corruption across libc upgrades.
       POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und-x-icu"
+    ports:
+      # Phase-1 topology runs api/control-engine/hardware-io as systemd host
+      # units (see deploy/systemd/); they reach Postgres on loopback. Remove
+      # when the app services move into this file for real.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
