@@ -38,29 +38,29 @@ __all__ = [
 PWM_CHIP = Path("/sys/class/pwm/pwmchip0")
 W1_DEVICES = Path("/sys/bus/w1/devices")
 
-#: Which GPIO each PWM channel reaches, from the archived HAL (v3.1.0):
-#: channel 0 -> GPIO12, channel 1 -> GPIO13, set by
-#: ``dtoverlay=pwm,pin=12,func=4`` and ``pin=13``.
+#: Which GPIO each PWM channel reaches. **Verified on this board 2026-08-12**
+#: (CLAUDE.md, Verified host facts): ``dtoverlay=pwm-2chan,pin=12,func=4,
+#: pin2=13,func2=4`` muxes channel 0 -> GPIO12 and channel 1 -> GPIO13,
+#: confirmed with ``pinctrl get 12,13``.
 #:
-#: **Not confirmed on this board.** It is reported to clients as a convenience
-#: so an operator binding a channel can see which pin they are claiming, and it
-#: is a wiring fact rather than a software one — out of scope to verify here per
-#: the bench boundary. A channel with no entry announces without a gpio field
-#: rather than guessing.
+#: This map is also the announcement filter: a channel absent from it reaches
+#: no pin, and a pinless channel is not something the hub can offer — it
+#: exports in sysfs and drives nothing, which is the trap the host notes call
+#: out. Changing the overlay therefore means updating this map in the same
+#: commit, the same discipline the pinned PWM frequency follows.
 PWM_CHANNEL_GPIO: dict[int, int] = {0: 12, 1: 13}
 
 
 def discover_pwm(chip: Path = PWM_CHIP) -> CapabilityAnnouncement | None:
-    """The Pi's own PWM channels, from ``npwm``.
+    """The Pi's own pin-backed PWM channels.
 
-    Reads the count the kernel reports rather than assuming one. Our Pi reports
-    4 where the archived HAL states 2 — recorded in CLAUDE.md, unresolved, and
-    exactly why this asks the hardware instead of hardcoding a number.
-
-    Channels are announced whether or not an overlay has muxed them to a pin.
-    hardware-io cannot tell the difference from sysfs, and claiming otherwise
-    would be inventing a fact; the operator binding a channel is the one who
-    knows what is wired.
+    ``npwm`` bounds the count (our Pi reports 4 where the archived HAL states
+    2 — recorded in CLAUDE.md, and why this asks the hardware instead of
+    hardcoding a number), and :data:`PWM_CHANNEL_GPIO` filters it: only
+    channels the overlay muxes to a pin are announced. The RP1's other
+    channels export in sysfs and drive nothing; announcing them offered the
+    operator a device the engine would command, with green telemetry, and no
+    output — met in the app on 2026-08-13 as two adoptable ghosts.
     """
     if not chip.is_dir():
         return None
@@ -72,10 +72,10 @@ def discover_pwm(chip: Path = PWM_CHIP) -> CapabilityAnnouncement | None:
 
     channels = []
     for index in range(npwm):
-        detail: dict[str, str | int | float | bool] = {"chip": chip.name}
         gpio = PWM_CHANNEL_GPIO.get(index)
-        if gpio is not None:
-            detail["gpio"] = gpio
+        if gpio is None:
+            continue
+        detail: dict[str, str | int | float | bool] = {"chip": chip.name, "gpio": gpio}
         channels.append(CapabilityChannel(channel=str(index), detail=detail))
 
     return CapabilityAnnouncement(
