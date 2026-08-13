@@ -241,13 +241,18 @@ step "waiting for a fresh sample on the wire"
 # /api/v1/export rather than /api/v1/query: VictoriaMetrics hides the newest
 # ~30s from instant queries (-search.latencyOffset), so a fresh write looks
 # like a failed one through /query.
+#
+# Probed over ssh against localhost, not curled from the dev machine: this
+# branch's compose cutover binds VictoriaMetrics to 127.0.0.1 on the Pi (see
+# deploy/compose.yaml), so a probe from off-box would get connection-refused
+# while telemetry is perfectly healthy. Same shape as the journalctl calls
+# elsewhere in this script — run the check where the loopback port actually is.
 START="$(date +%s)"
 DEADLINE=$((START + 90))
 FOUND=0
 while [[ "$(date +%s)" -lt $DEADLINE ]]; do
     now="$(date +%s)"
-    body="$(curl -fsS --max-time 10 \
-        "http://${PI_HOST}:8428/api/v1/export?match[]=bellasreef_sensor_reading&start=${START}&end=${now}" 2>/dev/null)"
+    body="$(ssh "$PI_HOST" "curl -fsS --max-time 10 'http://localhost:8428/api/v1/export?match[]=bellasreef_sensor_reading&start=${START}&end=${now}'" 2>/dev/null)"
     if [[ -n "$body" ]] && grep -q '"values"' <<<"$body"; then
         FOUND=1
         break
