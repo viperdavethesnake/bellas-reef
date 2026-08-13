@@ -75,9 +75,37 @@ class CommandPublisher:
         self._nc: Client | None = None
         self._js: JetStreamContext | None = None
         self._beat_seq = 0
+        #: Called after the underlying NATS client reconnects. Settable any
+        #: time before :meth:`connect` runs — that is when it gets wired into
+        #: ``reconnected_cb``. See the docstring on :meth:`connect` for why
+        #: this exists.
+        self.on_reconnected: Callable[[], None] | None = None
 
     async def connect(self) -> None:
-        self._nc = await nats.connect(self._url)
+        """Connect, and re-arm the assignment drain across a reconnect.
+
+        Core NATS subscriptions (``subscribe_assignments``, ``subscribe_sensors``)
+        survive a reconnect on their own — the client resubscribes — but any
+        message published *while disconnected* is simply never delivered to
+        them. There is no redelivery on core pub/sub, unlike JetStream. A
+        tombstone published during a gap would then be permanently missed:
+        the ledger keeps the channel adopted forever, until the process
+        restarts.
+
+        The retained assignment stream (JetStream) still has that tombstone,
+        though, so the fix is to force a re-drain of it once the client is
+        back: ``reconnected_cb`` fires ``on_reconnected``, which the engine
+        wires to flip ``_assignments_loaded`` back to False. The existing
+        ``_loop`` retry (written for a stream that provisions after startup)
+        then re-drains it for free — this reuses that path rather than adding
+        a second one.
+        """
+
+        async def _on_reconnected() -> None:
+            if self.on_reconnected is not None:
+                self.on_reconnected()
+
+        self._nc = await nats.connect(self._url, reconnected_cb=_on_reconnected)
         self._js = self._nc.jetstream()
         log.info("publisher connected", extra={"url": self._url})
 
