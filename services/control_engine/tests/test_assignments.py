@@ -3,14 +3,18 @@
 """The ledger is pure state: assignments in, adopted-set out."""
 
 import asyncio
+import logging
+import time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from bellasreef_contracts import DeviceAssignment
 from bellasreef_control_engine.assignments import AssignmentLedger
 from bellasreef_control_engine.publisher import CommandPublisher
+from nats.js.errors import NotFoundError
 
 
 def _assignment(device_id: str, *, adopted: bool) -> DeviceAssignment:
@@ -122,3 +126,43 @@ def test_subscribe_assignments_survives_a_raising_handler() -> None:
 
     assert fake_nc.cb is not None
     asyncio.run(fake_nc.cb(msg))  # must not raise out of the callback
+
+
+class _FakeJsNotFound:
+    """A stream that has not been provisioned yet — pull_subscribe refuses."""
+
+    async def pull_subscribe(self, subject: str, durable: object, config: object) -> _FakeSub:
+        raise NotFoundError
+
+
+def test_unprovisioned_stream_warns_once_then_throttles(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """_loop retries load_assignments every loop_interval_s (1s by default)
+    until the stream provisions. Without throttling that is a warning a
+    second; this asserts the first sighting logs and the throttle window
+    is respected, while every call still returns False."""
+    fake_now = [0.0]
+    # Patches the shared stdlib `time` module object, not a reference held by
+    # bellasreef_control_engine.publisher — mypy --strict forbids reaching
+    # into another module's attributes that aren't in its __all__, and this
+    # works regardless because `import time` there resolves to this same
+    # module instance.
+    monkeypatch.setattr(time, "monotonic", lambda: fake_now[0])
+
+    publisher = CommandPublisher("nats://unused:4222")
+    publisher._js = _FakeJsNotFound()  # type: ignore[assignment]
+    ledger = AssignmentLedger()
+
+    with caplog.at_level(logging.WARNING, logger="bellasreef_control_engine.publisher"):
+        assert asyncio.run(publisher.load_assignments(ledger)) is False  # t=0: warns
+        assert asyncio.run(publisher.load_assignments(ledger)) is False  # t=0: throttled
+
+        fake_now[0] = 30.0
+        assert asyncio.run(publisher.load_assignments(ledger)) is False  # t=30: throttled
+
+        fake_now[0] = 61.0
+        assert asyncio.run(publisher.load_assignments(ledger)) is False  # t=61: warns again
+
+    warnings = [r for r in caplog.records if "not provisioned" in r.message]
+    assert len(warnings) == 2

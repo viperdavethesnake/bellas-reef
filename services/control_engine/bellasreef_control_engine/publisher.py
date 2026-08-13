@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -56,6 +57,14 @@ log = get_logger(__name__)
 #: schedule has already moved past.
 DEFAULT_COMMAND_TTL_S = 30.0
 
+#: Minimum gap between "assignment stream not provisioned yet" warnings.
+#:
+#: _loop retries load_assignments every loop_interval_s (1s by default) until
+#: it succeeds, so logging on every failed attempt is a warning a second for
+#: as long as the hub takes to provision the stream. One at first sight is the
+#: useful signal; the rest is noise that would bury it.
+UNPROVISIONED_WARN_INTERVAL_S = 60.0
+
 
 class CommandPublisher:
     """Publishes to `bellasreef.cmd.*` and heartbeats to `bellasreef.heartbeat.*`."""
@@ -80,6 +89,10 @@ class CommandPublisher:
         #: ``reconnected_cb``. See the docstring on :meth:`connect` for why
         #: this exists.
         self.on_reconnected: Callable[[], None] | None = None
+        #: monotonic() of the last "assignment stream not provisioned yet"
+        #: warning, or None before the first one. See
+        #: UNPROVISIONED_WARN_INTERVAL_S.
+        self._unprovisioned_warned_at: float | None = None
 
     async def connect(self) -> None:
         """Connect, and re-arm the assignment drain across a reconnect.
@@ -239,7 +252,18 @@ class CommandPublisher:
                 config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
             )
         except NotFoundError:
-            log.warning("assignment stream not provisioned yet; will retry")
+            # _loop retries this every loop_interval_s (1s by default) until
+            # it succeeds, so logging every attempt is a warning a second for
+            # as long as the hub takes to provision the stream. Log the first
+            # sighting, then at most once per UNPROVISIONED_WARN_INTERVAL_S —
+            # still returning False every time either way.
+            now = time.monotonic()
+            if (
+                self._unprovisioned_warned_at is None
+                or now - self._unprovisioned_warned_at >= UNPROVISIONED_WARN_INTERVAL_S
+            ):
+                self._unprovisioned_warned_at = now
+                log.warning("assignment stream not provisioned yet; will retry")
             return False
 
         while True:
