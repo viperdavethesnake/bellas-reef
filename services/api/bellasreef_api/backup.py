@@ -140,10 +140,11 @@ class HubIdentity(_Strict):
     """Which tank this came from — recorded from two angles, because neither
     one is sufficient on its own.
 
-    ``database_host`` is the Postgres server as it was addressed. Run on the
-    hub the documented way (the host-unit CLI with ``api.env`` sourced) that is
-    ``localhost``, which identifies nothing. Run from a laptop it is
-    ``bellasreef.local``, which identifies everything.
+    ``database_host`` is the Postgres server exactly as the DSN addressed it.
+    A loopback name (``localhost``, ``127.0.0.1``, a tunnel) identifies
+    nothing; a network name like ``bellasreef.local`` identifies everything.
+    Which one the on-hub flow produces is a fact about the host's ``api.env``,
+    not about this code.
 
     ``taken_on`` is the machine that ran the tool, and has the mirror-image
     problem: on the hub it is the hub, from a laptop it is the laptop.
