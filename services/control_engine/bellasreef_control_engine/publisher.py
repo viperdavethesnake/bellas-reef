@@ -18,6 +18,7 @@ possible in one place instead of many:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from uuid import uuid4
 import nats
 from bellasreef_contracts import (
     ActuatorCommand,
+    DeviceAssignment,
     PwmLevel,
     SensorAlert,
     SensorReading,
@@ -36,7 +38,11 @@ from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
+from nats.js.api import ConsumerConfig, DeliverPolicy
+from nats.js.errors import NotFoundError
 from pydantic import ValidationError
+
+from bellasreef_control_engine.assignments import AssignmentLedger
 
 __all__ = ["DEFAULT_COMMAND_TTL_S", "CommandPublisher"]
 
@@ -187,6 +193,66 @@ class CommandPublisher:
 
         await self._nc.subscribe(subjects.ALL_SENSORS, cb=_on_message)
         log.info("subscribed to sensor telemetry", extra={"subject": subjects.ALL_SENSORS})
+
+    async def load_assignments(self, ledger: AssignmentLedger) -> bool:
+        """Drain the retained assignment stream into ``ledger``, once.
+
+        Mirrors hardware-io's startup read: LAST_PER_SUBJECT gives the current
+        truth per device, tombstones included. Returns False when the stream is
+        not provisioned yet — a hub booting in arbitrary order — so the caller
+        knows to retry rather than trusting an empty ledger forever.
+        """
+        if self._js is None:
+            raise RuntimeError("publisher not connected")
+        try:
+            sub = await self._js.pull_subscribe(
+                subjects.ALL_ASSIGNMENTS,
+                durable=None,
+                config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+            )
+        except NotFoundError:
+            log.warning("assignment stream not provisioned yet; will retry")
+            return False
+
+        while True:
+            try:
+                msgs = await sub.fetch(32, timeout=1.0)
+            except (TimeoutError, nats.errors.TimeoutError):
+                break
+            for msg in msgs:
+                try:
+                    ledger.apply(DeviceAssignment.model_validate_json(msg.data))
+                except ValidationError:
+                    log.warning(
+                        "assignment did not validate; skipped",
+                        extra={"subject": msg.subject},
+                    )
+                await msg.ack()
+        with contextlib.suppress(Exception):
+            await sub.unsubscribe()
+        log.info("assignments loaded", extra={"adopted": sorted(ledger.adopted)})
+        return True
+
+    async def subscribe_assignments(self, handler: Callable[[DeviceAssignment], None]) -> None:
+        """Live adoption changes, on core pub/sub.
+
+        A JetStream publish traverses core subjects too, so a plain subscription
+        hears every bind/unbind the API publishes — no durable, deliberately:
+        a durable here would contend with nothing but would still be broker
+        state to leak. Malformed payloads are dropped with a log, same contract
+        as subscribe_sensors.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+
+        async def _on_message(msg: Msg) -> None:
+            try:
+                handler(DeviceAssignment.model_validate_json(msg.data))
+            except ValidationError:
+                log.warning("dropping an undecodable assignment", extra={"subject": msg.subject})
+
+        await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_on_message)
+        log.info("subscribed to assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
 
     async def heartbeat(self, interval_s: float) -> None:
         """Core pub/sub, never JetStream.
