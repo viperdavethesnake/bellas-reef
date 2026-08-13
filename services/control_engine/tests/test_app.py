@@ -163,11 +163,12 @@ class TestAssignmentGate:
         still remembers the pre-tombstone duty would command a pop from 0 to
         whatever it last emitted, with no slew, the instant a channel is
         re-adopted. Timestamps are spread across the ramp (08:00 -> 08:30 ->
-        14:00): the 08:00 -> 08:30 gap must move the duty past the scheduler's
-        deadband, or the tombstone tick produces no "due" intent at all — and
-        the suppression transition (where `forget` is called) only runs for
-        channels the scheduler actually flags as due. A stale ``_last_duty``
-        would land on "ramp"/"converge" at 14:00, not "initial".
+        14:00) so the duty genuinely moves between ticks — this is the "slow"
+        path, distinct from test_tombstone_forgets_immediately_even_when_no_tick_is_due
+        below, which is the same defect on a tombstone that never appears in
+        any tick's due intents at all. Forgetting is driven by the tombstone
+        event (AssignmentLedger.on_tombstone), not tick timing, so both are
+        covered by the same fix.
         """
         engine, published = engine_with_fake_publisher
         first = datetime(2026, 6, 1, 8, tzinfo=UTC)
@@ -184,6 +185,69 @@ class TestAssignmentGate:
         engine.assignments.apply(_assignment("led-blue", adopted=True))
         asyncio.run(engine._tick(third))  # re-adopted, hours later on the ramp
 
+        assert published[-1].reason == "lighting:initial"
+
+    def test_tombstone_forgets_immediately_even_when_no_tick_is_due(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """Reproduction from the scoped re-review of this branch's first
+        pass at finding 2.
+
+        A forget() called from inside `_tick`'s `for intent in intents:` loop
+        only ever runs for a channel `due()` actually surfaces — which
+        happens only when it is cold, mid-slew, past the 0.005 deadband, or
+        past the 300s refresh window. Unadopt 30s after publish and re-adopt
+        30s after that lands well inside both windows: the channel never
+        appears in `intents` while suppressed, so a tick-scoped forget()
+        never runs at all — not "late", not "throttled", *never*, until
+        something else makes the channel due again. The next due tick then
+        publishes a "ramp" continuation from the stale pre-tombstone duty:
+        the exact pop, on a channel that was dark the whole time in between.
+
+        Forgetting must therefore be driven by the tombstone event itself
+        (AssignmentLedger.on_tombstone -> LightingScheduler.forget, wired in
+        ControlEngine.__init__), which fires the moment apply() sees
+        adopted=False regardless of what any tick is doing — specifically,
+        it fires from the ``apply(adopted=False)`` call below, *before*
+        ``_tick(unadopt_at)`` ever runs. That is what makes the channel cold
+        again at ``readopt_at``: a cold intent bypasses the deadband/refresh
+        gates entirely and always emits (see ``due()``), so the very next
+        tick where the channel is adopted is already "the next due tick" —
+        no need to wait out the 300s refresh window to see the effect.
+
+        Under the tick-scoped forget this replaces, none of that happens:
+        ``_last_duty`` is still the pre-tombstone value at ``readopt_at``,
+        the delta is inside the deadband and 60s is inside the refresh
+        window, so due() does not even surface the channel — nothing
+        publishes at ``readopt_at`` at all, and the eventual first
+        publish (whenever the schedule next drifts past the deadband or the
+        refresh window elapses) is a "ramp" continuation from the stale
+        duty, not "initial".
+        """
+        engine, published = engine_with_fake_publisher
+        t0 = datetime(2026, 6, 1, 8, 0, 0, tzinfo=UTC)
+        unadopt_at = datetime(2026, 6, 1, 8, 0, 30, tzinfo=UTC)
+        readopt_at = datetime(2026, 6, 1, 8, 1, 0, tzinfo=UTC)
+
+        engine.assignments.apply(_assignment("led-blue", adopted=True))
+        asyncio.run(engine._tick(t0))  # cold "initial" publish
+        assert published[0].reason == "lighting:initial"
+
+        # Tombstone 30s later: well inside the scheduler's deadband (0.005)
+        # and refresh window (300s). apply() fires on_tombstone here,
+        # synchronously, regardless of whether the following tick finds
+        # anything due.
+        engine.assignments.apply(_assignment("led-blue", adopted=False))
+        asyncio.run(engine._tick(unadopt_at))
+        assert len(published) == 1, "30s in, well inside deadband/refresh: nothing was due"
+
+        # Re-adopt 30s after that — still well inside both windows by the
+        # clock alone. The tombstone already forgot this channel, so it is
+        # cold again: this tick is the proof.
+        engine.assignments.apply(_assignment("led-blue", adopted=True))
+        asyncio.run(engine._tick(readopt_at))
+
+        assert len(published) == 2
         assert published[-1].reason == "lighting:initial"
 
 
