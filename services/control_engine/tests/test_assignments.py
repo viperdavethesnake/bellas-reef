@@ -3,6 +3,7 @@
 """The ledger is pure state: assignments in, adopted-set out."""
 
 import asyncio
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -79,6 +80,16 @@ class _FakeJs:
         return _FakeSub(self._batches)
 
 
+class _FakeNc:
+    def __init__(self) -> None:
+        self.cb: Callable[[_FakeMsg], Coroutine[Any, Any, None]] | None = None
+
+    async def subscribe(
+        self, subject: str, cb: Callable[[_FakeMsg], Coroutine[Any, Any, None]]
+    ) -> None:
+        self.cb = cb
+
+
 def test_drain_feeds_ledger_and_skips_garbage() -> None:
     good = _assignment("led-blue", adopted=True)
     msgs = [
@@ -94,3 +105,20 @@ def test_drain_feeds_ledger_and_skips_garbage() -> None:
     assert loaded is True
     assert ledger.adopted == frozenset({"led-blue"})
     assert all(m.acked for m in msgs)
+
+
+def test_subscribe_assignments_survives_a_raising_handler() -> None:
+    good = _assignment("led-blue", adopted=True)
+    msg = _FakeMsg(good.model_dump_json().encode(), "bellasreef.assignment.led-blue")
+
+    def handler(assignment: DeviceAssignment) -> None:
+        raise RuntimeError("boom")
+
+    publisher = CommandPublisher("nats://unused:4222")
+    fake_nc = _FakeNc()
+    publisher._nc = fake_nc  # type: ignore[assignment]
+
+    asyncio.run(publisher.subscribe_assignments(handler))
+
+    assert fake_nc.cb is not None
+    asyncio.run(fake_nc.cb(msg))  # must not raise out of the callback
