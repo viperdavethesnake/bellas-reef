@@ -165,6 +165,13 @@ class ControlEngine:
             },
         )
         if self.publisher is not None:
+            # Wired before connect(), which is when CommandPublisher hands it
+            # to nats.py's reconnected_cb. A reconnect means core-subject
+            # messages (assignment tombstones included) may have been missed
+            # during the gap — see CommandPublisher.connect's docstring — so
+            # this forces the _loop retry to re-drain JetStream, which still
+            # has them.
+            self._wire_reconnect_handling()
             await self.publisher.connect()
             await self.publisher.subscribe_assignments(self.assignments.apply)
             self._assignments_loaded = await self.publisher.load_assignments(self.assignments)
@@ -190,6 +197,28 @@ class ControlEngine:
 
     def request_stop(self) -> None:
         self._stopping.set()
+
+    def _wire_reconnect_handling(self) -> None:
+        """Point the publisher's reconnect hook at ``_on_reconnected``.
+
+        Split out from :meth:`run` so it is callable on its own — the wiring
+        itself needs no live connection, and testing it that way avoids
+        driving a real NATS reconnect just to prove the two objects are
+        pointed at each other.
+        """
+        if self.publisher is not None:
+            self.publisher.on_reconnected = self._on_reconnected
+
+    def _on_reconnected(self) -> None:
+        """A NATS reconnect may have missed core-subject messages.
+
+        ``_loop`` already retries ``load_assignments`` while
+        ``_assignments_loaded`` is False (written for a stream that
+        provisions after startup) — flipping it back here reuses that retry
+        to re-drain JetStream, which still has whatever tombstone or bind was
+        missed during the gap.
+        """
+        self._assignments_loaded = False
 
     # ------------------------------------------------------------- main loop
 

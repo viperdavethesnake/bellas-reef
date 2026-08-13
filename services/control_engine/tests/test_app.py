@@ -187,6 +187,82 @@ class TestAssignmentGate:
         assert published[-1].reason == "lighting:initial"
 
 
+class TestReconnectReDrain:
+    """A NATS reconnect can miss core-subject messages (e.g. a tombstone) sent
+    during the gap. `_wire_reconnect_handling` points the publisher's
+    `on_reconnected` at `_on_reconnected`, which flips `_assignments_loaded`
+    back to False so `_loop`'s existing retry re-drains JetStream — which
+    still has whatever was missed.
+    """
+
+    def test_wiring_points_the_publisher_at_on_reconnected(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        engine, _ = engine_with_fake_publisher
+        assert engine.publisher is not None
+
+        engine._wire_reconnect_handling()
+
+        # Bound-method identity is not stable across attribute reads, so this
+        # proves the wiring by effect rather than by inspecting the callable:
+        # invoking whatever got wired must produce exactly _on_reconnected's
+        # effect. test_reconnect_makes_the_next_loop_iteration_redrain below
+        # proves the far end of the same wiring, through the real loop.
+        engine._assignments_loaded = True
+        assert engine.publisher.on_reconnected is not None
+        engine.publisher.on_reconnected()
+        assert engine._assignments_loaded is False
+
+    def test_on_reconnected_flips_assignments_loaded_false(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        engine, _ = engine_with_fake_publisher
+        engine._assignments_loaded = True
+
+        engine._on_reconnected()
+
+        assert engine._assignments_loaded is False
+
+    def test_wiring_is_a_no_op_with_no_spine(self) -> None:
+        """An engine with no publisher (no BELLASREEF_NATS_URL) must not blow
+        up when run() calls this unconditionally-safe wiring step."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        assert engine.publisher is None
+        engine._wire_reconnect_handling()  # must not raise
+
+    def test_reconnect_makes_the_next_loop_iteration_redrain(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """End-to-end through the real `_loop`, not a re-statement of its
+        condition: after a reconnect, one iteration must call
+        load_assignments again and pick up whatever it returns."""
+        engine, _ = engine_with_fake_publisher
+        assert engine.publisher is not None
+        engine._loop_interval_s = 0.0
+        engine._assignments_loaded = True
+        engine._clock_trusted = False  # keep the iteration to just the redrain check
+
+        redrain_calls = 0
+
+        async def fake_load_assignments(ledger: object) -> bool:
+            nonlocal redrain_calls
+            redrain_calls += 1
+            engine.request_stop()  # stop after the one iteration under test
+            return True
+
+        engine.publisher.load_assignments = fake_load_assignments  # type: ignore[method-assign]
+        engine._wire_reconnect_handling()
+
+        # Simulates what nats.py does: fires the callback it was handed.
+        engine.publisher.on_reconnected()  # type: ignore[misc]
+        assert engine._assignments_loaded is False
+
+        asyncio.run(engine._loop())
+
+        assert redrain_calls == 1
+        assert engine._assignments_loaded is True
+
+
 class TestProfileLoading:
     def test_loads_the_shipped_example(self) -> None:
         profiles = load_profiles(Path("deploy/config/lighting.json"))
