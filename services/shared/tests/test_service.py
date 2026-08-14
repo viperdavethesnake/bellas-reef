@@ -14,12 +14,7 @@ from typing import Any
 
 import pytest
 from bellasreef_service.logging import JsonFormatter, configure_logging
-from bellasreef_service.watchdog import (
-    LIVENESS_EXIT_CODE,
-    LivenessGuard,
-    SdNotifier,
-    watchdog_interval_s,
-)
+from bellasreef_service.watchdog import LIVENESS_EXIT_CODE, LivenessGuard
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -115,38 +110,13 @@ class TestLivenessGuard:
     def test_exit_code_is_distinct_from_other_death_modes(self) -> None:
         """Post-incident, you need to know WHICH mechanism killed the process.
 
-        0 is a clean stop, 137 is SIGKILL/OOM, 134 is systemd's watchdog
-        SIGABRT. A liveness kill must not be confusable with any of them.
+        0 is a clean stop, 137 is SIGKILL/OOM, 134 is SIGABRT. A liveness kill
+        must not be confusable with any of them — `scripts/drill-restart.sh`
+        asserts on this exact value coming back from a `die` event.
         """
         assert LIVENESS_EXIT_CODE != 0
         assert LIVENESS_EXIT_CODE not in (134, 137)
         assert LIVENESS_EXIT_CODE == 70  # EX_SOFTWARE
-
-
-class TestSdNotifier:
-    def test_is_a_noop_without_a_notify_socket(self) -> None:
-        """Same code path under Docker, where systemd is not present."""
-        notifier = SdNotifier(address=None)
-        assert notifier.enabled is False
-        notifier.ready()
-        notifier.ping()  # must not raise
-
-    def test_interval_is_half_of_watchdog_usec(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """systemd's guidance: notify at half the configured interval."""
-        monkeypatch.setenv("WATCHDOG_USEC", "20000000")  # 20 s
-        monkeypatch.delenv("WATCHDOG_PID", raising=False)
-        assert watchdog_interval_s() == pytest.approx(10.0)
-
-    def test_falls_back_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("WATCHDOG_USEC", raising=False)
-        assert watchdog_interval_s(default=7.0) == 7.0
-
-    def test_ignores_a_watchdog_inherited_from_another_pid(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("WATCHDOG_USEC", "20000000")
-        monkeypatch.setenv("WATCHDOG_PID", "999999")
-        assert watchdog_interval_s(default=3.0) == 3.0
 
 
 def threading_flag() -> Any:

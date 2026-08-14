@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-FileCopyrightText: 2026 Bella's Reef LLC
+#
+# Overlay that ARMS THE FREEZE DRILL on hardware-io. Never part of a deploy:
+# `scripts/deploy-pi.sh` names compose.yaml alone, and this file is only ever
+# reached by `scripts/drill-restart.sh`, which disarms via a trap on the way
+# out — including when the drill fails.
+#
+# The trigger is opt-in and the container is recreated to arm it, because
+# BELLASREEF_ENABLE_FREEZE_DRILL is read once at process start (app.py). A
+# permanently armed "hang yourself" signal on the hub would be a liability, and
+# leaving one behind after a drill is the same class of mistake as an
+# integration test leaking a durable.
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.drill.yaml \
+#     --env-file deploy/.env up -d hardware-io
+
+services:
+  hardware-io:
+    environment:
+      # Arms SIGUSR1 -> HardwareIO.enable_freeze, and registers the
+      # `drill-dummy` actuator that comes up ENERGISED so the restart's
+      # safe-state assertion has real work to do.
+      BELLASREEF_ENABLE_FREEZE_DRILL: "1"

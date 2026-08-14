@@ -13,12 +13,7 @@ never depend on hardware-io, so the shared parts cannot live in either.
 from bellasreef_service.clock import ASSUME_TRUSTED_ENV, clock_is_trusted
 from bellasreef_service.httpd import Health, HealthProbe, MetricsServer, probe_once
 from bellasreef_service.logging import JsonFormatter, configure_logging, get_logger
-from bellasreef_service.watchdog import (
-    LIVENESS_EXIT_CODE,
-    LivenessGuard,
-    SdNotifier,
-    watchdog_interval_s,
-)
+from bellasreef_service.watchdog import LIVENESS_EXIT_CODE, LivenessGuard
 
 __all__ = [
     "ASSUME_TRUSTED_ENV",
@@ -28,10 +23,8 @@ __all__ = [
     "JsonFormatter",
     "LivenessGuard",
     "MetricsServer",
-    "SdNotifier",
     "clock_is_trusted",
     "configure_logging",
     "get_logger",
     "probe_once",
-    "watchdog_interval_s",
 ]
