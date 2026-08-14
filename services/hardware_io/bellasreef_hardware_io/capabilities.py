@@ -45,9 +45,10 @@ __all__ = [
 
 W1_DEVICES = Path("/sys/bus/w1/devices")
 
-#: Absolute because the service PATH does not include /usr/sbin (CLAUDE.md,
-#: "PATH trap").
-PINCTRL: Final = "/usr/sbin/pinctrl"
+#: /usr/bin, verified with ``command -v`` on the host 2026-08-13 — NOT
+#: /usr/sbin, where a plan pinned it without checking and discovery failed
+#: at the next boot. Absolute so the service's PATH is not a variable here.
+PINCTRL: Final = "/usr/bin/pinctrl"
 
 #: One pinctrl line: "12: a0    pd | lo // GPIO12 = PWM0_CHAN0"
 _PINCTRL_LINE = re.compile(r"//\s*GPIO(\d+)\s*=\s*PWM0_CHAN(\d+)\s*$")
@@ -116,13 +117,15 @@ def read_pwm_mux() -> dict[int, int] | None:
             [PINCTRL, "get"], capture_output=True, text=True, timeout=10, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log.critical("pinctrl could not run: %s — pi-pwm will not be announced", exc)
+        log.critical(
+            "pinctrl could not run — pi-pwm will not be announced",
+            extra={"error": str(exc)},
+        )
         return None
     if result.returncode != 0:
         log.critical(
-            "pinctrl exited %d: %s — pi-pwm will not be announced",
-            result.returncode,
-            result.stderr.strip(),
+            "pinctrl failed — pi-pwm will not be announced",
+            extra={"returncode": result.returncode, "stderr": result.stderr.strip()},
         )
         return None
     return parse_pinctrl(result.stdout)
@@ -140,6 +143,11 @@ def discover_pwm(
     change is reflected at the next startup, and a mux that cannot be read
     announces nothing rather than guessing (the two pinless RP1 channels
     shipped as adoptable ghosts on 2026-08-13; never again by construction).
+
+    A readable mux with nothing muxed announces an EMPTY list — known-empty
+    is a fact the registry needs in order to prune, distinct from
+    unknown (``None``), which stays silent and leaves the registry's last
+    good answer standing.
     """
     chip = find_pwm_chip(pwm_class)
     if chip is None:
@@ -159,8 +167,12 @@ def discover_pwm(
         if index < npwm
     ]
     if not channels:
-        log.critical("the RP1 PWM0 block has no pins muxed — pi-pwm not announced")
-        return None
+        # Known-empty is announced, not suppressed: an empty list is how the
+        # registry learns to prune (the contract: "a source that loses a
+        # channel can say so by republishing a shorter list"). Suppressing it
+        # left two stale channels in the registry after an overlay change on
+        # 2026-08-13. Only an UNREADABLE mux (None, above) stays silent.
+        log.warning("the RP1 PWM0 block has no pins muxed — announcing an empty pi-pwm")
 
     return CapabilityAnnouncement(
         message_id=uuid4(),
