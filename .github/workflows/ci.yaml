@@ -176,6 +176,51 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # Publishes the three app images the Pi actually pulls. Push-to-main only —
+  # a PR from a fork has no ghcr credential and the dry-run job above already
+  # proves the arm64 build succeeds, so there is nothing this job would add on
+  # a PR except a failure with no secret to fix it.
+  publish:
+    name: publish images (ghcr)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [hardware-io, control-engine, api]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged by SHA (what deploy-pi.sh pins to) and :latest (what a fresh
+      # `docker compose pull` without BELLASREEF_TAG would fall back to).
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/viperdavethesnake/bellasreef-${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/viperdavethesnake/bellasreef-${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   compose:
     name: compose config
     runs-on: ubuntu-latest
