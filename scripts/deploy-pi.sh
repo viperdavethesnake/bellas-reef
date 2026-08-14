@@ -2,12 +2,20 @@
 # Deploy to the hub. The only supported way to change what the Pi runs.
 #
 # The rule this enforces (CLAUDE.md, "Deployment discipline"): the Pi runs
-# supervised systemd units, from pushed commits, only. No rsync, no editing on
-# the box, no dev launchers, nothing uncommitted. If it is not pushed, it does
-# not run.
+# supervised containers, from pushed commits, only. No rsync, no editing on
+# the box, no dev launchers, nothing uncommitted. If it is not pushed and
+# built by CI, it does not run.
+#
+# Containers-only topology: hardware-io, control-engine and api are images
+# CI publishes to ghcr.io, tagged with the commit SHA. This script pulls that
+# tag, records the manifest digest it resolved to, migrates, and recreates
+# the three app containers — it never builds on the Pi and never touches the
+# spine's data services (postgres, nats, victoria-metrics keep
+# restart: unless-stopped and are only ever started, never recreated, by a
+# deploy).
 #
 # The last step is the one that matters. A deploy that checks "are the
-# processes up" proves almost nothing here: hardware-io without
+# containers up" proves almost nothing here: hardware-io without
 # BELLASREEF_NATS_URL starts cleanly, serves metrics, logs a healthy startup
 # and publishes absolutely nothing. So this script does not report success
 # until it has seen a *fresh sample land in VictoriaMetrics* — the wire, not
@@ -25,10 +33,14 @@ set -uo pipefail
 
 PI_HOST="${BELLASREEF_PI_HOST:-bellasreef.local}"
 PI_DIR="/home/david/bellasreef"
+DEPLOY_DIR="${PI_DIR}/deploy"
+COMPOSE_FILE="${DEPLOY_DIR}/compose.yaml"
+COMPOSE_ENV="${DEPLOY_DIR}/.env"
 API_PORT=8000
 VERIFY=1
 SKIP_CI_CHECK=0
-UNITS=(bellasreef-hardware-io bellasreef-control-engine bellasreef-api)
+SERVICES=(hardware-io control-engine api)
+IMAGE_PREFIX="ghcr.io/viperdavethesnake/bellasreef"
 AVAHI_RECORD="deploy/avahi/bellasreef.service"
 AVAHI_INSTALLED="/etc/avahi/services/bellasreef.service"
 
@@ -46,6 +58,14 @@ cd "$(git rev-parse --show-toplevel)"
 die() { printf '\033[31mdeploy: %s\033[0m\n' "$1" >&2; exit 1; }
 step() { printf '\033[1m▶ %s\033[0m\n' "$1"; }
 warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
+
+# A compose invocation against the Pi's project, with an explicit -f/--env-file
+# rather than relying on cwd — matches how bellasreef.service itself invokes
+# compose, and works the same whether or not the ssh session's default
+# directory is the clone.
+compose() {
+    ssh "$PI_HOST" "docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
+}
 
 # ---------------------------------------------------------------- preconditions
 
@@ -83,6 +103,9 @@ step "checking CI is green for this commit"
 # was written down. Reading a CI result and acting on it are two different
 # things; an exit code is the control.
 #
+# It is also, now, the thing that proves the images this script is about to
+# pull actually exist: the publish job only runs on a green push to main.
+#
 # A missing or unreachable answer warns rather than blocks: GitHub being down
 # must not stop a deploy during an incident, but it must say so out loud.
 if [[ $SKIP_CI_CHECK -eq 1 ]]; then
@@ -110,11 +133,57 @@ step "resetting ${PI_HOST}:${PI_DIR} to ${SHA:0:8}"
 ssh "$PI_HOST" "cd ${PI_DIR} && git fetch -q origin && git reset -q --hard ${SHA} && git clean -qfd -e .venv -e deploy/.env && git log --oneline -1" \
     || die "could not update the checkout on ${PI_HOST}"
 
-step "syncing dependencies"
-ssh "$PI_HOST" "cd ${PI_DIR} && uv sync --frozen 2>&1 | tail -3" \
-    || die "uv sync failed on ${PI_HOST}"
+step "checking the ghcr.io pull credential"
+# The credential is host state (CLAUDE.md, Deployment discipline) — this
+# script never supplies one. The check is a heuristic (it greps the default
+# config.json auths map, which is where a plain `docker login` without a
+# credential helper stores the token) rather than a guarantee: a Pi configured
+# with a credsStore would fail this grep even when logged in. Either way the
+# real answer comes from the pull attempt below, which is where the actual
+# failure message lives.
+if ! ssh "$PI_HOST" "grep -q '\"ghcr.io\"' ~/.docker/config.json 2>/dev/null"; then
+    warn "no ghcr.io entry found in ~/.docker/config.json — if 'docker login ghcr.io' hasn't been run on ${PI_HOST}, the pull below will fail"
+fi
+
+step "pulling images tagged ${SHA:0:8}"
+compose "pull ${SERVICES[*]}" || die "image pull failed on ${PI_HOST}. If this is an auth error: the pull credential is host state — run 'docker login ghcr.io' on ${PI_HOST} first (a PAT with read:packages scope, or 'gh auth token' from a machine authorized for this repo's packages if its scopes include read:packages). Otherwise check that CI actually published ${SHA:0:8} — see the publish job in .github/workflows/ci.yaml."
+
+step "recording pulled image digests"
+# Every spine image in compose.yaml is pinned by manifest digest already; this
+# is the same audit trail for the app images CI just published, read back from
+# the registry rather than trusted from a tag.
+for svc in "${SERVICES[@]}"; do
+    digest="$(ssh "$PI_HOST" "docker inspect --format '{{index .RepoDigests 0}}' ${IMAGE_PREFIX}-${svc}:${SHA} 2>/dev/null")"
+    printf '  %-16s %s\n' "$svc" "${digest:-<no digest found>}"
+done
+
+step "applying migrations"
+# Containerized equivalent of the old venv invocation
+# (cd db && uv run alembic upgrade head): the api image ships alembic and the
+# db package at /app/db, alembic.ini's script_location is relative, so the
+# working directory has to move with it. BELLASREEF_DATABASE_URL is already in
+# the api service's compose environment (from deploy/.env), so there is
+# nothing extra to source here.
+#
+# Before the app containers restart, same as before — the new code must never
+# meet the old schema. `docker compose run` starts any unmet depends_on
+# (nats, postgres) on its own, so this also brings the spine up on a Pi where
+# it was not already running.
+compose "run --rm api sh -c 'cd /app/db && alembic upgrade head' 2>&1 | tail -5" \
+    || die "alembic upgrade failed on ${PI_HOST}"
+
+step "pointing the boot unit at ${SHA:0:8}"
+# Written to deploy/.env, not exported ad hoc: bellasreef.service has no shell
+# around it to set BELLASREEF_TAG, so the tag a reboot picks up is whatever
+# this line says. sed -i on a line that already matches the key; appended only
+# if the key is missing, never duplicated.
+ssh "$PI_HOST" "grep -q '^BELLASREEF_TAG=' ${COMPOSE_ENV} && sed -i 's/^BELLASREEF_TAG=.*/BELLASREEF_TAG=${SHA}/' ${COMPOSE_ENV} || echo 'BELLASREEF_TAG=${SHA}' >> ${COMPOSE_ENV}" \
+    || die "could not update BELLASREEF_TAG in ${COMPOSE_ENV}"
 
 step "installing unit files"
+# Globs deploy/systemd/*.service, which today is bellasreef.service alone —
+# the app units it once installed alongside the spine unit are deleted from
+# the repo, so there is nothing left to install beyond it.
 ssh "$PI_HOST" "sudo install -m 0644 ${PI_DIR}/deploy/systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload" \
     || die "could not install units"
 
@@ -142,47 +211,31 @@ advertised="$(ssh "$PI_HOST" "sed -n 's|.*<txt-record>contracts=\\([^<]*\\)</txt
     || die "the hub advertises contracts=${advertised:-<none>} but this build ships ${CONTRACTS}. A client reads that record to decide whether it can talk to this hub at all."
 echo "  advertising contracts=${advertised}"
 
-step "enabling services at boot"
-# Idempotent, and separate from restart on purpose: `systemctl restart` on a
-# disabled unit starts it now and forgets it at the next power cut, which on a
-# tank is the outage you find out about from a thermometer.
-ssh "$PI_HOST" "sudo systemctl enable ${UNITS[*]} bellasreef-spine.service 2>&1 | tail -1" || die "could not enable units"
+step "starting the app containers"
+# Data services are untouched unless their pinned digests changed: `up -d`
+# only recreates a service whose definition actually changed, and the app
+# images are the only thing this deploy pulled.
+compose "up -d --wait ${SERVICES[*]}" || die "compose up failed on ${PI_HOST}"
 
-step "starting the spine"
-# The spine is started, never restarted, by a deploy: restarting it would
-# bounce Postgres and NATS under every code push for no reason. `start` on an
-# already-active oneshot with RemainAfterExit is a no-op.
-ssh "$PI_HOST" "sudo systemctl start bellasreef-spine.service" || die "spine failed to start"
+step "enabling the boot unit"
+ssh "$PI_HOST" "sudo systemctl enable bellasreef.service 2>&1 | tail -1" || die "could not enable bellasreef.service"
 
-step "applying migrations"
-# Before the restart, so the new code never meets the old schema. Caught the
-# hard way: a deploy that shipped code reading `sensor_alerts.alert_class` to a
-# database that had never heard of it, and control-engine crash-looped on boot.
-#
-# Migrations here are additive by policy, so the *old* code running during this
-# window is fine. Note that the restore flow deliberately does NOT do this —
-# see docs/backup-restore.md, where migrating before a restore is exactly the
-# mistake that gets an archive refused.
-#
-# Run after the spine starts, not before: the spine brings up Postgres, and a
-# fresh checkout has no database to migrate until it does.
-ssh "$PI_HOST" "cd ${PI_DIR}/db && set -a && . /etc/bellasreef/api.env && set +a && uv run alembic upgrade head 2>&1 | tail -5" \
-    || die "alembic upgrade failed on ${PI_HOST}"
+step "starting the boot unit"
+# Started, never restarted: see bellasreef.service's own comment. `start` on
+# an already-active oneshot with RemainAfterExit is a no-op — this line exists
+# for boot persistence, not to reconcile a deploy that already ran the
+# targeted `up -d --wait` above.
+ssh "$PI_HOST" "sudo systemctl start bellasreef.service" || die "bellasreef.service failed to start"
 
-step "restarting services"
-# Restarted oldest-dependency-first. hardware-io provisions the streams the
-# others bind to, and the API's registry consumer retries until the stream
-# exists, so this ordering is a courtesy rather than a requirement.
-ssh "$PI_HOST" "sudo systemctl restart ${UNITS[*]}" || die "restart failed"
-
-sleep 3
-step "unit status"
-for unit in "${UNITS[@]}"; do
-    state="$(ssh "$PI_HOST" "systemctl is-active ${unit}" 2>/dev/null)"
-    printf '  %-32s %s\n' "$unit" "$state"
-    [[ "$state" == "active" ]] || {
-        ssh "$PI_HOST" "sudo journalctl -u ${unit} -n 30 --no-pager"
-        die "${unit} is ${state}"
+step "container status"
+for svc in "${SERVICES[@]}"; do
+    cid="$(ssh "$PI_HOST" "docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} ps -q ${svc}" 2>/dev/null)"
+    state=""
+    [[ -n "$cid" ]] && state="$(ssh "$PI_HOST" "docker inspect -f '{{.State.Status}}' ${cid}" 2>/dev/null)"
+    printf '  %-16s %s\n' "$svc" "${state:-not running}"
+    [[ "$state" == "running" ]] || {
+        compose "logs --tail=30 ${svc}"
+        die "${svc} is ${state:-not running}"
     }
 done
 
@@ -197,15 +250,15 @@ step "checking the API answers and speaks the contract we just shipped"
 # The other half of "verified on the wire". Everything below this comment used
 # to be missing, which meant a deploy could prove the tank was monitored and
 # never prove a single person could log in — discovery or pairing broken on the
-# hub, three units active, green banner.
+# hub, three containers active, green banner.
 #
 # /api/v1/info is the right probe for exactly the reason it is unauthenticated:
 # it is the first request any client makes, before pairing, before a credential
 # exists. If this does not answer, nobody is getting in, and the contract
 # version it reports is what a client compares against before it will speak.
 #
-# Retried briefly rather than asked once: uvicorn has just been restarted, and a
-# connection refused two seconds after `systemctl restart` means nothing.
+# Retried briefly rather than asked once: uvicorn has just come up in a fresh
+# container, and a connection refused two seconds after `up -d` means nothing.
 AUTH_DEADLINE=$(($(date +%s) + 30))
 info_body=""
 info_code=""
@@ -220,13 +273,13 @@ while :; do
 done
 
 if [[ "$info_code" != "200" ]]; then
-    ssh "$PI_HOST" "sudo journalctl -u bellasreef-api -n 40 --no-pager"
-    die "GET /api/v1/info on ${PI_HOST}:${API_PORT} answered '${info_code:-nothing}' after 30s. The unit is active and the front door is shut — no client can discover this hub, pair with it, or refresh a token."
+    compose "logs --tail=40 api"
+    die "GET /api/v1/info on ${PI_HOST}:${API_PORT} answered '${info_code:-nothing}' after 30s. The container is running and the front door is shut — no client can discover this hub, pair with it, or refresh a token."
 fi
 
 served_contracts="$(sed -n 's/.*"contracts_version":"\([^"]*\)".*/\1/p' <<<"$info_body")"
 if [[ "$served_contracts" != "$CONTRACTS" ]]; then
-    die "the API reports contracts_version='${served_contracts:-<absent>}' and this build ships ${CONTRACTS}. The unit restarted into code that is not what was just deployed, or /info is not the endpoint this reply came from — either way clients are being told the wrong contract."
+    die "the API reports contracts_version='${served_contracts:-<absent>}' and this build ships ${CONTRACTS}. The container started into code that is not what was just deployed, or /info is not the endpoint this reply came from — either way clients are being told the wrong contract."
 fi
 
 paired="$(sed -n 's/.*"paired_client_count":\([0-9]*\).*/\1/p' <<<"$info_body")"
@@ -242,10 +295,10 @@ step "waiting for a fresh sample on the wire"
 # ~30s from instant queries (-search.latencyOffset), so a fresh write looks
 # like a failed one through /query.
 #
-# Probed over ssh against localhost, not curled from the dev machine: this
-# branch's compose cutover binds VictoriaMetrics to 127.0.0.1 on the Pi (see
+# Probed over ssh against localhost, not curled from the dev machine: the
+# compose stack binds VictoriaMetrics to 127.0.0.1 on the Pi (see
 # deploy/compose.yaml), so a probe from off-box would get connection-refused
-# while telemetry is perfectly healthy. Same shape as the journalctl calls
+# while telemetry is perfectly healthy. Same shape as the `compose logs` calls
 # elsewhere in this script — run the check where the loopback port actually is.
 START="$(date +%s)"
 DEADLINE=$((START + 90))
@@ -261,8 +314,8 @@ while [[ "$(date +%s)" -lt $DEADLINE ]]; do
 done
 
 if [[ $FOUND -eq 0 ]]; then
-    ssh "$PI_HOST" "sudo journalctl -u bellasreef-hardware-io -n 40 --no-pager"
-    die "no sensor sample reached VictoriaMetrics within 90s. The processes are up and the tank is not being monitored — this is exactly the state a process check would have called a successful deploy."
+    compose "logs --tail=40 hardware-io"
+    die "no sensor sample reached VictoriaMetrics within 90s. The containers are up and the tank is not being monitored — this is exactly the state a process check would have called a successful deploy."
 fi
 
 latest="$(sed -n 's/.*"values":\[\([^,]*\).*/\1/p' <<<"$body" | tail -1)"
