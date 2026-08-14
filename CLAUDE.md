@@ -405,6 +405,13 @@ into this section.** Blocked until the FET stage is on the bench.
 The three measured voltages are what set `INVRT_ON` in the driver. They are
 ground truth with no stack in the loop.
 
+- FLAG (2026-08-13, unresolved, David decides at the bench): which output
+  stage drives the first real light — the PCA9685→FET chain items 0a–5
+  describe, or the RP1 pi-pwm channels that got the 2026-08-13 bring-up (4
+  channels announced, driver deployed). Stage 1 is blocked on this ruling; the
+  bench-plan items stay as written for the PCA9685 path and must not be
+  treated as superseded until ruled.
+
 **Stage 2 — the same facts through our stack.** Register the channel via
 hardware-io (authoritative, role `light`, full safety triple), command the
 identical three duty points through control-engine over the spine, David
