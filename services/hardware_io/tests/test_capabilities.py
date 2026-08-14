@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bellasreef_hardware_io.capabilities import (
+    PINCTRL,
     discover_pwm,
     find_pwm_chip,
 )
@@ -87,8 +88,20 @@ class TestDiscoverPwm:
     def test_an_unreadable_mux_announces_nothing(self, tmp_path: Path) -> None:
         assert discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: None) is None
 
-    def test_a_readable_mux_with_nothing_muxed_announces_nothing(self, tmp_path: Path) -> None:
-        assert discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: {}) is None
+    def test_a_readable_mux_with_nothing_muxed_announces_empty(self, tmp_path: Path) -> None:
+        """Known-empty is a fact worth publishing: an empty channel list is how
+        the registry learns to prune (the contract: 'a source that loses a
+        channel can say so by republishing a shorter list'). Only an UNREADABLE
+        mux stays silent — found live 2026-08-13, when a failed discovery left
+        two stale channels in the registry indefinitely."""
+        announcement = discover_pwm(_rp1_class(tmp_path), mux_reader=lambda: {})
+        assert announcement is not None
+        assert announcement.channels == []
+
+    def test_pinctrl_is_where_dpkg_puts_it(self) -> None:
+        """/usr/bin, not /usr/sbin — asserted here because the wrong path
+        shipped once, 'pinned' in a plan without being verified on the host."""
+        assert PINCTRL == "/usr/bin/pinctrl"
 
     def test_a_missing_chip_announces_nothing(self, tmp_path: Path) -> None:
         empty = tmp_path / "class-pwm"
