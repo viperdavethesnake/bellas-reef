@@ -83,6 +83,9 @@ class TestRegistrationUpsert:
         assert second is False, "a re-announcement updates rather than duplicating"
         assert len(rows) == 1
         assert rows[0]["poll_interval_s"] == 7.0, "hardware-owned fields do follow the hardware"
+        assert rows[0]["channel"] is None, (
+            "announced but never bound: it claims no physical channel yet"
+        )
 
     def test_a_re_announcement_does_not_erase_operator_settings(self) -> None:
         """hardware-io restarting must not reset the name or the alert band.

@@ -570,7 +570,15 @@ class Store:
             "SELECT device_id, display_name, kind, driver_id, sensor_type, "
             "poll_interval_s, actuator_class, role, control_authority, "
             "failsafe_capable, transport, safe_state, max_runtime_s, "
-            "heartbeat_timeout_s, enabled, alert_min, alert_max, alert_clear_margin "
+            "heartbeat_timeout_s, enabled, alert_min, alert_max, alert_clear_margin, "
+            # Only an adopted device's channel is live. `binding` survives an
+            # unadopt so re-binding recognises the same hardware (see
+            # unadopt_device), so gating on `adopted` alone — not on `binding
+            # IS NOT NULL` — is what keeps a released channel from reading as
+            # still claimed.
+            "CASE WHEN adopted "
+            "     THEN COALESCE(binding ->> 'channel', binding ->> 'rom') "
+            "     ELSE NULL END AS channel "
             "FROM devices"
         )
         params: dict[str, object] = {}

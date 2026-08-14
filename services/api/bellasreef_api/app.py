@@ -311,6 +311,12 @@ class DeviceView(BaseModel):
     alert_max: float | None = None
     alert_clear_margin: float | None = None
 
+    #: The binding's capability channel — a PWM channel number or a 1-Wire
+    #: ROM. ``None`` for a device whose binding is released: two adopted
+    #: lights are otherwise indistinguishable except by name (David's ruling
+    #: 2026-08-13). Additive and optional — no existing client breaks.
+    channel: str | None = None
+
     @property
     def name(self) -> str:
         return self.display_name or self.device_id
