@@ -63,8 +63,16 @@ warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
 # rather than relying on cwd — matches how bellasreef.service itself invokes
 # compose, and works the same whether or not the ssh session's default
 # directory is the clone.
+#
+# BELLASREEF_TAG is exported into every call, not just read from
+# deploy/.env: compose prefers a shell-environment value over the .env file,
+# so this is what makes `pull` and the migration `run` resolve the image
+# refs to the SHA being deployed right now, before the .env rewrite step
+# further down persists that same tag for the next boot. Without this, pull
+# and migrate would silently target whatever tag the *previous* deploy left
+# in .env.
 compose() {
-    ssh "$PI_HOST" "docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
+    ssh "$PI_HOST" "BELLASREEF_TAG=${SHA} docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
 }
 
 # ---------------------------------------------------------------- preconditions
