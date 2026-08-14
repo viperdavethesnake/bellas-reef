@@ -42,21 +42,49 @@ gpiodetect | grep rp1       # expect gpiochip0 [pinctrl-rp1] (54 lines)
 
 Alongside the dtoverlays above, `/home/david/bellasreef/deploy/.env` is host
 state, not repo state: it is gitignored (`deploy/.env.example` is the
-template committed instead) and holds the values `bellasreef-spine.service`
+template committed instead) and holds the values `bellasreef.service`
 interpolates into `deploy/compose.yaml` — `POSTGRES_USER`,
 `POSTGRES_PASSWORD`, `POSTGRES_DB`, `BELLASREEF_DATABASE_URL`, `NATS_URL`,
-`VM_RETENTION`, `I2C_GID`, `GPIO_GID`.
+`BELLASREEF_TAG`, `VM_RETENTION`, `I2C_GID`, `GPIO_GID`.
 
-`I2C_GID`/`GPIO_GID` are required in this file even though the spine service
-starts no container with hardware access — compose interpolates the whole
-file before evaluating which services `up` targets, so a missing variable
-here fails the spine's `docker compose up`, not just an app container that
-never runs.
+`I2C_GID`/`GPIO_GID` are required in this file for the same reason every
+other value here is: `bellasreef.service` brings up the whole stack,
+hardware-io included, in one `docker compose up`, and compose interpolates
+the whole file up front — a missing variable anywhere in it fails that `up`
+before any service, hardware-accessing or not, gets a chance to start.
 
 Never committed, and never reset by `deploy-pi.sh` — a git reset touches the
 repo clone, not this file. Verify it exists and is current after any change
 to Postgres credentials, retention, or the host's `i2c`/`gpio` group GIDs
 (`getent group i2c gpio`).
+
+## 1c. The ghcr.io pull credential — the third piece of host state
+
+Containers-only means the app images (`hardware-io`, `control-engine`, `api`)
+are pulled, not built, on the Pi — and ghcr.io packages under this repo are
+private, so pulling them needs a credential the Pi has to hold on its own.
+Without it, `docker compose pull` fails and `deploy-pi.sh` refuses before it
+touches anything running.
+
+```bash
+docker login ghcr.io -u <github-username>
+# password prompt: paste a token with the read:packages scope — a
+# fine-grained PAT scoped to this repo's packages, or a classic PAT with
+# read:packages. Not a password; GitHub does not accept those here.
+```
+
+The credential lands in `~/.docker/config.json` (mode `0600` by `docker
+login` itself) and is host state, not repo state — never committed, never
+reset by a `deploy-pi.sh` run, and not recreated by a factory wipe. Verify it
+survived a wipe or a fresh clone with:
+
+```bash
+grep -q '"ghcr.io"' ~/.docker/config.json && echo present
+```
+
+`deploy-pi.sh` checks for this entry before pulling and fails loudly with the
+login command above if it is missing, rather than letting a bare `docker
+compose pull` fail with an opaque auth error partway through a deploy.
 
 ## 2. Headless stripping
 
@@ -233,66 +261,73 @@ GPIO pin map, or `config.txt`.
 A failure here is a wiring defect. Do not attempt to compensate for it in
 software — there is no software running at the moment this drill tests.
 
-## 7. Services under systemd, and the restart drill
+## 7. The one boot unit, and container supervision
 
-Every service on this host runs as a supervised systemd unit, from a pushed
-commit. There are no dev launchers; `scripts/dev/run-*.sh` were deleted on
-2026-08-11 after an unsupervised hardware-io exited and stayed exited for ten
-hours. See CLAUDE.md, "Deployment discipline".
+Containers-only, per the PRD topology (David's ruling, 2026-08-13): all five
+services — nats, postgres, victoria-metrics, hardware-io, control-engine,
+api — run as containers under `deploy/compose.yaml`, and Docker's own
+`restart: unless-stopped` policies are the supervisor from there on. There
+are no per-service systemd units; `bellasreef-{hardware-io,control-engine,
+api}.service` are deleted, not deprecated. There are no dev launchers either;
+`scripts/dev/run-*.sh` were deleted on 2026-08-11 after an unsupervised
+hardware-io exited and stayed exited for ten hours. See CLAUDE.md,
+"Deployment discipline".
+
+**Closed detour, dated:** between 2026-08-11 and 2026-08-13 this section
+described three separate systemd app units reading
+`/etc/bellasreef/<service>.env`. That was an overcorrection from the outage —
+it put process supervision on the host instead of in the runtime CLAUDE.md
+already locked. Removed 2026-08-13; nothing below describes it.
+
+One unit remains: `bellasreef.service` — oneshot + `RemainAfterExit`, ordered
+`After=time-sync.target docker.service` / `Wants=time-sync.target`. It exists
+for exactly two things: bringing the stack up once at boot, and clock
+ordering (§3 — a board with no RTC battery must not schedule against an
+unsynchronised clock). It is not the supervisor; Docker is. A deploy `start`s
+this unit and never `restart`s it — restarting it would `up -d --wait` the
+whole stack including the spine's data services, which is the durable-
+contention risk the environment-boundary rule in CLAUDE.md exists to prevent.
 
 Deploy with `scripts/deploy-pi.sh`, which refuses a dirty or unpushed tree,
-resets `/home/david/bellasreef` to the pushed commit, installs the units,
-restarts them, and then waits for a fresh sample to reach VictoriaMetrics
-before reporting success.
+resets `/home/david/bellasreef` to the pushed commit, pulls the three app
+images by digest-verified SHA tag, migrates, recreates
+hardware-io/control-engine/api, and then waits for a fresh sample to reach
+VictoriaMetrics before reporting success.
 
-### Service configuration lives on the host
+### Service configuration: `deploy/.env` + compose, not a directory per service
 
-The unit files carry no environment values, so the same unit works on any hub.
-Configuration is read from:
+There is no `/etc/bellasreef/<service>.env` anymore. Configuration is two
+things:
 
-```
-/etc/bellasreef/hardware-io.env
-/etc/bellasreef/control-engine.env
-/etc/bellasreef/api.env
-```
-
-Mode `0640`, group `david`. They hold the database DSN, which contains a
-password, and `Environment=` lines in a unit file are readable by any user
-through `systemctl show`.
-
-These files are deliberately not in the archive `bellasreef backup` writes, so
-on fresh hardware they are authored by hand. The full `api.env`, as the live
-hub runs it — the password is the one you put in `deploy/.env` (§1b):
-
-```
-BELLASREEF_NATS_URL=nats://localhost:4222
-BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:<password>@localhost:5432/bellasreef
-BELLASREEF_VM_URL=http://localhost:8428
-BELLASREEF_LOG_LEVEL=INFO
-BELLASREEF_ASSUME_CLOCK_TRUSTED=1
-```
+- `deploy/.env` (§1b) — host state, gitignored, holds `POSTGRES_*`,
+  `BELLASREEF_DATABASE_URL`, `NATS_URL`, `BELLASREEF_TAG`, `VM_RETENTION`,
+  `I2C_GID`/`GPIO_GID`.
+- the `environment:` block of each service in `deploy/compose.yaml` — repo
+  state, committed, machine-agnostic (it references `${VARS}` from
+  `deploy/.env`, not literal values).
 
 `BELLASREEF_VM_URL` is not optional decoration: `bellasreef backup` refuses to
-run without it (or an explicit `--no-telemetry-snapshot`), so an `api.env`
-missing it breaks backups, not just dashboards. The other two service files
-carry the same DSN/NATS pair minus the VM URL.
+run without it (or an explicit `--no-telemetry-snapshot`), and it is set in
+the `api` service's `environment:` block in compose.yaml, not per-host.
 
-`BELLASREEF_NATS_URL` is the entry that bites. Leave it out and hardware-io
-reads the probe, serves metrics, logs a clean startup, and publishes nothing at
-all. Nothing about the process looks wrong; the tank is simply not monitored.
-That is why `deploy-pi.sh` verifies a sample on the wire instead of a process
-in the table.
+`BELLASREEF_NATS_URL` is the entry that bites. Leave it unset on hardware-io
+and it reads the probe, serves metrics, logs a clean startup, and publishes
+nothing at all. Nothing about the container looks wrong; the tank is simply
+not monitored. That is why `deploy-pi.sh` verifies a sample on the wire
+instead of a container being merely "up."
 
-### Logs are in journald
+### Logs are `docker compose logs`, not journald-per-unit
 
 ```bash
-journalctl -u bellasreef-hardware-io -f
-journalctl -u bellasreef-hardware-io --since "2 hours ago"
+docker compose -f deploy/compose.yaml --env-file deploy/.env logs -f hardware-io
+docker compose -f deploy/compose.yaml --env-file deploy/.env logs --since "2 hours ago" hardware-io
+# or, equivalently, straight from the container:
+docker logs -f bellasreef-hardware-io-1
 ```
 
 Not `/tmp/*.log`. A log in `/tmp` is truncated by the next start, which is how
 the evidence for the first half of the 2026-08-10 outage was destroyed before
-anyone read it.
+anyone read it — the same reasoning, now pointed at compose's own log driver.
 
 ### Installing by hand
 
@@ -300,16 +335,16 @@ anyone read it.
 bring-up.
 
 ```bash
-sudo install -m 0644 deploy/systemd/*.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/bellasreef.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now bellasreef-spine
-sudo systemctl enable --now bellasreef-hardware-io bellasreef-control-engine bellasreef-api
+sudo systemctl enable --now bellasreef
 ```
 
-The spine first: the app units crash-loop (harmlessly, `Restart=always`) until
-NATS and Postgres answer, and on a machine being *restored* rather than
-deployed, `docs/backup-restore.md` needs the spine up steps before the app
-units exist to start.
+That one `enable --now` brings up the whole stack — spine and app services
+together — because compose's own `depends_on: { condition: service_healthy }`
+sequences hardware-io/control-engine/api after nats/postgres are ready; there
+is no separate "bring the spine up first" step to remember on a machine being
+*restored* rather than deployed (see `docs/backup-restore.md`).
 
 The unit is ordered `After=time-sync.target` / `Wants=time-sync.target`. On a
 board with no RTC battery that ordering is the difference between a scheduler
@@ -317,6 +352,19 @@ starting against a real clock and one starting against whatever `fake-hwclock`
 restored. It only means anything because `chrony-wait` is enabled (§3) — without
 it, `time-sync.target` is reached as soon as the NTP daemon starts, which is not
 the same claim.
+
+FLAG (2026-08-13, unresolved): the subsections below (`Two runtimes, two
+liveness mechanisms`, `Telling the death modes apart`, `Running the drill`)
+describe a per-service systemd watchdog (`WatchdogSec` on
+`bellasreef-hardware-io.service`) from the deleted host-units era.
+`bellasreef.service` is a oneshot with no `WatchdogSec`, so that half of the
+table no longer has a unit to attach to. Docker's `LivenessGuard` →
+`os._exit` → `restart: unless-stopped` path still stands and is unaffected.
+Not rewritten here — out of scope for this docs pass, and any replacement
+mechanism should be verified on hardware before being documented as fact,
+not assumed. Until resolved, treat this section as describing exit-code
+semantics only; `scripts/drill-restart.sh` targets a unit that no longer
+exists and will not run as written.
 
 ### Two runtimes, two liveness mechanisms
 
@@ -593,18 +641,20 @@ app will not open.
 
 ### Running the CLI
 
-`bellasreef` is a console script installed with the API package, so it lives in
-the same virtualenv systemd starts uvicorn from. It talks to Postgres directly
-and does not go through the API, which is the point: the API is what you cannot
-authenticate to.
+`bellasreef` is a console script installed with the API package. It lives
+**in the `api` image**, not in a host virtualenv — there is no
+`.venv/bin/bellasreef` on the host to fall back to anymore. It talks to
+Postgres directly and does not go through the API, which is the point: the
+API is what you cannot authenticate to.
 
-Configuration comes from the environment, and the service's environment lives in
-`/etc/bellasreef/api.env` (section 7), not in the unit file. Source it:
+Run it via `docker compose exec` against the already-running `api`
+container, which means it inherits that container's own environment —
+no sourcing a service env file by hand, because there is no longer a
+per-service env file to source (see §7):
 
 ```bash
 cd /home/david/bellasreef
-set -a; . /etc/bellasreef/api.env; set +a
-.venv/bin/bellasreef revoke --list
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke --list
 ```
 
 | Variable | What it is for | Missing |
@@ -612,14 +662,14 @@ set -a; . /etc/bellasreef/api.env; set +a
 | `BELLASREEF_DATABASE_URL` | everything. Required. | refuses, exit 2 |
 | `BELLASREEF_NATS_URL` | publishing the audit event | the command still does its job, then warns on stderr that the event was **not** recorded |
 
-Sourcing the file gets you both. Exporting the DSN by hand and nothing else is
-the mistake that loses the audit row, which is why the warning is loud rather
-than a log line.
+Both are set in the `api` service's `environment:` block in
+`deploy/compose.yaml` — there is nothing to source by hand, and nothing to
+get wrong by sourcing only half of it.
 
 ### Listing clients
 
 ```bash
-.venv/bin/bellasreef revoke --list
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke --list
 ```
 
 ```
@@ -638,8 +688,8 @@ than a log line.
 Revoke the lost one by id, or by name when the name is unambiguous:
 
 ```bash
-.venv/bin/bellasreef revoke 0f9e4c6a-1d2b-4a77-9f3e-1c5b8a2d4e60
-.venv/bin/bellasreef revoke "David's iPhone"
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke 0f9e4c6a-1d2b-4a77-9f3e-1c5b8a2d4e60
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke "David's iPhone"
 ```
 
 If two clients share a name, the command lists them and revokes nothing. Every
@@ -659,18 +709,17 @@ Three steps, on the hub:
 
 ```bash
 cd /home/david/bellasreef
-set -a; . /etc/bellasreef/api.env; set +a
 
 # 1. Open a recovery window. Default 300 seconds; --ttl takes seconds.
-.venv/bin/bellasreef pair --ttl 600
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef pair --ttl 600
 
 # 2. On the replacement phone, open the app, pick the hub, pair.
 #    It gets a token immediately instead of a six-digit code, because the
 #    window is open. The window is spent by whoever uses it first.
 
 # 3. Turn the lost phone off.
-.venv/bin/bellasreef revoke --list
-.venv/bin/bellasreef revoke <id of the lost phone>
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke --list
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke <id of the lost phone>
 ```
 
 **Step 3 is not optional, and step 1 does not do it for you.** A pairing window
@@ -697,24 +746,30 @@ Look for `pair.window_opened` and `client.revoked`. If the CLI warned that
 `BELLASREEF_NATS_URL` was unset, they will not be there, and there is no way to
 add them after the fact: `audit_log` is append-only by trigger.
 
-## 11. PostgreSQL client tools — for `bellasreef backup`
+## 11. PostgreSQL client tools — now carried by the `api` image
 
-`bellasreef backup` and `bellasreef restore` spawn `pg_dump`/`pg_restore` as
-host binaries. Postgres itself runs in a container, but its copy of the tools
-cannot be borrowed: `pg_dump --file` writes inside whatever filesystem the
-binary runs in, so a `docker exec` detour leaves the dump in the container, not
-in the archive. The host needs its own client package:
+`bellasreef backup` and `bellasreef restore` spawn `pg_dump`/`pg_restore`, and
+containers-only changed where those binaries live. The command now runs
+*inside* the `api` container (`docker compose exec api bellasreef backup
+--out /backups/...`), and `/backups` is itself a host bind mount
+(`/home/david/backups:/backups`, declared on the `api` service in
+`deploy/compose.yaml`), so `pg_dump --file` writing inside the container's filesystem lands the
+archive on the host through that mount — no `docker exec` detour needed, and
+none of the "host copy of the tools" reasoning below is load-bearing anymore.
+
+`deploy/Dockerfile.api` installs `postgresql-client-17` from the PGDG repo in
+the image itself (pinned to major 17, matching the `postgres:17-alpine`
+spine image). The rule that matters is unchanged even though where it's
+enforced moved: the client's major version must be **at least** the server's
+— an older `pg_dump` refuses a newer server outright. A compose bump to
+`postgres:18` now requires bumping `Dockerfile.api`'s PGDG install in the
+same change, not a host `apt-get`.
 
 ```bash
 sudo apt-get install -y postgresql-client-17
 ```
 
-Debian ships one PostgreSQL major per release and the compose spine pins
-`postgres:17`, so today the two coincide — but nothing couples them. The rule
-that matters: the client's major version must be **at least** the server's — an
-older `pg_dump` refuses a newer server outright. A compose bump to
-`postgres:18` therefore requires installing the matching newer client on the
-host in the same change, or every subsequent backup fails with that refusal
-until someone notices. Installed and verified on this host 2026-08-12 (client
-17.10, server 17.10; backup + restore drill both passed against the live
-spine).
+The host package above is no longer load-bearing for backups — kept only if
+you want `psql`/`pg_dump` available for ad-hoc use directly on the host (e.g.
+against the loopback-published `127.0.0.1:5432`). It has no bearing on
+whether `bellasreef backup`/`restore` work; those go through the image.

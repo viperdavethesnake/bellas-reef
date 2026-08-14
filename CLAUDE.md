@@ -73,7 +73,13 @@ alternative.
 
 ## Deployment discipline (non-negotiable)
 
-**The Pi runs supervised systemd units, from pushed commits, only.**
+**The Pi runs the whole stack as supervised containers, from pushed commits,
+only.** All five services — nats, postgres, victoria-metrics, hardware-io,
+control-engine, api — are containers under one boot unit,
+`bellasreef.service`; Docker's own restart policies (`restart:
+unless-stopped`) are the supervisor from there on. Containers-only per the
+PRD topology, ruled by David 2026-08-13 ("containers only — we are not
+carrying that decision").
 
 - No dev launchers. `scripts/dev/run-*.sh` are deleted, not deprecated. An
   unsupervised process that exits stays exited, which is the second half of the
@@ -81,8 +87,10 @@ alternative.
 - No rsync, no editing on the Pi, no uncommitted state. `/home/david/bellasreef`
   is a git clone reset to `origin/main`; anything not pushed does not run.
 - Deploy with `scripts/deploy-pi.sh`. It refuses a dirty or unpushed tree,
-  resets the Pi to the pushed commit, applies migrations, restarts the units,
-  and then **verifies fresh telemetry on the wire** before reporting success. A
+  resets the Pi to the pushed commit, pulls the three app images by
+  digest-verified SHA tag, applies migrations via a one-off `docker compose
+  run --rm api`, recreates hardware-io/control-engine/api, and then
+  **verifies fresh telemetry on the wire** before reporting success. A
   process check is not a deploy check: hardware-io without
   `BELLASREEF_NATS_URL` starts cleanly, serves metrics and publishes nothing.
 - **A backend pass is not done at CI green.** The stop condition is
@@ -94,41 +102,54 @@ alternative.
   was serving a contracts version it did not have and running code whose
   replacement had already been reviewed and merged. "It passed CI" describes a
   runner in a datacentre; the tank is on a shelf.
-- Service environment lives in `/etc/bellasreef/<service>.env` on the host, not
-  baked into the unit files. Unit files in this repo stay machine-agnostic.
-- Logs are in journald (`journalctl -u bellasreef-hardware-io`). A log in
-  `/tmp` gets overwritten by the next start, which destroyed the evidence for
-  the first half of that outage.
-- The spine (NATS, Postgres, VictoriaMetrics) runs as `bellasreef-spine.service`
-  — oneshot+RemainAfterExit, `docker compose up -d --wait nats postgres
-  victoria-metrics` against an explicit service list (compose.yaml also
-  declares the app services; those run as host units in phase 1, so an
-  unqualified `up` would start a second BR_CMD consumer and collide on port
-  8000). Deploys **start** the unit, never restart it — the spine is shared
-  broker/DB state, not a redeployable artifact, and restarting it on every
-  deploy would recreate the exact durable-contention risk the environment
-  boundary rule above exists to prevent. Host state for the Pi is now two
-  files, not one: `/etc/bellasreef/<service>.env` (as above) **and**
-  `/home/david/bellasreef/deploy/.env` — the compose interpolation source for
-  `POSTGRES_*`, `VM_RETENTION`, `I2C_GID`/`GPIO_GID`. The GIDs are needed in
-  it even though no app container starts, because compose interpolates the
-  whole file up front.
+- Service configuration is no longer `/etc/bellasreef/<service>.env` — that
+  era is closed (see the dated paragraph below). Config now flows through
+  `deploy/.env` (compose interpolation: `POSTGRES_*`, `BELLASREEF_TAG`,
+  `VM_RETENTION`, `I2C_GID`/`GPIO_GID`, `BELLASREEF_DATABASE_URL`, `NATS_URL`)
+  and the `environment:` blocks in `deploy/compose.yaml` itself. One file plus
+  one committed manifest, not a per-service directory on the host.
+- Logs are `docker compose logs -f <service>` (or `docker logs
+  bellasreef-hardware-io-1`), not journald-per-unit. A log in `/tmp` gets
+  overwritten by the next start, which destroyed the evidence for the first
+  half of the 2026-08-10 outage — the same reasoning, now pointed at compose's
+  own log driver instead of journald.
+- Spine data services (postgres, nats, victoria-metrics) are never
+  force-recreated by a deploy: they keep `restart: unless-stopped` and their
+  compose definitions don't change per-deploy, so `docker compose up -d` only
+  touches the three app services. `bellasreef.service` is only ever `start`ed
+  by a deploy, never `restart`ed — restarting it would `up -d --wait` the
+  whole stack, including the data services, recreating the exact
+  durable-contention risk the environment boundary rule above exists to
+  prevent.
 - A fresh registry means no devices. After any factory wipe, sensors must be
-  re-imported (`bellasreef devices import /etc/bellasreef/devices.import.yaml`,
-  which needs an API token via the TOFU-pair-a-seed-CLI-then-revoke dance)
-  before the deploy telemetry gate can pass — no devices, no readings, no
-  wire traffic to verify. The 2026-08-12 cutover hit exactly this.
+  re-imported (`docker compose exec api bellasreef devices import
+  /etc/bellasreef/devices.import.yaml`, which needs an API token via the
+  TOFU-pair-a-seed-CLI-then-revoke dance) before the deploy telemetry gate can
+  pass — no devices, no readings, no wire traffic to verify. The 2026-08-12
+  cutover hit exactly this.
 
-- FLAG (2026-08-12, unresolved): compose.yaml declares containerized app
-  services; the operative deployment is systemd host units. One of the two is
-  the future; David decides which, deliberately, not mid-task.
-- FLAG (2026-08-12, unresolved): the ad-hoc `-dev` spine ran LAN-exposed
-  (0.0.0.0:5432/4222/8428) since Aug 9; the compose spine is loopback-only.
-  If anything off-Pi was talking to those ports directly, it broke at cutover
-  — nothing is known to, but the exposure existed for three days.
-- FLAG (2026-08-12, unresolved): app units could be ordered After=bellasreef-spine.service now that
-  the spine is a unit; today they crash-loop briefly at boot until the spine is up (Restart=always
-  self-heals). Deliberate change, not urgent.
+**Closed detour, dated: the host-systemd-units era.** Between the 2026-08-10
+outage and 2026-08-13, services ran as three separate systemd app units
+(`bellasreef-{hardware-io,control-engine,api}.service`) reading
+`/etc/bellasreef/<service>.env`, alongside a `bellasreef-spine.service` that
+brought up only the data containers — an overcorrection from the outage that
+put supervision on the host rather than in the runtime CLAUDE.md already
+locked. Removed 2026-08-13 per the PRD's containers-only topology and David's
+ruling; the app units are deleted from the host and from this repo, not kept
+around "just in case." Anything below referencing that era is describing a
+closed chapter, not current practice.
+
+- RESOLVED (topology, 2026-08-13): containers won. All five services run
+  containerized under one boot unit; the host-systemd-app-units alternative
+  is deleted, not deferred.
+- RESOLVED (LAN exposure, 2026-08-13): closed by David's ruling not to rotate
+  credentials — the three-day exposure of the ad-hoc `-dev` spine
+  (0.0.0.0:5432/4222/8428, 2026-08-09 through cutover) is accepted as a past
+  window with nothing known to have used it, not remediated after the fact.
+- RESOLVED (unit ordering, 2026-08-13): obsolete by construction — there is
+  one boot unit now, not several to order against each other, and
+  `depends_on: { condition: service_healthy }` in compose.yaml handles
+  intra-stack sequencing (e.g. hardware-io after nats).
 
 ## Bench boundary (non-negotiable)
 
@@ -455,15 +476,17 @@ if `bellasreef.local` ever stops resolving, check this file first.
 WiFi power save is **off**, persisted in the NetworkManager connection profile.
 No firewall is active (`nftables`/`ufw` both inactive).
 
-## Spine — cutover 2026-08-12
+## Spine — cutover 2026-08-12, folded into the one boot unit 2026-08-13
 
-The spine moved from ad-hoc `pg-dev`/`nats-dev`/`vm-dev` containers to
-`bellasreef-spine.service` (compose, see Deployment discipline above).
-Containers: `bellasreef-nats-1`, `bellasreef-postgres-1`,
-`bellasreef-victoria-metrics-1`. Named volumes:
+The spine moved from ad-hoc `pg-dev`/`nats-dev`/`vm-dev` containers to a
+compose-managed spine, first as its own `bellasreef-spine.service`, then
+folded on 2026-08-13 into `bellasreef.service` covering all five services
+(see Deployment discipline above — the host-systemd-app-units era in between
+is a closed, dated detour). Containers: `bellasreef-nats-1`,
+`bellasreef-postgres-1`, `bellasreef-victoria-metrics-1`. Named volumes:
 `bellasreef_{nats,postgres,vm}-data`. All spine ports are loopback-only
 (`127.0.0.1:4222/8222/5432/8428`) — the old `-dev` containers were
-LAN-exposed (`0.0.0.0`) since 2026-08-09; see the standing flag below. The
+LAN-exposed (`0.0.0.0`) since 2026-08-09; see the RESOLVED entry above. The
 old containers are stopped, not yet removed — removal is gated on David.
 
 ## Installed tooling
@@ -474,20 +497,26 @@ old containers are stopped, not yet removed — removal is gated on David.
 **PATH trap:** `i2cdetect`, `iw`, and `hwclock` live in `/usr/sbin`, which is not
 on `PATH` for non-interactive SSH. `ssh <pi> i2cdetect` reports "not found" even
 though the tool is installed — prepend `/usr/sbin:/sbin` or use absolute paths.
-`uv` is symlinked into `/usr/local/bin` so systemd units can find it.
+`uv` is no longer load-bearing for running services — the app services run as
+images, not a host venv, and `bellasreef.service` invokes `docker compose`
+directly — but it stays installed for local checkout/scripting use on the host.
 
 **`pkill -f` self-match trap:** over SSH, `pkill -f <pattern>` matches the remote
 shell's own command line, so `ssh pi 'pkill -f bellasreef_hardware_io; ...'` kills
 the connection and returns 255 before the rest of the line runs. Bracketing the
 first character (`[b]ellasreef`) only helps if the literal string appears nowhere
 else in the same command — a restart line contains it twice, in the kill and in
-the start. Stop and start in **separate** `ssh` invocations.
+the start. Stop and start in **separate** `ssh` invocations. (This trap predates
+containers-only and applies to any process-name-matching command over SSH, not
+just the deleted host units.)
 
-**Dev launchers:** `scripts/dev/run-api.sh` and `scripts/dev/run-hwio.sh` carry
-the environment both services need. `BELLASREEF_NATS_URL` is the one that bites:
-hardware-io without it reads the probe, serves metrics and logs a clean startup
-while publishing nothing at all. Metrics are not the telemetry path — check the
-wire, not the gauge.
+**Wire, not gauge:** `BELLASREEF_NATS_URL` is the environment variable that
+bites — hardware-io without it reads the probe, serves metrics and logs a
+clean startup while publishing nothing at all. Metrics are not the telemetry
+path — check the wire, not the gauge. (Formerly documented against the
+deleted `scripts/dev/run-*.sh` dev launchers; the lesson outlives the
+scripts — it applies equally to `deploy/compose.yaml`'s `environment:`
+block for hardware-io.)
 
 ## Readiness check
 
