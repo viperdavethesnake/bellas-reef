@@ -10,8 +10,11 @@
 #   git ls-remote https://github.com/raspberrypi/utils HEAD
 # and update the pin below, rather than tracking the branch.
 FROM debian:bookworm-slim AS pinctrl-build
+# ca-certificates: without it, git's HTTPS clone of github.com fails with
+# "server certificate verification failed. CAfile: none" — debian:bookworm-slim
+# carries no trust store by default, and cloning over https needs one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git cmake gcc make libc6-dev && rm -rf /var/lib/apt/lists/*
+        git ca-certificates cmake gcc make libc6-dev && rm -rf /var/lib/apt/lists/*
 # Pinned 2026-08-13 via the ls-remote command above.
 RUN git clone https://github.com/raspberrypi/utils /src \
     && cd /src && git checkout 6609ecb54f233d372d76b00caa12b292a6a9dba1 \
