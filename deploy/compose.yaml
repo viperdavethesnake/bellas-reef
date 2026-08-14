@@ -1,8 +1,9 @@
-# Bella's Reef — deployment topology.
+# Bella's Reef — deployment topology. All five services, containers only.
 #
-# Every image is digest-pinned. Digests resolved from the registry on
-# 2026-08-09 and verified present; a tag can be moved upstream, a digest cannot.
-# To re-resolve after a deliberate version bump:
+# Spine images (nats, postgres, victoria-metrics) are digest-pinned. Digests
+# resolved from the registry on 2026-08-09 and verified present; a tag can be
+# moved upstream, a digest cannot. To re-resolve after a deliberate version
+# bump:
 #
 #   docker buildx imagetools inspect <image>:<tag> --format '{{.Manifest.Digest}}'
 #
@@ -12,10 +13,11 @@
 # mainline. If an OSS LTS line is wanted, that question is unresolved and does
 # not have a Docker Hub answer today.
 #
-# Application services (hardware-io, control-engine, api) are declared but
-# commented out: their code lands in session 2 and a build context with no
-# Dockerfile would make this file un-buildable. Their device passthrough is
-# recorded now so it is reviewed as part of the contract, not improvised later.
+# App images (hardware-io, control-engine, api) are pulled by SHA tag —
+# `image:` is set alongside `build:` so `docker compose pull` (deploys) and
+# `docker compose build` (dev) both work from the same file; compose prefers
+# `image:` unless `--build` is given. BELLASREEF_TAG is set by deploy-pi.sh
+# to the commit SHA it just verified; it defaults to :latest for local dev.
 
 name: bellasreef
 
@@ -49,9 +51,9 @@ services:
       # Deterministic collation; avoids index corruption across libc upgrades.
       POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=und-x-icu"
     ports:
-      # Phase-1 topology runs api/control-engine/hardware-io as systemd host
-      # units (see deploy/systemd/); they reach Postgres on loopback. Remove
-      # when the app services move into this file for real.
+      # App containers reach Postgres over the compose network as
+      # postgres:5432 (see BELLASREEF_DATABASE_URL below); this loopback
+      # publish is for host-side psql/pg_dump access only.
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -76,28 +78,45 @@ services:
 
   # --------------------------------------------------------------- application
   hardware-io:
+    image: ghcr.io/viperdavethesnake/bellasreef-hardware-io:${BELLASREEF_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.hardware-io
+    depends_on:
+      nats: { condition: service_healthy }
     # SOLE owner of hardware. Specific device nodes only — never privileged.
     devices:
       - /dev/i2c-1:/dev/i2c-1
       - /dev/gpiochip0:/dev/gpiochip0
+      # pinctrl reads the live pin mux through the RP1's gpiomem window;
+      # discovery announces only what the mux proves (capabilities.py).
+      - /dev/gpiomem0:/dev/gpiomem0
     volumes:
       # DS18B20 read path is sysfs; w1-therm exposes no character device.
       # The kernel object lives under /sys/devices, and /sys/bus/w1 is symlinks
       # into it, so both are needed for the link targets to resolve.
       - /sys/bus/w1:/sys/bus/w1:ro
       - /sys/devices/w1_bus_master1:/sys/devices/w1_bus_master1:ro
+      # PWM chip device dir, rw: export/period/duty writes land here. The
+      # /sys/class/pwm entries are symlinks into it; the driver resolves them.
+      - /sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm:/sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm
+      # Chip identity + of_node compatible resolve into the device tree, ro.
+      - /sys/class/pwm:/sys/class/pwm:ro
+      - /sys/firmware/devicetree:/sys/firmware/devicetree:ro
     group_add: ["${I2C_GID:?}", "${GPIO_GID:?}"]
     user: "1000:1000"
     environment:
+      # The documented silent-death trap: without this, hardware-io reads the
+      # probe, serves metrics, logs a clean startup, and publishes nothing at
+      # all. See CLAUDE.md, "Dev environment".
+      BELLASREEF_NATS_URL: nats://nats:4222
       # No timedatectl inside the container. Clock trust is guaranteed by the
       # host: the compose stack is started by a systemd unit ordered
       # After=time-sync.target. Making that an explicit opt-in rather than a
       # silent default is the point — see docs/host-setup.md.
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
+      BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
     # Deliberately NOT published. health + metrics ride the compose network
     # only. The one container holding /dev should not also own a listening
     # socket on the host. For ad-hoc debugging use
@@ -118,6 +137,7 @@ services:
     restart: unless-stopped
 
   control-engine:
+    image: ghcr.io/viperdavethesnake/bellasreef-control-engine:${BELLASREEF_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.control-engine
@@ -139,6 +159,7 @@ services:
       BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
       BELLASREEF_METRICS_PORT: "9102"
+      BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
     volumes:
       - ./config:/config:ro
     expose:
@@ -146,6 +167,7 @@ services:
     restart: unless-stopped
 
   api:
+    image: ghcr.io/viperdavethesnake/bellasreef-api:${BELLASREEF_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -160,27 +182,15 @@ services:
       # The telemetry writer lives here: it needs the spine to read and Postgres
       # to resolve each device's control_authority (docs/device-classes.md §4).
       BELLASREEF_VM_URL: http://victoria-metrics:8428
+      BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
     # The ONE service published to the LAN: clients have to reach it. Bound to
     # all interfaces because the WiFi address changes, per the host facts.
     ports:
       - "0.0.0.0:8000:8000"
+    volumes:
+      # `bellasreef backup --out /backups/...` lands archives on the host here.
+      - /home/david/backups:/backups
     restart: unless-stopped
-
-  # control-engine:
-  #   build: { context: .., dockerfile: deploy/Dockerfile.control-engine }
-  #   depends_on:
-  #     nats: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   # No device access. Ever. It reaches hardware only through NATS.
-  #   restart: unless-stopped
-  #
-  # api:
-  #   build: { context: .., dockerfile: deploy/Dockerfile.api }
-  #   depends_on:
-  #     nats: { condition: service_healthy }
-  #     postgres: { condition: service_healthy }
-  #   ports: ["0.0.0.0:8000:8000"]   # bind all interfaces: the WiFi IP changes
-  #   restart: unless-stopped
 
 volumes:
   nats-data:
