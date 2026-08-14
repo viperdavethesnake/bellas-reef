@@ -18,11 +18,13 @@ WORKDIR /app
 
 COPY contracts/python /app/contracts/python
 COPY services/shared /app/services/shared
+COPY db /app/db
 COPY services/control_engine /app/services/control_engine
 
 RUN uv pip install --system --no-cache \
         /app/contracts/python \
         /app/services/shared \
+        /app/db \
         /app/services/control_engine
 
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin bellasreef
