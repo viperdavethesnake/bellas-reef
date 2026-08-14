@@ -353,49 +353,72 @@ restored. It only means anything because `chrony-wait` is enabled (§3) — with
 it, `time-sync.target` is reached as soon as the NTP daemon starts, which is not
 the same claim.
 
-FLAG (2026-08-13, unresolved): the subsections below (`Two runtimes, two
-liveness mechanisms`, `Telling the death modes apart`, `Running the drill`)
-describe a per-service systemd watchdog (`WatchdogSec` on
-`bellasreef-hardware-io.service`) from the deleted host-units era.
-`bellasreef.service` is a oneshot with no `WatchdogSec`, so that half of the
-table no longer has a unit to attach to. Docker's `LivenessGuard` →
-`os._exit` → `restart: unless-stopped` path still stands and is unaffected.
-Not rewritten here — out of scope for this docs pass, and any replacement
-mechanism should be verified on hardware before being documented as fact,
-not assumed. Until resolved, treat this section as describing exit-code
-semantics only; `scripts/drill-restart.sh` targets a unit that no longer
-exists and will not run as written.
+RESOLVED (2026-08-14): the FLAG that stood here described a per-service systemd
+watchdog (`WatchdogSec` on `bellasreef-hardware-io.service`) from the deleted
+host-units era, and a drill script that targeted that unit. Both are gone. The
+subsections below are rewritten from a drill actually run on this hardware, and
+the `sd_notify` half of the mechanism was deleted from the code rather than
+documented as an option that no deployed path can reach.
 
-### Two runtimes, two liveness mechanisms
+### One runtime, one liveness mechanism
 
 CLAUDE.md locks Docker Compose as the runtime, and **Docker does not restart a
 container that is merely unhealthy** — `restart: unless-stopped` acts on process
 *exit*. A healthcheck alone therefore cannot recover a hung event loop in a
 container; something has to make the process die.
 
-So the service carries both:
+That something is `LivenessGuard`: a thread watching a heartbeat emitted from
+inside the supervisor loop, which calls `os._exit(70)` when the beat goes stale.
+The process exits, and `restart: unless-stopped` brings it back.
 
-| Runtime | Mechanism | Recovery |
+It runs on a **thread**, not an asyncio task, because a frozen event loop cannot
+run the task that would have rescued it. The beat is emitted from *inside* the
+loop for the same reason — a beat from a separate task would keep asserting
+health the loop no longer has.
+
+`BELLASREEF_LIVENESS_TIMEOUT_S` (15 s in `compose.yaml`) is the only liveness
+number in the system. The `sd_notify` path that used to sit beside this one was
+deleted on 2026-08-14: under Compose there is no `NOTIFY_SOCKET`, so it was a
+branch that could not execute anywhere, and a dormant second answer to "is this
+process alive" reads as a supported option.
+
+### `docker kill` does not exercise this path
+
+Measured on this Pi, docker 29.7.2, 2026-08-14 — worth knowing before you try to
+test recovery by hand:
+
+| How the process is made to die | Guard fires | Container restarts |
 |---|---|---|
-| systemd | `sd_notify WATCHDOG=1` from inside the supervisor loop | systemd SIGABRTs and restarts on `WatchdogSec` |
-| Docker | `LivenessGuard` thread calling `os._exit` | process exits, `restart: unless-stopped` brings it back |
+| `docker kill --signal=USR1 <c>` | yes, exit 70 | **no** — stays `exited`, `RestartCount=0` |
+| `os.kill(1, SIGUSR1)` from inside | yes, exit 70 | **yes** — new PID, `RestartCount` +1, ~15 s |
 
-The guard runs on a **thread**, not an asyncio task, because a frozen event loop
-cannot run the task that would have rescued it.
+`docker kill` marks the container manually-stopped, and `unless-stopped` then
+declines to restart it. This is an artefact of the daemon's kill API, **not** of
+the recovery path: a genuine stall exits the process with nobody calling `docker
+kill`, which is the second row. `scripts/drill-restart.sh` signals PID 1 from
+inside the container for exactly this reason.
 
 ### Telling the death modes apart
 
 The liveness guard exits **70** (`EX_SOFTWARE`) deliberately, so a post-incident
-`docker inspect` or journal entry says which mechanism fired:
+`docker inspect` says which mechanism fired:
 
 | Exit | Meaning |
 |---|---|
 | `0` | clean stop |
 | `70` | **liveness guard — the supervisor loop stalled** |
-| `134` | systemd watchdog SIGABRT (128+6) |
 | `137` | SIGKILL / OOM killer (128+9) |
 
-`docker inspect --format '{{.State.ExitCode}}' bellasreef-hardware-io-1`
+```bash
+# only meaningful while the container is stopped — a running container
+# reports ExitCode 0 even if its previous life ended at 70
+docker inspect --format '{{.State.ExitCode}}' bellasreef-hardware-io-1
+
+# after a restart-policy recovery, the exit is in the event log instead
+docker events --since 30m --until "$(date +%s)" \
+  --filter container=bellasreef-hardware-io-1 --filter event=die \
+  --format '{{.Actor.Attributes.exitCode}}'
+```
 
 A stall and an OOM kill send you to completely different places, and at 3 a.m.
 the exit code is the fastest way to know which.
@@ -410,33 +433,36 @@ socket on the host.
 ### Running the drill
 
 ```bash
-./scripts/drill-restart.sh reef        # from the dev machine
+./scripts/drill-restart.sh bellasreef.local   # from the dev machine
+./scripts/drill-restart.sh                    # on the Pi
 ```
 
-It needs the freeze trigger armed, which is deliberately opt-in — an always-armed
-"hang yourself" signal in production is a liability:
+Arming is handled by the script. The freeze trigger is read once at process
+start, so arming means recreating hardware-io with `deploy/compose.drill.yaml`
+layered on — and the script **disarms via a `trap` on every exit path,
+including failure**. Nothing to remember, and nothing left behind: an
+always-armed "hang yourself" signal on a tank controller is a liability, and a
+drill that leaves one has broken the thing it was checking.
 
-```bash
-sudo mkdir -p /etc/systemd/system/bellasreef-hardware-io.service.d
-printf '[Service]\nWatchdogSec=10\nEnvironment=BELLASREEF_ENABLE_FREEZE_DRILL=1\n' \
-  | sudo tee /etc/systemd/system/bellasreef-hardware-io.service.d/drill.conf
-sudo systemctl daemon-reload && sudo systemctl restart bellasreef-hardware-io
-```
+The drill asserts four things, and the third is the one that matters:
 
-The drill asserts three things, and the second is the one that matters:
+1. the container **died with exit 70** on its `die` event — the liveness guard
+   fired, rather than the restart having some incidental cause.
+2. the guard **logged the stall** before terminating.
+3. the restarted process **re-ran the startup safe-state assertion** — the
+   `drill-dummy` actuator deliberately comes up *energised*, so a restart that
+   skipped the assertion would be visible rather than silently passing.
+4. the container healthcheck is green again.
 
-1. systemd attributed the kill to **`Watchdog timeout`**, not something incidental.
-2. the restarted process **re-ran the startup safe-state assertion** — the drill
-   actuator deliberately comes up *energised*, so a restart that skipped the
-   assertion would be visible rather than silently passing.
-3. the health endpoint is green again.
-
-Verified 2026-08-09: freeze at 23:50:14.797, watchdog timeout at 10 s, SIGABRT,
-restart, safe state re-asserted at 23:50:25.628 — about 10.8 s from hung loop to
+Verified 2026-08-14 on this hardware: freeze engaged, guard fired at
+`stall_s 15.496` against a 15 s timeout, process exited 70, container restarted
+(`RestartCount` 0→1, new PID), safe state re-asserted with
+`drill_actuator_safe:true` about a second later — roughly 16 s from hung loop to
 hardware safe.
 
-**Remove the drop-in when finished.** Leaving the freeze trigger armed on a
-tank controller means one stray signal hangs it until the watchdog fires.
+If the drill fails it dumps the container's logs, state and die events **before**
+the trap disarms, because recreating the container destroys its logs. The first
+failing run on 2026-08-14 lost its own evidence that way.
 
 ## 8. Not configured yet
 

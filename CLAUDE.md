@@ -517,6 +517,26 @@ the start. Stop and start in **separate** `ssh` invocations. (This trap predates
 containers-only and applies to any process-name-matching command over SSH, not
 just the deleted host units.)
 
+**`docker kill` suppresses the restart policy** (measured 2026-08-14, docker
+29.7.2). `docker kill --signal=<any> <c>` marks the container manually-stopped,
+so `restart: unless-stopped` declines to restart it even when the process exits
+on its own afterwards. Measured both ways on hardware-io: killed via the daemon
+API the guard fired, the process exited 70, and the container **stayed dead**
+(`RestartCount=0`); signalled from inside with `docker exec <c> python -c
+"import os,signal; os.kill(1, signal.SIGUSR1)"` the identical exit restarted
+normally (new PID, `RestartCount` +1, ~15 s).
+
+This is an artefact of the kill API, **not** of the recovery path — a genuine
+stall exits the process with nobody calling `docker kill`. It matters because
+testing recovery the obvious way reports a failure that production would not
+have, and could be misread as "the restart policy is broken." Signal PID 1 from
+inside. `scripts/drill-restart.sh` does, and `docs/host-setup.md` §7 records
+both rows.
+
+Related: `.State.ExitCode` reads `0` on a *running* container even when its
+previous life ended at 70. After a restart-policy recovery the exit code lives
+in `docker events --filter event=die`, not in `inspect`.
+
 **Wire, not gauge:** `BELLASREEF_NATS_URL` is the environment variable that
 bites — hardware-io without it reads the probe, serves metrics and logs a
 clean startup while publishing nothing at all. Metrics are not the telemetry
