@@ -114,6 +114,9 @@ class TestHardwareListing:
         # The role added in contracts 2.0.0 is what lets a client render a
         # light differently from a doser.
         assert next(d for d in devices if d["device_id"] == "led-blue")["role"] == "light"
+        # seed_devices inserts directly, bypassing bind_device, so neither row
+        # is adopted or carries a binding — channel must read as None for both.
+        assert all(d["channel"] is None for d in devices)
 
     def test_sensors_filters_to_sensors(self) -> None:
         async def scenario() -> list[dict[str, Any]]:

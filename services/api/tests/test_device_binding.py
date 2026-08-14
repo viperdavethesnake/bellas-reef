@@ -635,6 +635,59 @@ async def bind_light(
     )
 
 
+async def get_device(
+    c: httpx.AsyncClient, headers: dict[str, str], device_id: str
+) -> dict[str, Any]:
+    body: list[dict[str, Any]] = (await c.get("/api/v1/devices", headers=headers)).json()
+    return next(d for d in body if d["device_id"] == device_id)
+
+
+def test_a_bound_devices_channel_is_surfaced() -> None:
+    """Two adopted lights are indistinguishable except by name without this.
+
+    David's ruling 2026-08-13: `DeviceView` carries the physical channel its
+    binding claims, additive and optional, so a client can finally tell two
+    adopted PWM lights apart.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            return await get_device(c, headers, "led-blue")
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    assert run(scenario)["channel"] == "0"
+
+
+def test_an_unbound_devices_channel_is_none() -> None:
+    """A released binding must not leave its old channel visible on the API.
+
+    `test_unbinding_keeps_the_row_and_its_history` pins that the `binding`
+    column itself is retained internally so re-binding recognises the same
+    hardware — but that is a store detail, not something the API should show
+    as a still-claimed channel.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            await c.delete("/api/v1/devices/led-blue", headers=headers)
+            return await get_device(c, headers, "led-blue")
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    assert run(scenario)["channel"] is None
+
+
 def test_unbinding_frees_the_channel_to_be_bound_again() -> None:
     """The lockout this endpoint closes.
 
