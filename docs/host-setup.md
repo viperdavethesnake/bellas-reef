@@ -461,9 +461,30 @@ overlay does is **mux header pins to it**. Without one, exporting a channel
 succeeds and drives nothing.
 
 ```bash
-# In /boot/firmware/config.txt, [pi5] section. Applied and verified 2026-08-12.
-dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+# In /boot/firmware/config.txt, [pi5] section. Applied and verified 2026-08-13.
+dtoverlay=pwm-4chan
 ```
+
+`pwm-4chan` is **our own overlay** — source in `deploy/overlays/pwm-4chan.dts`,
+build/install commands in its header — because no stock overlay muxes all four
+RP1 PWM0 channels. The verified pin map:
+
+| Channel | GPIO | Header pin | legacy `func` | RP1 alt |
+|---|---|---|---|---|
+| PWM0_CHAN0 | 12 | 32 | 4 | a0 |
+| PWM0_CHAN1 | 13 | 33 | 4 | a0 |
+| PWM0_CHAN2 | 18 | 12 | **2** | a3 |
+| PWM0_CHAN3 | 19 | 35 | **2** | a3 |
+
+The legacy `brcm,function` values are translated per-pin and are not the RP1
+alt numbers — `func=7` on 18/19 is rejected and **poisons the whole map**,
+unmuxing 12/13 too (measured; the two `pinctrl-rp1 ... invalid function` lines
+in dmesg are the tell). hardware-io's discovery reads the live mux with
+`pinctrl get` at startup, so whatever this overlay muxes is exactly what the
+hub announces — fewer channels muxed means fewer announced, no code change in
+either direction. The earlier two-channel form
+(`dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`) remains valid if only
+two channels are wanted.
 
 **Not two single-channel overlays.** The archived HAL (v3.1.0) prescribes
 
@@ -497,13 +518,14 @@ channel 1 → GPIO13** — it is only the overlay form that does not carry to RP
 | `pwmchip0` | `1f00098000.pwm` | the one the overlay muxes to GPIO12/13 |
 | `pwmchip1` | `1f0009c000.pwm` | present before the overlay; unmuxed |
 
-Before the overlay, `pwmchip0` **was** `1f0009c000.pwm`. The index is not stable
-across a config change, exactly like `gpiochip*`. Our bindings target
-`pwmchip0`, which is correct today and is worth re-checking after any overlay
-edit.
+Before the overlay, `pwmchip0` **was** `1f0009c000.pwm`. The index is not
+stable across a config change, exactly like `gpiochip*` — which is why
+hardware-io resolves the chip by device identity (`1f00098000.pwm` = PWM0,
+ours; `1f0009c000.pwm` = PWM1, the fan header's block) and never by index.
 
-Verify with `pinctrl get 12,13` after a reboot; a channel that exports happily
-while the pin reads `none` is the failure this section exists to prevent.
+Verify with `pinctrl get 12,13,18,19` after a reboot; a channel that exports
+happily while the pin reads `none` is the failure this section exists to
+prevent.
 
 Three cautions:
 

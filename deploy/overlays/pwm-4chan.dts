@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-FileCopyrightText: 2026 Bella's Reef LLC
+//
+// All four RP1 PWM0 channels muxed to header pins. Built 2026-08-13 because
+// no stock overlay does this: pwm-2chan stops at two, and stacking multiple
+// pwm overlay lines fails on this board (the last one wins).
+//
+// The function values are the LEGACY brcm encoding, translated per-pin by the
+// RP1 compat layer — they are NOT the RP1 alt numbers:
+//
+//   GPIO12/13 -> 4 (legacy ALT0)  -> RP1 a0 = PWM0_CHAN0/1
+//   GPIO18/19 -> 2 (legacy ALT5)  -> RP1 a3 = PWM0_CHAN2/3
+//
+// func=7 on 18/19 is rejected ("invalid function in map table") and poisons
+// the WHOLE map, unmuxing 12/13 too — measured on this board 2026-08-13.
+// Verify after any change: pinctrl get 12,13,18,19 must show PWM0_CHAN0-3.
+//
+// Build and install (on the Pi):
+//   dtc -@ -I dts -O dtb -o pwm-4chan.dtbo deploy/overlays/pwm-4chan.dts
+//   sudo cp pwm-4chan.dtbo /boot/firmware/overlays/
+//   config.txt: dtoverlay=pwm-4chan   (then reboot)
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			pwm_pins: pwm_pins {
+				brcm,pins = <12 13 18 19>;
+				brcm,function = <4 4 2 2>;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&pwm>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&pwm_pins>;
+			status = "okay";
+		};
+	};
+};

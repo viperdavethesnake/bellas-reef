@@ -220,7 +220,7 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 | Interface | Path | State |
 |---|---|---|
 | I²C | `/dev/i2c-1` | enabled; see device inventory below |
-| PWM (RP1) | `/sys/class/pwm/pwmchip0` | `1f00098000.pwm` after `pwm-2chan`; **npwm 4**. Two chips exist once the overlay loads and the index MOVED — `pwmchip0` was `1f0009c000.pwm` before it. Verified 2026-08-12 |
+| PWM (RP1) | resolve by device identity: `1f00098000.pwm` (PWM0, ours) vs `1f0009c000.pwm` (PWM1, fan) — the pwmchipN index moves between kernels. npwm 4, all four pin-muxed by `pwm-4chan` since 2026-08-13 |
 | I²C (HDMI DDC) | `/dev/i2c-13`, `/dev/i2c-14` | ignore |
 | 1-Wire | `/sys/bus/w1/devices/w1_bus_master1` | live; DS18B20 probes appear as `28-*` |
 | SPI | — | disabled (`dtoverlay=nospi10`) |
@@ -236,20 +236,41 @@ The `/dev/gpiochipN` index has moved between kernel releases — resolve by labe
 `0x70` on a bus scan is **not a second board** — it is the PCA9685's ALLCALLADR
 (`0x05` reads `0xE0`; `0xE0 >> 1 = 0x70`). Expect both addresses from one chip.
 
-**PWM pin muxing, verified 2026-08-12.** `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`
-gives `GPIO12 = PWM0_CHAN0` and `GPIO13 = PWM0_CHAN1`. The archive's form — two
-separate `dtoverlay=pwm` lines — was tried on this board and **only the second
-took**, leaving GPIO12 unmuxed while the channel still exported happily. A
-channel that exports while its pin reads `none` is the trap; check
-`pinctrl get 12,13`, not the presence of a sysfs directory.
+**PWM: all four RP1 PWM0 channels, verified live 2026-08-13.** The archive's
+"two channels" claim was the Pi-4 era talking; the RP1's PWM0 block has four
+independent channels and every one reaches a header pin on this board:
 
-**PWM channel count, and a discrepancy with the archive.** Our Pi reports
-`npwm` **4**. The archived HAL README (v3.1.0) states the count "should show: 2"
-and calls two channels the hardware reality. Both are recorded; ours is the
-measured one, taken with no PWM overlay loaded. Which channels reach GPIO12/13
-is set by the overlay, and the mapping the archive gives — channel 0→GPIO12,
-channel 1→GPIO13 — has not been confirmed on this board. Do not resolve this
-from the number alone.
+| Channel | GPIO | Header pin | Legacy `brcm,function` | RP1 alt |
+|---|---|---|---|---|
+| PWM0_CHAN0 | 12 | 32 | 4 | a0 |
+| PWM0_CHAN1 | 13 | 33 | 4 | a0 |
+| PWM0_CHAN2 | 18 | 12 | **2** | a3 |
+| PWM0_CHAN3 | 19 | 35 | **2** | a3 |
+
+All four measured muxed with `pinctrl get 12,13,18,19` after the custom
+`pwm-4chan` overlay (see `docs/host-setup.md` §9 — built on the Pi with `dtc`;
+current `config.txt` runs `dtoverlay=pwm-4chan`). The legacy function values
+are NOT the RP1 alt numbers: 12/13 take `4` (legacy ALT0) but 18/19 take `2`
+(legacy ALT5, the BCM-era PWM position — the compat layer translates per-pin).
+`func=7` on 18/19 is rejected as `invalid function` and **poisons the whole
+pin map**, unmuxing 12/13 too. The archive's two-separate-`dtoverlay=pwm`-lines
+form also fails here (only the second takes). A channel that exports in sysfs
+while its pin reads `none` is the standing trap; check `pinctrl get`, never
+the presence of a sysfs directory — which is exactly what hardware-io now does:
+discovery shells `pinctrl get` and announces only what the mux proves, so an
+overlay change is reflected at the next service start with zero code change.
+
+The two RP1 PWM instances: `1f00098000.pwm` is PWM0 (ours); `1f0009c000.pwm`
+is PWM1 (fan header). The pwmchip index has moved between kernels — resolve by
+device identity, which discovery also now does. `pinctrl` lives in `/usr/bin`
+(verified `command -v`; a plan once pinned `/usr/sbin` unchecked and discovery
+failed at the next boot — loudly, by design).
+
+**Rule, from how this was learned:** a recorded measured-vs-documented
+discrepancy (like npwm=4 vs the archive's 2, which sat unresolved under two
+days of PWM work) is a **blocking flag** — no dependent config or unit ships
+on top of it until it is resolved on hardware or explicitly accommodated in
+the design.
 
 **Measured DS18B20 read cost: 831 ms** on this hardware, above the ~750 ms
 datasheet conversion time. This is the empirical basis for the driver-interface
