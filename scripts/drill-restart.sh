@@ -38,7 +38,21 @@ else
     run() { bash -c "$1"; }
 fi
 
-fail() { echo "DRILL FAILED: $*" >&2; exit 1; }
+# Dump the evidence BEFORE the trap disarms, because disarming recreates the
+# container and takes its logs with it. Learned the hard way on 2026-08-14: the
+# first failing run destroyed the only record of why it failed.
+fail() {
+    echo "DRILL FAILED: $*" >&2
+    if [[ -n "${CID:-}" ]]; then
+        echo "── evidence (logs are about to be destroyed by the recreate) ──" >&2
+        run "docker logs --tail 25 $CID 2>&1" >&2 || true
+        run "docker inspect -f 'Status={{.State.Status}} ExitCode={{.State.ExitCode}} RestartCount={{.RestartCount}} RestartPolicy={{.HostConfig.RestartPolicy.Name}}' $CID" >&2 || true
+        # Epochs are evaluated on the Pi, not here: the window has to be in the
+        # docker daemon's clock, not the dev machine's.
+        run "docker events --since ${t0:-$T_START} --until \$(date +%s) --filter container=$CID --format 'event={{.Action}} exitCode={{.Actor.Attributes.exitCode}}'" >&2 || true
+    fi
+    exit 1
+}
 
 inspect() { run "docker inspect -f '$1' $CID"; }
 
@@ -78,6 +92,9 @@ wait_healthy() {
 
 echo "── preflight ──"
 
+# Read on the Pi: every docker --since/--until below is in the daemon's clock.
+T_START=$(run "date +%s")
+
 running=$(run "$COMPOSE_BASE ps --format '{{.Service}} {{.State}}' | grep '^$SERVICE '" || true)
 [[ "$running" == *running* ]] || fail "$SERVICE is not running (got '${running:-nothing}')"
 echo "  $SERVICE is running"
@@ -107,8 +124,20 @@ echo "  armed:    container=${CID:0:12} Pid=$pid_before RestartCount=$restarts_b
 # `docker logs --since` take it, and it sidesteps the container's timezone.
 t0=$(run "date +%s")
 
+# Signalled from INSIDE the container, not with `docker kill --signal=USR1`.
+# Measured on the Pi 2026-08-14, docker 29.7.2: `docker kill` marks the
+# container manually-stopped, and `unless-stopped` then declines to restart it.
+# The guard still fired and the process still exited 70 — the container simply
+# stayed dead, RestartCount=0, indefinitely.
+#
+# That is an artefact of the daemon's kill API, NOT of the recovery path: a
+# genuine stall exits the process without anyone calling `docker kill`, and
+# that case was verified to restart normally (Pid changed, RestartCount 0->1,
+# ~15 s). Signalling PID 1 from inside reproduces the real failure faithfully.
+# Using python rather than `kill` because the slim image ships no shell utils.
 echo "  freezing…"
-run "docker kill --signal=USR1 $CID" >/dev/null || fail "could not signal $CID"
+run "docker exec $CID python -c 'import os,signal; os.kill(1, signal.SIGUSR1)'" >/dev/null \
+    || fail "could not signal PID 1 inside $CID"
 
 deadline=$((SECONDS + 90))
 while (( SECONDS < deadline )); do
