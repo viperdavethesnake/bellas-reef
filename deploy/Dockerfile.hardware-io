@@ -13,8 +13,13 @@ FROM debian:bookworm-slim AS pinctrl-build
 # ca-certificates: without it, git's HTTPS clone of github.com fails with
 # "server certificate verification failed. CAfile: none" — debian:bookworm-slim
 # carries no trust store by default, and cloning over https needs one.
+#
+# g++: pinctrl's CMakeLists.txt project() call probes for a C++ compiler even
+# though the tool itself is C — cmake . fails without one. gcc alone is not
+# enough. Verified on the Pi: with g++ added, the build completes and the
+# resulting binary runs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git ca-certificates cmake gcc make libc6-dev && rm -rf /var/lib/apt/lists/*
+        git ca-certificates cmake gcc g++ make libc6-dev && rm -rf /var/lib/apt/lists/*
 # Pinned 2026-08-13 via the ls-remote command above.
 RUN git clone https://github.com/raspberrypi/utils /src \
     && cd /src && git checkout 6609ecb54f233d372d76b00caa12b292a6a9dba1 \
