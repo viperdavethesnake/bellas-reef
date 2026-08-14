@@ -29,10 +29,12 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 COPY contracts/python /app/contracts/python
+COPY services/shared /app/services/shared
 COPY services/hardware_io /app/services/hardware_io
 
 RUN uv pip install --system --no-cache \
         /app/contracts/python \
+        /app/services/shared \
         /app/services/hardware_io
 
 # capabilities.py invokes this by the absolute path PINCTRL == "/usr/bin/pinctrl".
