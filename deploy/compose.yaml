@@ -88,9 +88,16 @@ services:
     devices:
       - /dev/i2c-1:/dev/i2c-1
       - /dev/gpiochip0:/dev/gpiochip0
-      # pinctrl reads the live pin mux through the RP1's gpiomem window;
+      # pinctrl reads the live pin mux through the RP1's gpiomem windows;
       # discovery announces only what the mux proves (capabilities.py).
+      # ALL FIVE banks are required: pinctrl mmaps the whole gpiolib and
+      # exits 255 ("Failed to mmap gpiolib") with any subset — measured
+      # in-container 2026-08-13, gpiomem0 alone and 0-3 both fail.
       - /dev/gpiomem0:/dev/gpiomem0
+      - /dev/gpiomem1:/dev/gpiomem1
+      - /dev/gpiomem2:/dev/gpiomem2
+      - /dev/gpiomem3:/dev/gpiomem3
+      - /dev/gpiomem4:/dev/gpiomem4
     volumes:
       # DS18B20 read path is sysfs; w1-therm exposes no character device.
       # The kernel object lives under /sys/devices, and /sys/bus/w1 is symlinks
