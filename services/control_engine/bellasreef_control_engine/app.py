@@ -37,11 +37,9 @@ from bellasreef_service import (
     Health,
     LivenessGuard,
     MetricsServer,
-    SdNotifier,
     clock_is_trusted,
     configure_logging,
     get_logger,
-    watchdog_interval_s,
 )
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -159,7 +157,6 @@ class ControlEngine:
         self._threshold_refresh_s = threshold_refresh_s
         self._thresholds_read_at = 0.0
 
-        self.notifier = SdNotifier()
         self.liveness = LivenessGuard(timeout_s=liveness_timeout_s)
         self.httpd = MetricsServer(probe=self.health, registry=self.registry, port=metrics_port)
         self._stopping = asyncio.Event()
@@ -192,14 +189,12 @@ class ControlEngine:
 
         await self.httpd.start()
         self.liveness.start()
-        self.notifier.ready()
         try:
             await self._loop()
         finally:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        self.notifier.stopping()
         self.liveness.stop()
         await self.httpd.stop()
         if self.publisher is not None:
@@ -234,11 +229,7 @@ class ControlEngine:
     # ------------------------------------------------------------- main loop
 
     async def _loop(self) -> None:
-        ping_every = watchdog_interval_s(default=self._liveness_timeout_s / 3)
-        next_ping = 0.0
-
         while not self._stopping.is_set():
-            mono = time.monotonic()
             self.liveness.beat()
             self.metrics.loop_beats.inc()
             self.metrics.loop_stall.set(self.liveness.age_s())
@@ -257,9 +248,6 @@ class ControlEngine:
                 self._assignments_loaded = await self.publisher.load_assignments(self.assignments)
 
             if self._clock_trusted:
-                if mono >= next_ping:
-                    self.notifier.ping()
-                    next_ping = mono + ping_every
                 await self._tick(datetime.now(UTC))
 
             try:

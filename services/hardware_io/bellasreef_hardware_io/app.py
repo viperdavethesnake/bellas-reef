@@ -31,7 +31,7 @@ from bellasreef_contracts import (
 from bellasreef_contracts.driver import SensorSample
 from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
-from bellasreef_service.watchdog import LivenessGuard, SdNotifier, watchdog_interval_s
+from bellasreef_service.watchdog import LivenessGuard
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
 from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
@@ -144,7 +144,6 @@ class HardwareIO:
         )
         self.sensors: list[DS18B20] = []
 
-        self.notifier = SdNotifier()
         self.liveness = LivenessGuard(timeout_s=liveness_timeout_s)
         self.httpd = MetricsServer(probe=self.health, registry=self.registry, port=metrics_port)
 
@@ -303,7 +302,6 @@ class HardwareIO:
             "starting",
             extra={
                 "clock_trusted": self._clock_trusted,
-                "sd_notify": self.notifier.enabled,
                 "sensors": len(self.sensors),
                 "actuators": len(self.supervisor.actuator_ids),
             },
@@ -329,8 +327,6 @@ class HardwareIO:
 
         await self.httpd.start()
         self.liveness.start()
-        self.notifier.ready()
-        self.notifier.status("running")
 
         try:
             await self._loop()
@@ -338,7 +334,6 @@ class HardwareIO:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        self.notifier.stopping()
         self.liveness.stop()
         await self.httpd.stop()
         if self.spine is not None:
@@ -427,9 +422,6 @@ class HardwareIO:
     # ------------------------------------------------------------- main loop
 
     async def _loop(self) -> None:
-        ping_every = watchdog_interval_s(default=self._liveness_timeout_s / 3)
-        next_ping = 0.0
-
         while not self._stopping.is_set():
             now = time.monotonic()
 
@@ -447,10 +439,6 @@ class HardwareIO:
             self.liveness.beat()
             self.metrics.loop_beats.inc()
             self.metrics.loop_stall.set(self.liveness.age_s())
-
-            if now >= next_ping:
-                self.notifier.ping()
-                next_ping = now + ping_every
 
             self._refresh_clock_trust()
             await self._beat_and_serve()

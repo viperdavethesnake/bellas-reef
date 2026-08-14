@@ -7,19 +7,20 @@ The kernel watchdog on this board (`/dev/watchdog0`, systemd
 Python process whose event loop has deadlocked while the kernel hums along —
 which is the failure that actually leaves a heater on.
 
-Two mechanisms, because this service has two deployment paths and only one of
-them can use `sd_notify`:
+``LivenessGuard`` is that mechanism, and under the locked runtime it is the
+only one. A watchdog **thread** (not a task — a stalled loop cannot run its own
+rescue) watches a heartbeat emitted from inside the supervisor loop and calls
+``os._exit`` if it goes stale, so the container exits and
+``restart: unless-stopped`` brings it back.
 
-``SdNotifier``
-    Under systemd with ``Type=notify`` + ``WatchdogSec=``, pinging
-    ``WATCHDOG=1`` from inside the supervisor loop. If the loop stops turning,
-    the pings stop, and systemd kills and restarts the unit.
+.. note::
 
-``LivenessGuard``
-    Under Docker, where there is no ``NOTIFY_SOCKET``. A watchdog **thread**
-    (not a task — a stalled loop cannot run its own rescue) watches the same
-    heartbeat and calls ``os._exit`` if it goes stale, so the container exits
-    and ``restart: unless-stopped`` brings it back.
+   An ``sd_notify`` implementation lived here until 2026-08-14, pinging
+   ``WATCHDOG=1`` for the host systemd units that supervised these services
+   between 2026-08-10 and 2026-08-13. Containers-only closed that era, and
+   under Compose there is no ``NOTIFY_SOCKET`` — so it was a branch that could
+   not execute on any deployed path. Deleted rather than kept: a dormant
+   second answer to "is this process alive" reads as a supported option.
 
 .. warning::
 
@@ -34,121 +35,25 @@ them can use `sd_notify`:
 from __future__ import annotations
 
 import os
-import socket
 import threading
 import time
-from types import TracebackType
-from typing import Self
 
 from bellasreef_service.logging import get_logger
 
-__all__ = ["LIVENESS_EXIT_CODE", "LivenessGuard", "SdNotifier", "watchdog_interval_s"]
+__all__ = ["LIVENESS_EXIT_CODE", "LivenessGuard"]
 
 #: Exit code used when the liveness guard kills us. Deliberately distinct so a
-#: post-incident `docker inspect` or journal entry says WHICH mechanism fired:
+#: post-incident `docker inspect` says WHICH mechanism fired:
 #:
 #:   0    clean stop
 #:   70   liveness guard — the supervisor loop stalled  (EX_SOFTWARE)
-#:   134  systemd watchdog SIGABRT (128+6)
 #:   137  SIGKILL / OOM killer (128+9)
 #:
 #: Knowing a stall killed us rather than the OOM killer changes what you go
-#: and look at next.
+#: and look at next. `scripts/drill-restart.sh` asserts on exactly this value.
 LIVENESS_EXIT_CODE = 70
 
 log = get_logger(__name__)
-
-_NOTIFY_SOCKET_ENV = "NOTIFY_SOCKET"
-_WATCHDOG_USEC_ENV = "WATCHDOG_USEC"
-_WATCHDOG_PID_ENV = "WATCHDOG_PID"
-
-
-def watchdog_interval_s(default: float = 5.0) -> float:
-    """How often to ping, derived from systemd's ``WatchdogSec``.
-
-    systemd's own guidance is to notify at **half** the configured interval, so
-    a single missed cycle is not fatal but two are.
-    """
-    raw = os.environ.get(_WATCHDOG_USEC_ENV)
-    if not raw:
-        return default
-    try:
-        usec = int(raw)
-    except ValueError:
-        return default
-    if usec <= 0:
-        return default
-
-    # WATCHDOG_PID guards against inheriting a parent's watchdog settings.
-    pid = os.environ.get(_WATCHDOG_PID_ENV)
-    if pid and pid != str(os.getpid()):
-        return default
-
-    return (usec / 1_000_000.0) / 2.0
-
-
-class SdNotifier:
-    """Minimal ``sd_notify`` client.
-
-    A datagram to the socket in ``NOTIFY_SOCKET``. Deliberately not using the
-    systemd Python bindings — this is a dozen lines and avoids a compiled
-    dependency in an arm64 image.
-
-    A no-op when ``NOTIFY_SOCKET`` is absent, so the same code runs unchanged
-    under Docker and in tests.
-    """
-
-    def __init__(self, address: str | None = None) -> None:
-        self._address = address if address is not None else os.environ.get(_NOTIFY_SOCKET_ENV)
-        self._sock: socket.socket | None = None
-        if self._address:
-            # Python sockets are non-inheritable by default since 3.4, so no
-            # SOCK_CLOEXEC needed — and that flag is Linux-only, which would
-            # break type-checking and imports on the macOS dev machine.
-            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-
-    @property
-    def enabled(self) -> bool:
-        return self._sock is not None and bool(self._address)
-
-    def _send(self, message: str) -> None:
-        if self._sock is None or not self._address:
-            return
-        # A leading NUL marks an abstract socket on Linux.
-        path = "\0" + self._address[1:] if self._address.startswith("@") else self._address
-        try:
-            self._sock.sendto(message.encode(), path)
-        except OSError:
-            # Never let telling systemd we are alive be the thing that kills us.
-            log.warning("sd_notify send failed", extra={"message": message}, exc_info=True)
-
-    def ready(self) -> None:
-        self._send("READY=1")
-
-    def ping(self) -> None:
-        self._send("WATCHDOG=1")
-
-    def stopping(self) -> None:
-        self._send("STOPPING=1")
-
-    def status(self, text: str) -> None:
-        self._send(f"STATUS={text}")
-
-    def close(self) -> None:
-        if self._sock is not None:
-            self._sock.close()
-            self._sock = None
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close()
 
 
 class LivenessGuard:
