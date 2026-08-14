@@ -218,8 +218,12 @@ jobs:
           tags: |
             ghcr.io/viperdavethesnake/bellasreef-${{ matrix.service }}:${{ github.sha }}
             ghcr.io/viperdavethesnake/bellasreef-${{ matrix.service }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped per service: the matrix's three legs share a gha cache
+          # namespace by default, so without scope= each build's cache
+          # entries evict the previous leg's — last-writer-wins churn instead
+          # of three independently warm caches.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
   compose:
     name: compose config

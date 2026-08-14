@@ -162,7 +162,11 @@ step "recording pulled image digests"
 # the registry rather than trusted from a tag.
 for svc in "${SERVICES[@]}"; do
     digest="$(ssh "$PI_HOST" "docker inspect --format '{{index .RepoDigests 0}}' ${IMAGE_PREFIX}-${svc}:${SHA} 2>/dev/null")"
-    printf '  %-16s %s\n' "$svc" "${digest:-<no digest found>}"
+    # A missing digest means the pull did not produce an inspectable image —
+    # fatal, not a line item, for a trail whose entire point is pinning by
+    # digest rather than trusting a tag.
+    [[ -n "$digest" ]] || die "no digest found for ${IMAGE_PREFIX}-${svc}:${SHA} on ${PI_HOST}. The pull did not produce an inspectable image, so there is nothing to pin — check the pull step's output above."
+    printf '  %-16s %s\n' "$svc" "$digest"
 done
 
 step "applying migrations"
@@ -177,7 +181,13 @@ step "applying migrations"
 # meet the old schema. `docker compose run` starts any unmet depends_on
 # (nats, postgres) on its own, so this also brings the spine up on a Pi where
 # it was not already running.
-compose "run --rm api sh -c 'cd /app/db && alembic upgrade head' 2>&1 | tail -5" \
+#
+# Not routed through compose(): `| tail -5` for readable output would
+# otherwise swallow alembic's real exit status behind tail's, so `|| die`
+# could never fire and a migration failure would silently let the deploy
+# continue into new code against an old schema. `set -o pipefail` on the
+# remote shell is what makes the pipeline's exit status alembic's again.
+ssh "$PI_HOST" "set -o pipefail && BELLASREEF_TAG=${SHA} docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} run --rm api sh -c 'cd /app/db && alembic upgrade head' 2>&1 | tail -5" \
     || die "alembic upgrade failed on ${PI_HOST}"
 
 step "pointing the boot unit at ${SHA:0:8}"
@@ -218,6 +228,17 @@ advertised="$(ssh "$PI_HOST" "sed -n 's|.*<txt-record>contracts=\\([^<]*\\)</txt
 [[ "$advertised" == "$CONTRACTS" ]] \
     || die "the hub advertises contracts=${advertised:-<none>} but this build ships ${CONTRACTS}. A client reads that record to decide whether it can talk to this hub at all."
 echo "  advertising contracts=${advertised}"
+
+step "stopping any legacy host units"
+# The first cutover to containers can find the old host units still active:
+# the host api holds 0.0.0.0:8000 and the host hardware-io holds the BR_CMD
+# durable (a JetStream workqueue permits exactly one consumer per filter
+# subject), so the container versions of both collide with their host
+# counterparts by construction if this isn't done first. Idempotent —
+# `2>/dev/null || true` makes "unit not found" harmless once the units no
+# longer exist on a host — and kept here for the cutover plus any straggler
+# host that never got the memo.
+ssh "$PI_HOST" "sudo systemctl stop bellasreef-hardware-io bellasreef-control-engine bellasreef-api 2>/dev/null || true"
 
 step "starting the app containers"
 # Data services are untouched unless their pinned digests changed: `up -d`
