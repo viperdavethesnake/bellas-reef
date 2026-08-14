@@ -1,0 +1,40 @@
+# Bella's Reef — one boot unit for the whole stack (nats, postgres,
+# victoria-metrics, hardware-io, control-engine, api). Containers only, per
+# the PRD topology — the systemd app units (bellasreef-{hardware-io,
+# control-engine,api}.service) are deleted; this unit evolves the former
+# spine-only unit into the single thing systemd supervises.
+#
+# What this unit is for, and what it is not for:
+#
+# - It exists for boot persistence and clock ordering. On a board with no RTC
+#   battery the clock is wrong until chrony catches up, so the stack is
+#   ordered After=time-sync.target — the same reasoning that gated the old
+#   spine unit, now covering every service instead of just three.
+# - Docker's own restart policies (`restart: unless-stopped` in compose.yaml)
+#   are the supervisor from here on. This unit does not restart anything; it
+#   brings the stack up once at boot and gets out of the way.
+# - Deploys talk to compose directly (`docker compose pull/up`) and only ever
+#   `start` this unit — never `restart`. Restarting it would `up -d --wait`
+#   the whole stack including the spine's data services, which is exactly the
+#   forced-recreate risk the environment-boundary rule in CLAUDE.md exists to
+#   prevent. `start` on an already-active oneshot with RemainAfterExit is a
+#   no-op, which is what makes that safe to call from a script.
+[Unit]
+Description=Bella's Reef (nats, postgres, victoria-metrics, hardware-io, control-engine, api)
+Requires=docker.service
+After=time-sync.target docker.service
+Wants=time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=david
+WorkingDirectory=/home/david/bellasreef
+ExecStart=/usr/bin/docker compose -f /home/david/bellasreef/deploy/compose.yaml --env-file /home/david/bellasreef/deploy/.env up -d --wait
+# stop, not down: volumes and networks persist across a stack stop. `down`
+# would drop the named volumes' network and require recreating it on the next
+# start for no benefit — this unit's job is process supervision, not teardown.
+ExecStop=/usr/bin/docker compose -f /home/david/bellasreef/deploy/compose.yaml --env-file /home/david/bellasreef/deploy/.env stop
+
+[Install]
+WantedBy=multi-user.target
