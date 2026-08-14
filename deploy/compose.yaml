@@ -102,7 +102,19 @@ services:
       - /sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm:/sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm
       # Chip identity + of_node compatible resolve into the device tree, ro.
       - /sys/class/pwm:/sys/class/pwm:ro
-      - /sys/firmware/devicetree:/sys/firmware/devicetree:ro
+      # No /sys/firmware/devicetree bind mount here — tried it, and it lost to
+      # Docker's default masked-paths list, which hides /sys/firmware
+      # unconditionally regardless of what's bind-mounted over it. Live
+      # finding: the of_node/compatible read in capabilities.py failed
+      # in-container ("RP1 PWM0 block found but its compatible is unreadable"),
+      # pi-pwm went unannounced, and the bind mount was proven dead weight.
+      # security_opt below unmasks the host's real /sys/firmware instead.
+    # Docker masks /sys/firmware by default; chip-identity verification reads
+    # of_node/compatible through it (capabilities.py). This container's whole
+    # purpose is hardware truth — unmasking sysfs paths for it is the least
+    # bad option, and it stays unprivileged, non-root, specific-devices-only.
+    security_opt:
+      - systempaths=unconfined
     group_add: ["${I2C_GID:?}", "${GPIO_GID:?}"]
     user: "1000:1000"
     environment:

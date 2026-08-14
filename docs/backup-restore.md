@@ -70,52 +70,59 @@ preserves it, a drag into a cloud folder does not.
 at least the server's. An older `pg_dump` refuses to dump a newer server, which
 is the failure you are most likely to hit first.
 
-They are found on `PATH`, or in the directory named by `BELLASREEF_PG_BIN`.
-That second option is not decoration. Homebrew's `libpq` is keg-only, so on a
-Mac the tools are installed and `PATH` does not have them:
+**On the hub**, containers-only means these ship inside the `api` image —
+`deploy/Dockerfile.api` installs `postgresql-client-17` from PGDG, pinned to
+the spine's `postgres:17-alpine`. There is nothing to install on the host for
+this; host-setup §11 is the authority on why, and on what a future
+`postgres:18` bump changes.
+
+**From a workstation**, the tools are found on `PATH`, or in the directory
+named by `BELLASREEF_PG_BIN` — that second option is not decoration.
+Homebrew's `libpq` is keg-only, so on a Mac the tools are installed and
+`PATH` does not have them:
 
 ```bash
 export BELLASREEF_PG_BIN=/usr/local/opt/libpq/bin   # or /opt/homebrew/... on Apple silicon
 ```
 
-On the hub, Postgres runs in a container but the CLI runs on the host, so the
-host needs its own client package — `sudo apt-get install -y
-postgresql-client-17`. Host-setup §11 is the authority on which package, why
-the container's own copy cannot be borrowed, and what happens when the server
-major moves.
-
 ## Taking a backup
 
-On the hub, the CLI runs from the deployed clone the same way `bellasreef
-revoke` does (host-setup §10): source the service environment, then run the
-installed script. `api.env` must carry `BELLASREEF_VM_URL` as well as the DSN
-— see the variable table in host-setup §7.
+On the hub, the command runs *inside* the running `api` container, via
+`docker compose exec`. `/backups` is a host bind mount
+(`/home/david/backups:/backups`, declared on the `api` service in
+`deploy/compose.yaml`), so `--out /backups/...` lands the archive on the host
+at `/home/david/backups/...` even though `pg_dump` itself ran in the
+container:
 
 ```bash
 cd /home/david/bellasreef
-set -a; . /etc/bellasreef/api.env; set +a
-.venv/bin/bellasreef backup --out ~/backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api \
+  bellasreef backup --out /backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
 ```
 
-`.venv/bin/bellasreef`, not `uv run bellasreef`: the script form runs what the
-last deploy synced, while a bare `uv run` may re-resolve and rewrite the venv
-the live services are executing from.
+The `api` service's `environment:` block in compose.yaml carries
+`BELLASREEF_VM_URL` and the DSN already — nothing to source by hand, because
+there is no longer a per-service env file to source (host-setup §7).
 
 From a workstation there is no direct path: the spine's ports are
 loopback-only on the hub since the 2026-08-12 cutover, and `bellasreef.local:5432`
 refuses connections *by design* — do not "fix" that by re-exposing the ports.
-Either run the command over ssh as above and `scp` the archive off, or tunnel:
+Either run the command over ssh as above (the archive is already on the host
+filesystem at `/home/david/backups/...`; `scp` it off from there), or tunnel:
 
 ```bash
 ssh -L 5432:localhost:5432 -L 8428:localhost:8428 bellasreef.local
-# then, in another shell, with the password from the hub's api.env:
+# then, in another shell, with the password from deploy/.env:
 export BELLASREEF_DATABASE_URL="postgresql+asyncpg://bellasreef:***@localhost:5432/bellasreef"
 export BELLASREEF_VM_URL="http://localhost:8428"
 bellasreef backup
 ```
 
 With no `--out`, the file lands in the working directory as
-`bellasreef-<host>-<timestamp>.tar.gz`.
+`bellasreef-<host>-<timestamp>.tar.gz` — inside the container's filesystem if
+run via `docker compose exec` without an explicit `/backups/...` path, so
+always pass `--out /backups/...` on the hub or the archive will not survive
+the container's next recreation.
 
 ### The telemetry snapshot is not optional by accident
 
@@ -149,28 +156,30 @@ curl -X POST "http://localhost:8428/snapshot/delete?snapshot=<snapshot>"
 
 ## Restoring onto fresh hardware
 
-The order matters, and one step is easy to get wrong.
+Containers-only shortened this considerably: there is one unit, one env file,
+and the app image carries its own pg tools, so most of the old per-service
+setup steps are gone. The order still matters.
 
-**1. Prepare the host.** Follow `docs/host-setup.md`. Overlays, chrony, avahi
-and the systemd units are host configuration, and none of it is in the archive.
+**1. Prepare the host.** Follow `docs/host-setup.md` — overlays, chrony,
+avahi, and `deploy/.env` including the ghcr.io pull credential (§1c). None of
+it is in the archive.
 
-**2. Recreate the two host-state files** — neither is in the archive, on
-purpose, so that a file you copy to a laptop is not also a credential:
+**2. Recreate `deploy/.env`** from `deploy/.env.example` — the database
+password and the `i2c`/`gpio` group IDs (host-setup §1b). It is the only
+host-state config file now; there is no per-service `/etc/bellasreef/*.env`
+to recreate alongside it.
 
-- `deploy/.env` from `deploy/.env.example` — the database password and the
-  `i2c`/`gpio` group IDs (host-setup §1b).
-- `/etc/bellasreef/<service>.env` — the service environment, including the
-  DSN the restore command itself will read. Variable-by-variable recipe in
-  host-setup §7; the password must match what you put in `deploy/.env`.
-
-**3. Start the spine.** The unit files were installed in step 1 (host-setup
-§7), so the spine comes up supervised rather than as hand-run containers:
+**3. Start the spine.** `bellasreef.service` (installed in step 1) brings up
+the whole stack in one shot, app services included:
 
 ```bash
-sudo systemctl start bellasreef-spine.service
+sudo systemctl start bellasreef.service
 ```
 
-NATS and VictoriaMetrics idle harmlessly; what this step is for is Postgres.
+hardware-io/control-engine/api crash-loop harmlessly against the still-empty
+database — `restart: unless-stopped` keeps retrying until step 6 gives them
+something to connect to. What this step is really for is Postgres: NATS and
+VictoriaMetrics just idle.
 
 **4. Create an empty database. Do not migrate it.**
 
@@ -180,21 +189,24 @@ gives you a database full of empty tables, and restore will refuse it with
 `target-not-empty`. Which is correct behaviour, but it is easier to just not
 migrate.
 
-**5. Restore.** From the clone on the new host, with `postgresql-client-17`
-installed (host-setup §11), the venv synced (`uv sync --frozen` — deploy-pi.sh
-has not run yet on a machine being restored), and the DSN pointing at the
-empty database:
+**5. Restore**, with the DSN pointing at the empty database. The `api`
+image already has `postgresql-client-17` and the `bellasreef` CLI baked in
+(host-setup §11), so this is a one-off container run rather than anything
+installed on the host first:
 
 ```bash
 cd /home/david/bellasreef
-set -a; . /etc/bellasreef/api.env; set +a
-.venv/bin/bellasreef restore /home/david/backups/bellasreef-<timestamp>.tar.gz
+docker compose -f deploy/compose.yaml --env-file deploy/.env run --rm api \
+  bellasreef restore /backups/bellasreef-<timestamp>.tar.gz
 ```
 
-**6. Start the app units.**
+(the archive must be under `/home/david/backups` on the host — that's what
+`/backups` is bind-mounted to.)
+
+**6. Start the rest of the stack.**
 
 ```bash
-sudo systemctl start bellasreef-hardware-io bellasreef-control-engine bellasreef-api
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --wait hardware-io control-engine api
 ```
 
 hardware-io re-announces its devices on boot, so the spine rebuilds itself.
