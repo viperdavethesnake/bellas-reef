@@ -121,6 +121,9 @@ carrying that decision").
   whole stack, including the data services, recreating the exact
   durable-contention risk the environment boundary rule above exists to
   prevent.
+  The one sanctioned exception is `scripts/factory-reset-pi.sh` (spec
+  2026-08-15): a deliberate, typed-confirmation wipe of the three data
+  volumes with a mandatory pre-reset backup.
 - A fresh registry means no devices. After any factory wipe, sensors must be
   re-imported (`docker compose exec api bellasreef devices import
   /etc/bellasreef/devices.import.yaml`, which needs an API token via the
