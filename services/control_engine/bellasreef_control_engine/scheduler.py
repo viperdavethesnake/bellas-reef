@@ -100,6 +100,20 @@ class LightingScheduler:
         ``overrides`` maps channel to a held duty. Passing them in rather than
         reaching for them keeps this function pure and testable against fixed
         clocks, which is the property the whole module is arranged around.
+
+        A held channel with no configured profile — every channel adopted
+        through the app, spec 2026-08-15 — is not silently dropped: it is
+        treated as a constant schedule of :data:`SAFE_DUTY` that the override
+        outranks, exactly like a profiled channel's curve. Release is just
+        another target change, so the same slew/deadband/convergence/refresh
+        machinery applies unchanged via :meth:`_emit_for`. Which unprofiled
+        channels are even worth considering is derived from ``overrides``
+        (currently held) and ``self._last_duty`` (still converging toward
+        :data:`SAFE_DUTY` from a hold that ended) rather than from any state
+        this method writes — that keeps ``due()`` itself free of mutation, so
+        a channel that has fully converged and gone quiet never resurfaces on
+        its own, and a repeated call with identical arguments still answers
+        identically.
         """
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
@@ -111,31 +125,64 @@ class LightingScheduler:
             # applies on the way in and on release — from the tank's point of
             # view an override ending is just another target change.
             target = held.get(profile.channel_id, profile.duty_at(now))
-            previous = self._last_duty.get(profile.channel_id)
-            cold = previous is None
-            if previous is None:
-                previous = SAFE_DUTY
+            intent = self._emit_for(profile.channel_id, target, now)
+            if intent is not None:
+                intents.append(intent)
 
-            last_at = self._last_emitted_at.get(profile.channel_id, now)
-            duty = self._limit(previous, target, (now - last_at).total_seconds())
-            converging = duty != target
-
-            if cold:
-                intents.append(Intent(profile.channel_id, duty, "initial"))
-            elif converging:
-                # Mid-convergence. Emit even if this step is smaller than the
-                # deadband, or a slow slew would stall short of the target and
-                # sit there — the deadband exists to suppress noise, not
-                # progress.
-                intents.append(Intent(profile.channel_id, duty, "converge"))
-            elif abs(duty - previous) >= self._deadband:
-                intents.append(Intent(profile.channel_id, duty, "ramp"))
-            else:
-                elapsed = (now - last_at).total_seconds()
-                if profile.channel_id not in self._last_emitted_at or elapsed >= self._refresh_s:
-                    intents.append(Intent(profile.channel_id, duty, "refresh"))
+        # Held channels with no profile: an operator hold on an adopted
+        # channel the config never mentions (every channel adopted through
+        # the app, spec 2026-08-15). Semantics: a constant schedule of
+        # SAFE_DUTY that the override outranks — release is just another
+        # target change, and the same slew/deadband/convergence machinery
+        # applies. Worth considering = currently held, or still converging
+        # from a hold that has already ended; once converged and released it
+        # drops out on its own and stays quiet.
+        profiled = {p.channel_id for p in self._profiles}
+        synthetic = (
+            set(held) | {cid for cid, duty in self._last_duty.items() if duty != SAFE_DUTY}
+        ) - profiled
+        for channel_id in sorted(synthetic):
+            target = held.get(channel_id, SAFE_DUTY)
+            intent = self._emit_for(channel_id, target, now)
+            if intent is not None:
+                intents.append(intent)
 
         return intents
+
+    def _emit_for(self, channel_id: str, target: float, now: datetime) -> Intent | None:
+        """The shared per-channel emission decision.
+
+        Given a target duty (a profile's curve, or an unprofiled channel's
+        synthetic constant-SAFE_DUTY schedule), decide whether — and with what
+        reason — a channel is due. Cold-start, slew-limited convergence,
+        deadband suppression and periodic refresh are all target-agnostic, so
+        this is the one place that logic lives; both loops in :meth:`due` call
+        it rather than duplicating the block.
+        """
+        previous = self._last_duty.get(channel_id)
+        cold = previous is None
+        if previous is None:
+            previous = SAFE_DUTY
+
+        last_at = self._last_emitted_at.get(channel_id, now)
+        duty = self._limit(previous, target, (now - last_at).total_seconds())
+        converging = duty != target
+
+        if cold:
+            return Intent(channel_id, duty, "initial")
+        if converging:
+            # Mid-convergence. Emit even if this step is smaller than the
+            # deadband, or a slow slew would stall short of the target and
+            # sit there — the deadband exists to suppress noise, not
+            # progress.
+            return Intent(channel_id, duty, "converge")
+        if abs(duty - previous) >= self._deadband:
+            return Intent(channel_id, duty, "ramp")
+
+        elapsed = (now - last_at).total_seconds()
+        if channel_id not in self._last_emitted_at or elapsed >= self._refresh_s:
+            return Intent(channel_id, duty, "refresh")
+        return None
 
     def _limit(self, previous: float, target: float, dt_s: float) -> float:
         """Clamp a move toward ``target`` to the configured rate."""
