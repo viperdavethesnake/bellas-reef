@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Coroutine
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,6 +17,7 @@ from bellasreef_contracts import ActuatorCommand, DeviceAssignment
 from bellasreef_control_engine.app import ControlEngine, load_profiles
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
+from bellasreef_db.overrides import ActiveOverride
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -249,6 +250,54 @@ class TestAssignmentGate:
 
         assert len(published) == 2
         assert published[-1].reason == "lighting:initial"
+
+
+class TestHeldUnprofiledChannelPublishes:
+    """An override on an adopted channel with no lighting profile — every
+    channel adopted through the app, spec 2026-08-15 — must reach the
+    publisher. Before Task 1's fix, ``_tick``'s ``self.scheduler.due(now,
+    held)`` never surfaced such a channel at all, so the held duty was
+    stored, re-armed and expired but never once commanded."""
+
+    def test_active_override_on_unprofiled_channel_publishes(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        engine, published = engine_with_fake_publisher
+        # "pi-pwm-0" is adopted but has no entry in the "led-blue" lighting
+        # profile the fixture ships — exactly the adopted-but-unprofiled shape.
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        engine._held["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0"]
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+    def test_release_of_the_hold_publishes_duty_zero(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """Release is just another target change: the same tick machinery
+        slews the synthetic channel back toward SAFE_DUTY once nothing owes
+        it a duty anymore — this is what `_expire_overrides` produces once an
+        override's deadline passes, exercised here without a real store."""
+        engine, published = engine_with_fake_publisher
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        engine._held["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+        del engine._held["pi-pwm-0"]  # what an expiry/release leaves behind
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0", "pi-pwm-0"]
+        assert published[1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
 
 
 class TestReconnectReDrain:

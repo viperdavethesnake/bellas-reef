@@ -27,6 +27,12 @@ def at(hour: int, minute: int = 0, second: int = 0) -> datetime:
     return datetime(2026, 6, 1, hour, minute, second, tzinfo=UTC)
 
 
+PROFILE_LED_BLUE = ramp("led-blue")
+T0 = at(9)
+T1 = at(9, 0, 5)
+T2 = at(9, 0, 10)
+
+
 class TestEmissionPolicy:
     def test_first_tick_always_emits(self) -> None:
         """A restarted engine must state the level, not assume hardware knows."""
@@ -165,6 +171,42 @@ class TestRampAcrossTheBand:
         dusk = [profile.duty_at(at(21, m)) for m in range(60)]
         assert any(0.0 < d < 0.08 for d in dawn)
         assert any(0.0 < d < 0.08 for d in dusk)
+
+
+class TestHeldUnprofiledChannels:
+    """A held override on an adopted-but-unprofiled channel (every channel
+    adopted through the app, spec 2026-08-15) behaves as a constant-SAFE_DUTY
+    schedule the override outranks."""
+
+    def test_held_unprofiled_channel_is_emitted(self) -> None:
+        sched = LightingScheduler([], max_duty_delta_per_s=None)  # no profiles
+        intents = sched.due(T0, {"pi-pwm-0": 0.5})
+        assert [(i.channel_id, i.duty) for i in intents] == [("pi-pwm-0", 0.5)]
+
+    def test_held_unprofiled_channel_slews_from_safe_start(self) -> None:
+        # with a slew rate configured, the first emission climbs from
+        # SAFE_DUTY toward the held duty rather than popping to it
+        sched = LightingScheduler([], max_duty_delta_per_s=0.1)
+        first = sched.due(T0, {"pi-pwm-0": 0.5})
+        assert first and first[0].duty < 0.5  # converging, not popped
+
+    def test_release_slews_back_to_safe_and_goes_quiet(self) -> None:
+        sched = LightingScheduler([], max_duty_delta_per_s=None)
+        held = sched.due(T0, {"pi-pwm-0": 0.5})
+        sched.mark_emitted(held[0], T0)
+        # override gone: target falls to SAFE_DUTY
+        released = sched.due(T1, {})
+        assert [(i.channel_id, i.duty) for i in released] == [("pi-pwm-0", 0.0)]
+        sched.mark_emitted(released[0], T1)
+        # converged at 0: nothing further
+        assert sched.due(T2, {}) == []
+
+    def test_profiled_channels_unaffected_by_held_strangers(self) -> None:
+        # a profile plus a held stranger: both emit, profile from its own curve
+        sched = LightingScheduler([PROFILE_LED_BLUE], max_duty_delta_per_s=None)
+        intents = sched.due(T0, {"pi-pwm-0": 0.3})
+        ids = {i.channel_id for i in intents}
+        assert ids == {"led-blue", "pi-pwm-0"}
 
 
 def test_refresh_uses_the_publish_time_not_the_decision_time() -> None:
