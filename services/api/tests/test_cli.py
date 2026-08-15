@@ -20,7 +20,7 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
@@ -49,7 +49,10 @@ class FakeSink:
     with the answer flipped.
     """
 
-    published: ClassVar[list[tuple[str, dict[str, Any]]]] = []
+    #: ``(event, detail, category)``. The category is kept rather than dropped:
+    #: it decides which audit subject the event lands on, and a call site that
+    #: lost it used to pass here unnoticed.
+    published: ClassVar[list[tuple[str, dict[str, Any], str]]] = []
     sources: ClassVar[list[str]] = []
     fails = False
 
@@ -62,18 +65,22 @@ class FakeSink:
         if self.fails:
             self.failures += 1
             return
-        FakeSink.published.append((event, detail))
+        FakeSink.published.append((event, detail, category))
 
     async def close(self) -> None:
         return None
 
     @classmethod
     def events(cls) -> list[str]:
-        return [event for event, _ in cls.published]
+        return [event for event, _, _ in cls.published]
 
     @classmethod
     def detail_for(cls, event: str) -> dict[str, Any]:
-        return next(detail for name, detail in cls.published if name == event)
+        return next(detail for name, detail, _ in cls.published if name == event)
+
+    @classmethod
+    def category_for(cls, event: str) -> str:
+        return next(category for name, _, category in cls.published if name == event)
 
 
 class DeadSink(FakeSink):
@@ -120,16 +127,16 @@ def hub(monkeypatch: pytest.MonkeyPatch) -> str:
     return dsn
 
 
-@pytest.fixture
-def fresh_db_env(hub: str) -> str:
-    """``hub``, with ``hub_identity``'s setup columns reset to never-set-up.
+def _clear_setup_state(dsn: str) -> None:
+    """Put ``hub_identity`` back to never-set-up.
 
-    ``hub`` truncates the pairing tables but ``hub_identity`` is a singleton
-    that is never truncated — otherwise the hub would mint a new identity mid
-    suite. The setup-code tests need that row in a known state rather than
-    whatever the previous test in the run left it in, so this seeds the row
-    (``Store.hub_id()``, lazy like everything else that touches it) and then
-    clears both setup columns explicitly.
+    ``hub_identity`` is a singleton that is never truncated — otherwise the hub
+    would mint a new identity mid suite — so it carries whatever the last test
+    to touch it left behind. A minted-but-never-used code is the state that
+    bites: ``setup_code_hash`` set with ``setup_completed_at`` still NULL is a
+    live "code required" gate on ``POST /pair``, and any later test that
+    bootstraps without a code would 422 against it. Same reasoning, and the
+    same name, as test_auth_lifecycle.py's helper.
     """
 
     async def reset(engine: AsyncEngine) -> None:
@@ -139,25 +146,31 @@ def fresh_db_env(hub: str) -> str:
                 text("UPDATE hub_identity SET setup_completed_at = NULL, setup_code_hash = NULL")
             )
 
-    engine_scoped(hub, reset)
-    return hub
+    engine_scoped(dsn, reset)
 
 
 @pytest.fixture
-def paired_db_env(hub: str) -> str:
+def fresh_db_env(hub: str) -> Iterator[str]:
+    """``hub``, with ``hub_identity``'s setup columns reset to never-set-up.
+
+    Cleared on the way out as well as on the way in. Entry alone made each
+    test's own precondition order-independent while leaving the *next* file's
+    tests to inherit a minted code — the two minting tests below leave one
+    behind by construction, and only this file's ordering rescued a
+    ``-k``-filtered run from it.
+    """
+    _clear_setup_state(hub)
+    yield hub
+    _clear_setup_state(hub)
+
+
+@pytest.fixture
+def paired_db_env(hub: str) -> Iterator[str]:
     """``fresh_db_env``, then ``complete_setup()`` — the post-adoption state."""
-
-    async def complete(engine: AsyncEngine) -> None:
-        store = Store(engine)
-        await store.hub_id()
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("UPDATE hub_identity SET setup_completed_at = NULL, setup_code_hash = NULL")
-            )
-        await store.complete_setup()
-
-    engine_scoped(hub, complete)
-    return hub
+    _clear_setup_state(hub)
+    engine_scoped(hub, lambda engine: Store(engine).complete_setup())
+    yield hub
+    _clear_setup_state(hub)
 
 
 def add_client(dsn: str, name: str) -> tuple[UUID, str]:

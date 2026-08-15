@@ -27,11 +27,22 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 class Audit:
+    """Captures the whole call, category included — see
+    test_device_binding.py's copy for why dropping the category was a
+    blindspot."""
+
     def __init__(self) -> None:
-        self.events: list[str] = []
+        self.records: list[tuple[str, dict[str, Any], str]] = []
 
     async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
-        self.events.append(event)
+        self.records.append((event, detail, category))
+
+    @property
+    def events(self) -> list[str]:
+        return [e for e, _, _ in self.records]
+
+    def category(self, event: str) -> str:
+        return next(c for e, _, c in self.records if e == event)
 
 
 async def fresh_engine() -> AsyncEngine:

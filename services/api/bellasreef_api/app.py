@@ -24,6 +24,7 @@ token buys, and it is the whole reason the pairing code needs no rate limiter.
 import asyncio
 import json
 import os
+import secrets
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -898,7 +899,13 @@ def build_app(
                     "Too many attempts - wait a minute.",
                     headers={"Retry-After": str(after)},
                 )
-            if code_hash is None or hash_setup_code(body.setup_code) != code_hash:
+            # compare_digest, not `!=`: the comparison is over a hash rather
+            # than the code itself, but a hub answers this endpoint
+            # unauthenticated and there is no reason to leak the shape of the
+            # miss in the response time.
+            if code_hash is None or not secrets.compare_digest(
+                hash_setup_code(body.setup_code), code_hash
+            ):
                 _setup_throttle.record_failure(monotonic())
                 await sink("pair.code_rejected", {"client_name": body.client_name})
                 raise HTTPException(

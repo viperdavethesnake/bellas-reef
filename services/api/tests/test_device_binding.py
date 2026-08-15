@@ -45,11 +45,25 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 class Audit:
+    """Captures the whole call, category included.
+
+    The category used to be accepted and dropped, so a device event that lost
+    its ``category="config"`` — and landed in the auth trail — passed here.
+    """
+
     def __init__(self) -> None:
-        self.events: list[str] = []
+        self.records: list[tuple[str, dict[str, Any], str]] = []
 
     async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
-        self.events.append(event)
+        self.records.append((event, detail, category))
+
+    @property
+    def events(self) -> list[str]:
+        return [e for e, _, _ in self.records]
+
+    def category(self, event: str) -> str:
+        """The category the first occurrence of ``event`` was filed under."""
+        return next(c for e, _, c in self.records if e == event)
 
 
 async def fresh_engine() -> AsyncEngine:
@@ -796,7 +810,7 @@ def test_unbinding_publishes_the_tombstone_and_audits_it(
     RecordingPublisher.published = []
     monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
 
-    async def scenario() -> list[str]:
+    async def scenario() -> tuple[list[str], str, str]:
         engine = await fresh_engine()
         await announce(engine, "pi-pwm", "0")
         audit = Audit()
@@ -805,15 +819,21 @@ def test_unbinding_publishes_the_tombstone_and_audits_it(
             await bind_light(c, headers, "led-blue", "0")
             response = await c.delete("/api/v1/devices/led-blue", headers=headers)
             assert response.status_code == 204, response.text
-            return audit.events
+            return audit.events, audit.category("device.bound"), audit.category("device.unbound")
         finally:
             await c.aclose()
             await engine.dispose()
 
-    events = run(scenario)
+    events, bound_category, unbound_category = run(scenario)
     # Pairing and minting a token go through the same sink; only the device
     # events are this test's business.
     assert [e for e in events if e.startswith("device.")] == ["device.bound", "device.unbound"]
+
+    # A device change is config, not auth, and the category is what decides
+    # which subject it is published on. Asserted once for this area rather than
+    # on every event — the sink used to drop it, so nothing checked it at all.
+    assert bound_category == "config"
+    assert unbound_category == "config"
 
     assert [(a.device_id, a.adopted) for a in RecordingPublisher.published] == [
         ("led-blue", True),

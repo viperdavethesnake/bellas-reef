@@ -38,21 +38,31 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 class Audit:
-    """Captures auth events so the audit requirement is assertable."""
+    """Captures auth events so the audit requirement is assertable.
+
+    Keeps the ``category`` as well as the event and its detail. It used to be
+    accepted and dropped, which meant a call site that lost its
+    ``category="config"`` — and so filed a device change in the auth trail —
+    passed every test in this suite.
+    """
 
     def __init__(self) -> None:
-        self.events: list[tuple[str, dict[str, Any]]] = []
+        self.events: list[tuple[str, dict[str, Any], str]] = []
 
     async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
-        self.events.append((event, detail))
+        self.events.append((event, detail, category))
 
     def names(self) -> list[str]:
-        return [e for e, _ in self.events]
+        return [e for e, _, _ in self.events]
 
     def detail(self, event: str) -> dict[str, Any]:
         """The detail of the first occurrence of ``event``, for asserting
         payload fields (e.g. ``method``) rather than only event names."""
-        return next(d for e, d in self.events if e == event)
+        return next(d for e, d, _ in self.events if e == event)
+
+    def category(self, event: str) -> str:
+        """The category the first occurrence of ``event`` was filed under."""
+        return next(c for e, _, c in self.events if e == event)
 
 
 async def fresh_engine() -> AsyncEngine:
@@ -108,7 +118,7 @@ def test_the_tofu_window_grants_the_first_client_and_then_closes() -> None:
     """The window closes on first success — not on a timer, not on a count of
     live clients. Revoking everything must not reopen it."""
 
-    async def scenario() -> tuple[int, int, list[str], str]:
+    async def scenario() -> tuple[int, int, list[str], str, str]:
         h = await harness()
         async with h.client() as c:
             info = (await c.get("/api/v1/info")).json()
@@ -125,9 +135,10 @@ def test_the_tofu_window_grants_the_first_client_and_then_closes() -> None:
             second = await c.post("/api/v1/pair", json={"client_name": "second"})
         await h.engine.dispose()
         method = h.audit.detail("pair.tofu_granted")["method"]
-        return first.status_code, second.status_code, h.audit.names(), method
+        category = h.audit.category("pair.tofu_granted")
+        return first.status_code, second.status_code, h.audit.names(), method, category
 
-    first_code, second_code, events, method = run(scenario)
+    first_code, second_code, events, method, category = run(scenario)
     assert first_code == 200
     assert second_code == 202, "the TOFU window must be closed for the second client"
     assert "pair.tofu_granted" in events
@@ -135,6 +146,10 @@ def test_the_tofu_window_grants_the_first_client_and_then_closes() -> None:
     # Not one of the spec's three method values ("setup_code" | "window" |
     # "approval") — a recorded amendment (review ruling, 2026-08-15).
     assert method == "tofu"
+    # The pairing trail is auth, and the category is what puts it on
+    # `bellasreef.audit.auth`. Asserted once for this area rather than on every
+    # event — the sink used to drop it, so nothing checked it at all.
+    assert category == "auth"
 
 
 def test_revoking_every_client_does_not_reopen_the_tofu_window() -> None:
