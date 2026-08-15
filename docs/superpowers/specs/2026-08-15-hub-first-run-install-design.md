@@ -165,20 +165,33 @@ error that does not name the cause.
 - all containers running and healthy
 - `bellasreef.service` **enabled**, not merely active
 - API answering on `/api/v1/info`
-- avahi running, allowlisted, and the `_bellasreef._tcp` record present
+- avahi published the service, confirmed from the daemon's own log
 - setup code minted, then printed
 
-**A limitation to state rather than paper over.** The script runs on the hub, and
-`host-setup.md` §5 records that avahi does not reliably reflect its own services
-back to a local browse, so a local check that finds nothing proves nothing. The
-script therefore cannot verify its own discoverability. It verifies what it can
-(daemon running, allowlist correct, service file installed) and tells the user
-plainly that the real proof is the phone finding the hub, which is the next thing
-they will do anyway.
+**How the mDNS check works, and why not by browsing.** `host-setup.md` §5 records
+that avahi does not reliably reflect its own services back to a local browse, so
+`avahi-browse` on the hub proves nothing. Measured 2026-08-15, it is worse than
+unreliable: `avahi-browse` and `avahi-resolve` are not installed on the reference
+host at all. They ship in `avahi-utils`, which `avahi-daemon` does not depend on.
+A browse-based check would mean installing a package to run a test that cannot
+answer the question.
 
-Claiming a mDNS pass the script cannot actually establish would be worse than
-admitting the gap: it is exactly the class of check that reads as verified and
-is not.
+Four local facts answer it properly, and the fourth is authoritative:
+
+1. `/etc/avahi/services/bellasreef.service` is present
+2. `avahi-daemon` is active
+3. `allow-interfaces` names the real interfaces
+4. the journal shows, after the most recent reload:
+   `Service "Bella's Reef on <host>" (/services/bellasreef.service) successfully established.`
+
+Item 4 is the daemon reporting that it parsed the XML and published the record.
+A malformed file logs an error there instead, so this distinguishes "the file
+exists" from "the file worked", which is the distinction that matters.
+
+What remains genuinely unverifiable from the hub is whether the **network path**
+works: multicast blocked by a router, or a client on another subnet. No local
+check can establish that, and the script says so rather than implying otherwise.
+The phone finding the hub is the proof, and it is the next thing the owner does.
 
 The boot-unit check earns its place separately from the container check: the
 others prove the hub works now, and only this one proves it comes back after a
