@@ -408,18 +408,165 @@ into this section.** Blocked until the FET stage is on the bench.
 The three measured voltages are what set `INVRT_ON` in the driver. They are
 ground truth with no stack in the loop.
 
-- FLAG (2026-08-13, unresolved, David decides at the bench): which output
-  stage drives the first real light — the PCA9685→FET chain items 0a–5
-  describe, or the RP1 pi-pwm channels that got the 2026-08-13 bring-up (4
-  channels announced, driver deployed). Stage 1 is blocked on this ruling; the
-  bench-plan items stay as written for the PCA9685 path and must not be
-  treated as superseded until ruled.
+- RESOLVED (output stage order, 2026-08-15): **RP1 native PWM first, the
+  PCA9685→FET chain second.** David's ruling at the bench. This is an ordering,
+  not an exclusion — items 0a–5 stay live and unamended for the PCA9685 path,
+  which gets its own Stage 1 when the board is back on the bus. The paragraph
+  above (`i2cset`/`i2cget`, DMM on the FET drain, `INVRT_ON`) describes the
+  PCA9685 leg specifically and is still pending; the RP1 leg ran 2026-08-15 and
+  is recorded below.
+- The PCA9685 is **not on I²C bus 1 as of 2026-08-15** — a full `i2cdetect -y 1`
+  is empty, no `0x40`, no `0x70`, where 2026-08-09 saw both. The board is off
+  the bench for now, by David. Re-verify presence before the PCA9685 Stage 1.
+- The PCA9685 is also **not discoverable in code**: `capabilities.py` announces
+  only `discover_pwm()` (RP1) and `discover_w1()`, despite its module docstring
+  promising "a PCA9685 if one answers". The driver and `factory.py`'s
+  `driver_type == "pca9685"` branch are complete, but nothing announces the
+  capability, so no channel is adoptable. A `discover_pca9685()` is a
+  prerequisite for the PCA9685 Stage 2, not for its Stage 1.
+
+**Stage 1 (RP1 native PWM), CH0 and CH2 — PASSED on hardware 2026-08-15.**
+
+Raw `/sys/class/pwm` writes only, no Bella's Reef code in the loop. DMM ground
+referenced, probed at the channel's own header pin. `pwmchip0` resolved to
+`1f00098000.pwm` (PWM0, ours) on this boot. Both channels held at
+`period=2000000` (500 Hz, the pinned frequency) and `polarity=normal`
+throughout. Every value below is David's meter reading, recorded as given.
+
+| Commanded duty | `duty_cycle` (ns) | CH0 — pin 32 (GPIO12) | CH2 — pin 12 (GPIO18) |
+|---|---|---|---|
+| 0 % | 0 | **0 V** | **0 V** (≤3 mV, called meter error) |
+| 8 % | 160 000 | **265 mV** | **265 mV** |
+| 50 % | 1 000 000 | **~1.654 V** | **~1.654 V** |
+| 100 % | 2 000 000 | **~3.309 V** | **~3.309 V** |
+
+**The two channels agree on every point.** CH2 was probed on a different header
+pin, at a different alt (`a3` vs CH0's `a0`), and produced identical readings —
+so the numbers characterise the RP1 PWM0 block, not one lucky channel, and CH1
+and CH3 can be expected to match without re-measuring each. Expected, not
+assumed: measure before trusting a channel that drives a real load.
+
+Two findings, both load-bearing:
+
+1. **`polarity=normal` is correct; duty 0 measures 0 V.** The safety inversion
+   that item 1 warns about does **not** apply to the RP1 path — the declared
+   safe state `PwmLevel(duty=0.0)` is genuinely off at the pin, proven by meter
+   rather than by reasoning. This says nothing about the PCA9685→FET chain,
+   whose stage is expected to invert and whose `INVRT_ON` is still unproven.
+2. **The points are linear to within a millivolt** (8 % of 3.309 V is 265 mV;
+   the 50 % midpoint is 1.6545 V). The channels are consistent across the whole
+   commandable range, which is what makes Stage 2 a real test: any nonlinearity
+   that appears through the stack is our code, not the silicon.
+
+Both channels returned to `duty_cycle=0, enable=0` afterwards. CH1
+(`pi-pwm-1`, owned and enabled by hardware-io) was untouched for the whole run
+— verified before and after, and it is the reason CH1 cannot be Stage-1'd by
+raw CLI without contending with the running service. CH3 remains exported at a
+leftover `period=1000000` from the 2026-08-13 bring-up; that 1 kHz is nobody's
+decision and must be set to 2 000 000 before it is used. CH0 and CH2 are now at
+2 000 000.
+
+**Stage 1 (PCA9685), CH0 — PASSED on hardware 2026-08-15.**
+
+Board rewired onto I2C bus 1 the same afternoon and answering at `0x40` plus
+`0x70` (ALLCALL) again. Raw `i2cset`/`i2cget` only, no Bella's Reef code in the
+loop. Power-on registers read identical to the 2026-08-09 baseline: MODE1
+`0x11`, MODE2 `0x04`, PRE_SCALE `0x1e`, ALLCALLADR `0xe0`.
+
+Configured as the driver does it: all channels parked full-off via ALL_LED,
+`PRE_SCALE = 0x0b` written while SLEEP was set, MODE2 `0x04` (totem-pole,
+INVRT clear), then MODE1 `0x21` to wake and `0xa1` to RESTART.
+
+Measured at 544.8 Hz, full scale 3.307 V. Every value is David's meter reading.
+
+| Commanded | LED0 registers | Off-count | Measured | As % of 3.307 |
+|---|---|---|---|---|
+| 0 % | `00 00 00 10` | full-off bit | **0 V** | 0 % |
+| 8.008 % | `00 00 48 01` | 328 | **265 mV** | 8.01 % |
+| 25 % | `00 00 00 04` | 1024 | **828 mV** | 25.04 % |
+| 50 % | `00 00 00 08` | 2048 | **1.654 V** | 50.02 % |
+| 75 % | `00 00 00 0c` | 3072 | **2.481 V** | 75.02 % |
+| 100 % | `00 10 00 00` | full-on bit | **3.307 V** | 100 % |
+
+Worst error across the range is 0.04 percentage points. The counted-duty
+encoding is correct and the full-on/full-off bits behave as distinct from
+counted values. At both extremes the meter reads 0 Hz, which is right: a static
+level has no edges.
+
+**1. `INVRT_ON = True` in the driver is WRONG for the stage measured here.**
+Duty 0 measured 0 V with MODE2 INVRT **clear**. Setting INVRT inverts that,
+so the driver as written would drive this channel to 3.307 V when commanded to
+its declared safe state. This is item 1's failure mode reached from the
+opposite direction: the code assumed inversion, the bench found none. Not
+changed yet, because whether this is the final output stage is David's ruling.
+Whichever stage ships, the constant must match a measurement rather than an
+expectation.
+
+**2. The internal oscillator runs ~7.1 % fast, and the error is a constant
+ratio.** Two prescaler values, both measured:
+
+| PRE_SCALE | Computed @ 25 MHz | Measured | Implied oscillator |
+|---|---|---|---|
+| 11 | 508.6 Hz | **544.7 / 544.8 Hz** | 26 773 094 |
+| 4 | 1220.7 Hz | **1307 Hz** | 26 767 360 |
+
+So `osc_hz ≈ 26.77 MHz` for this chip, stable across a 2.4× frequency span.
+One calibration number per chip is enough. This is why frequency-as-config
+needs a measured oscillator field and not a hardcoded 25 MHz: reef-pi's driver
+takes a configurable frequency and divides it by a constant `clockFreq =
+25000000`, so asking it for 500 Hz on a chip like this one silently returns
+545. See `docs/superpowers/specs/2026-08-15-driver-hardware-config.md`.
+
+**3. The ALL_LED registers (`0xFA`–`0xFD`) do not read back what is written.**
+They return `0x00` regardless. The write lands: after writing `00 00 00 10`
+every per-channel register read `00 00 00 10`. Verify an ALL_LED write through
+a per-channel register, never by reading it back, or a successful write looks
+like a failed one. The driver writes ALL_LED at open and deliberately does not
+read it back; adding a readback assert there would break startup in a way that
+presents as hardware failure.
+
+**4. Bench instrument note.** David's DMM duty function reads the **complement**
+of the commanded duty (50 % → 48, 25 % → 68, 75 % → 21.5) and saturates to 100
+below roughly 10 % duty. It is readable as `100 minus displayed`. The voltage
+ratio is the precise measurement and the duty readout is a sanity check.
+Recorded because it looks exactly like an inverted output on first sight, and
+is not: at 25 % commanded the voltage read 828 mV, which is 25 %, not 75 %.
+
+**5. CH1 agrees with CH0.** Three points measured on CH1 (registers `0x0A`–
+`0x0D`) after CH0's six, abbreviated because CH0 had already established the
+encoding:
+
+| Commanded | CH0 | CH1 |
+|---|---|---|
+| 0 % | 0 V, 0 Hz | **0.9 mV, 0 Hz** |
+| 50 % | 1.654 V, 544.9 Hz | **1.654 V, 544.8 Hz** |
+| 100 % | 3.307 V, 0 Hz | **3.308 V, 0 Hz** |
+
+As with the RP1 block, two channels agreeing characterises the chip rather
+than one lucky output. Same caveat: expected, not assumed, for the remaining
+fourteen.
+
+Both channels returned to `00 00 00 10` (duty 0) afterwards. Chip left awake at
+MODE1 `0x21`, MODE2 `0x04`, PRE_SCALE `0x0b`.
+
+**Cross-silicon agreement.** The PCA9685 and the RP1 PWM0 block produce the
+same voltages at the same commanded duty, within 2 mV at every comparable
+point (0 V, 265 mV, 1.654 V, ~3.308 V). Four channels across two chips. That
+is a strong check on the measurement method and it means either silicon can
+drive a channel with no change visible above hardware-io, which is what the
+driver interface promised and had not previously been tested.
 
 **Stage 2 — the same facts through our stack.** Register the channel via
 hardware-io (authoritative, role `light`, full safety triple), command the
-identical three duty points through control-engine over the spine, David
-confirms the meter matches Stage 1 exactly. **Any divergence is a driver bug by
-definition** — the CLI numbers are the truth.
+identical duty points through control-engine over the spine, David confirms the
+meter matches Stage 1 exactly. **Any divergence is a driver bug by definition**
+— the CLI numbers are the truth.
+
+Run it on **the same channel and the same probe point** as that path's Stage 1,
+so the stack is the only variable. For RP1 that means CH0 / pin 32 against the
+four rows above — not CH1, which would introduce a second variable. The 8 % row
+is the one that exercises `snap_duty`; commands below 8 % must measure 0 V, not
+265 mV, because the driver snaps them down before they reach the pin.
 
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
