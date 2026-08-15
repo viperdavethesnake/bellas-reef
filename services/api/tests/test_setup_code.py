@@ -6,10 +6,11 @@ Pure-logic layer only (spec Feature 1, "Semantics"). Endpoint wiring and the
 setup-mode gate on `POST /pair` are a later task; this covers what
 `security.py` and `Store` need to expose for it.
 
-The `Store` tests below need a real Postgres — `hub_identity` and its CHECK
-constraints are the thing being tested, same reasoning as
-`test_auth_lifecycle.py`. Skipped without `BELLASREEF_TEST_DATABASE_URL`,
-never pointed at the hub (see the environment-boundary rule in CLAUDE.md).
+The `Store` tests below need a real Postgres — they exercise real UPDATE and
+rotation semantics against `hub_identity` (0017's two new nullable columns),
+not a mocked store, same reasoning as `test_auth_lifecycle.py`. Skipped
+without `BELLASREEF_TEST_DATABASE_URL`, never pointed at the hub (see the
+environment-boundary rule in CLAUDE.md).
 """
 
 from __future__ import annotations
@@ -71,7 +72,20 @@ _needs_pg = pytest.mark.skipif(not os.environ.get(_PG), reason=f"{_PG} not set")
 
 
 async def _fresh_engine() -> AsyncEngine:
+    """A Store-ready engine with a guaranteed `hub_identity` row.
+
+    0012 deliberately does not seed `hub_identity` in the migration — the
+    row is written lazily, by whichever service asks for it first, via
+    `Store.hub_id()` (see that migration's docstring: stamping an id at
+    migration time would give a restored database a new identity). Nothing
+    in a fresh test database has called `hub_id()` yet, so an UPDATE against
+    `hub_identity` here would silently touch zero rows and every assertion
+    below would pass against nothing. `hub_id()` first, to establish the
+    singleton row the same way the real services would; only then reset the
+    two setup columns this file actually exercises.
+    """
     engine = create_async_engine(os.environ[_PG], future=True)
+    await Store(engine).hub_id()
     async with engine.begin() as conn:
         await conn.execute(
             text("UPDATE hub_identity SET setup_code_hash = NULL, setup_completed_at = NULL")
