@@ -669,6 +669,10 @@
               "null"
             ]
           },
+          "adopted": {
+            "title": "Adopted",
+            "type": "boolean"
+          },
           "alert_clear_margin": {
             "title": "Alert Clear Margin",
             "type": [
@@ -790,7 +794,8 @@
           "display_name",
           "kind",
           "driver_id",
-          "enabled"
+          "enabled",
+          "adopted"
         ],
         "title": "DeviceView",
         "type": "object"
@@ -2197,6 +2202,127 @@
           }
         },
         "summary": "Rename Device",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/forget": {
+      "post": {
+        "description": "Delete a detached device row for good.\n\nThe Detached section's \"clear\" (ruled 2026-08-15). `unbind_device`'s\ndocstring explains why deletion is normally the wrong move: it severs\nhistory from hardware that might come back. This endpoint is the\noperator overruling that on purpose \u2014 the hardware is gone, and the\nname should stop appearing. Telemetry already written keeps its\ndevice_id; nothing here rewrites history.\n\nNo assignment publish: a detached device holds no channel claim to\nretract, and `unbind_device`'s tombstone already recorded the release.",
+        "operationId": "forgetDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. Identity and settings are gone."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "409": {
+            "description": "Still adopted. Unbind it first."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forget Device",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/readopt": {
+      "post": {
+        "description": "Reattach a detached device to the channel its row still remembers.\n\nThe Detached section's \"re-add\" (ruled 2026-08-15). `unbind_device`\nkeeps the row and its binding on purpose, and this is what makes that\nworth doing rather than merely quiet: the operator gets the *same*\ndevice back \u2014 name, thresholds and history intact \u2014 instead of\nre-binding through `bindDevice` and hoping the proposed id is the one\nthat lands (it is not always; see `bind_device`'s matching note).",
+        "operationId": "readoptDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceView"
+                }
+              }
+            },
+            "description": "Re-adopted onto the channel its row remembers."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device, or it is not detached."
+          },
+          "409": {
+            "description": "Its channel is now held by another adopted device."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Readopt Device",
         "tags": [
           "hardware"
         ]

@@ -60,7 +60,7 @@ from bellasreef_api.security import (
     issue_access_token,
     verify_access_token,
 )
-from bellasreef_api.store import PAIRING_TTL_S, Store
+from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, Store
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 from bellasreef_api.telemetry import TelemetryWriter
 
@@ -329,6 +329,10 @@ class DeviceView(BaseModel):
     #: lights are otherwise indistinguishable except by name (David's ruling
     #: 2026-08-13). Additive and optional — no existing client breaks.
     channel: str | None = None
+
+    #: False for a detached row: unbound, channel released, history kept.
+    #: Clients section on this, not on channel being null.
+    adopted: bool
 
     @property
     def name(self) -> str:
@@ -1376,6 +1380,109 @@ def build_app(
             },
             category="config",
         )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/v1/devices/{device_id}/readopt",
+        response_model=DeviceView,
+        tags=["hardware"],
+        operation_id="readoptDevice",
+        responses={
+            200: {"description": "Re-adopted onto the channel its row remembers."},
+            401: AUTH_401,
+            404: {"description": "No such device, or it is not detached."},
+            409: {"description": "Its channel is now held by another adopted device."},
+        },
+    )
+    async def readopt_device(
+        device_id: str,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> DeviceView:
+        """Reattach a detached device to the channel its row still remembers.
+
+        The Detached section's "re-add" (ruled 2026-08-15). `unbind_device`
+        keeps the row and its binding on purpose, and this is what makes that
+        worth doing rather than merely quiet: the operator gets the *same*
+        device back — name, thresholds and history intact — instead of
+        re-binding through `bindDevice` and hoping the proposed id is the one
+        that lands (it is not always; see `bind_device`'s matching note).
+        """
+        try:
+            row = await store.readopt_device(device_id)
+        except ChannelHeldError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{device_id!r}'s channel is now held by {exc.holder!r}. Unbind it first.",
+            ) from exc
+        if row is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"no detached device {device_id!r}. It is unknown, or already adopted.",
+            )
+
+        # Same tombstone shape as unbind_device, adopted=True this time: the
+        # retained last value on this subject is what lets a hardware-io that
+        # was offline for the readopt still build the driver on its next start.
+        if assignments is not None:
+            await assignments.publish(
+                DeviceAssignment(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="api",
+                    device_id=row["device_id"],
+                    adopted=True,
+                    role=row["role"],
+                    driver_type=row["driver_type"],
+                    binding=row["binding"],
+                )
+            )
+
+        await sink(
+            "device.bound",
+            {"device_id": device_id, "readopt": True},
+            category="config",
+        )
+        full = next(d for d in await store.list_devices() if d["device_id"] == device_id)
+        return DeviceView.model_validate(full)
+
+    @app.post(
+        "/api/v1/devices/{device_id}/forget",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        tags=["hardware"],
+        operation_id="forgetDevice",
+        responses={
+            204: {"description": "Deleted. Identity and settings are gone."},
+            401: AUTH_401,
+            404: {"description": "No such device."},
+            409: {"description": "Still adopted. Unbind it first."},
+        },
+    )
+    async def forget_device(
+        device_id: str,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> Response:
+        """Delete a detached device row for good.
+
+        The Detached section's "clear" (ruled 2026-08-15). `unbind_device`'s
+        docstring explains why deletion is normally the wrong move: it severs
+        history from hardware that might come back. This endpoint is the
+        operator overruling that on purpose — the hardware is gone, and the
+        name should stop appearing. Telemetry already written keeps its
+        device_id; nothing here rewrites history.
+
+        No assignment publish: a detached device holds no channel claim to
+        retract, and `unbind_device`'s tombstone already recorded the release.
+        """
+        outcome = await store.forget_device(device_id)
+        if outcome == "missing":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no device {device_id!r}.")
+        if outcome == "adopted":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{device_id!r} is adopted. Unbind it first.",
+            )
+        await sink("device.forgotten", {"device_id": device_id}, category="config")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get(
