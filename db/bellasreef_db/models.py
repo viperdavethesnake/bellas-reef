@@ -779,4 +779,16 @@ class HubIdentity(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     singleton: Mapped[bool] = mapped_column(Boolean, server_default=text("true"), unique=True)
 
+    #: The current setup code, hashed the same way a refresh token is (see
+    #: ``bellasreef_api.security.hash_setup_code``) — no plaintext at rest, so
+    #: "I forgot" is answered by minting a new one, not by reading this back.
+    #: NULL once setup is complete or before a code has ever been minted.
+    setup_code_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: NULL means still in setup mode. Stamped once, on first successful
+    #: pair by any method, and never unset again — a long-forgotten printed
+    #: code must not quietly become a key again (spec 2026-08-15).
+    setup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (CheckConstraint("singleton", name="hub_identity_is_singleton"),)

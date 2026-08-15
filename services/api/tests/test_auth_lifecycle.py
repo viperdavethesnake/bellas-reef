@@ -843,7 +843,10 @@ def test_info_leaks_nothing_sensitive() -> None:
     # An allowlist, not a snapshot. /info is unauthenticated, so every field
     # added here is published to anything that can reach the hub —
     # `approvers_available` is a bare boolean derived from a count, and reveals
-    # nothing a client could not learn by attempting to pair.
+    # nothing a client could not learn by attempting to pair. `setup_mode` is
+    # the same shape of fact: a bare boolean derived from whether anyone has
+    # ever paired, which `pairing_open`/`paired_client_count` above already
+    # disclose in substance — it carries no code, no hash, no client identity.
     assert set(body) == {
         "name",
         "api_version",
@@ -851,7 +854,9 @@ def test_info_leaks_nothing_sensitive() -> None:
         "approvers_available",
         "paired_client_count",
         "pairing_open",
+        "setup_mode",
     }
+    assert isinstance(body["setup_mode"], bool)
     # A count, never the names — /info is shown before any commitment.
     assert "David's iPhone" not in str(body)
 
