@@ -21,8 +21,8 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from bellasreef_api.app import build_app
-from bellasreef_api.security import issue_access_token
+from bellasreef_api.app import _setup_throttle, build_app
+from bellasreef_api.security import hash_setup_code, issue_access_token, new_setup_code
 from bellasreef_api.store import Store
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -1167,3 +1167,136 @@ def test_a_window_is_not_needed_while_someone_can_still_approve() -> None:
         return r.status_code
 
     assert run(scenario) == 202
+
+
+# --------------------------------------------------------- pairing by setup code
+#
+# Spec 2026-08-15, Feature 1: a new owner enters the code the deploy printed
+# instead of SSHing in to run `bellasreef pair`.
+
+
+async def _setup_ready_engine() -> AsyncEngine:
+    """`fresh_engine()` plus a real, clean `hub_identity` row.
+
+    Production always has this row by the time `POST /pair` runs — the API's
+    lifespan calls `Store.hub_id()` at boot (app.py) — but the ASGI transport
+    these tests use never runs lifespan, and `Store.set_setup_code_hash` /
+    `complete_setup` are plain UPDATEs that no-op against a missing row (same
+    reasoning as `test_setup_code.py`'s `_fresh_engine`). Setup-code tests
+    seed the row themselves rather than relying on production's boot path.
+    """
+    engine = await fresh_engine()
+    await Store(engine).hub_id()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE hub_identity SET setup_code_hash = NULL, setup_completed_at = NULL")
+        )
+    return engine
+
+
+async def _setup_harness(**kw: Any) -> Harness:
+    return Harness(await _setup_ready_engine(), Audit(), **kw)
+
+
+def _reset_setup_throttle() -> None:
+    """`_setup_throttle` is a module-level, process-wide global by design
+    (app.py's `_SetupThrottle` docstring) — one budget per process, not per
+    app instance. That means failures recorded by one test in this file would
+    otherwise count against the next one, so every test below resets it
+    first."""
+    _setup_throttle._failures.clear()
+
+
+def test_info_reports_setup_mode_until_the_first_pair() -> None:
+    async def scenario() -> bool:
+        h = await harness()
+        async with h.client() as c:
+            info = (await c.get("/api/v1/info")).json()
+        await h.engine.dispose()
+        return bool(info["setup_mode"])
+
+    assert run(scenario) is True, "nobody has ever paired"
+
+
+def test_setup_code_pairs_immediately_and_closes_setup_mode() -> None:
+    _reset_setup_throttle()
+
+    async def scenario() -> dict[str, Any]:
+        h = await _setup_harness()
+        out: dict[str, Any] = {}
+        code = new_setup_code()
+        await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
+        async with h.client() as c:
+            r = await c.post(
+                "/api/v1/pair",
+                json={"client_name": "iPhone", "setup_code": code.lower()},
+            )
+            out["status"] = r.status_code
+            out["body"] = r.json()
+            out["info_after"] = (await c.get("/api/v1/info")).json()
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+    assert out["status"] == 200 and "refresh_token" in out["body"]
+    assert out["info_after"]["setup_mode"] is False, "completed, never re-enters"
+    assert "client.paired" in out["events"]
+
+
+def test_wrong_code_is_rejected_not_pended() -> None:
+    """Setup mode, wrong code: an explicit 422, never a pending request —
+    there is nobody yet to approve one."""
+    _reset_setup_throttle()
+
+    async def scenario() -> int:
+        h = await _setup_harness()
+        code = new_setup_code()
+        await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
+        async with h.client() as c:
+            r = await c.post(
+                "/api/v1/pair", json={"client_name": "iPhone", "setup_code": "XXXX-XXXX"}
+            )
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 422
+
+
+def test_code_outside_setup_is_rejected() -> None:
+    """A code supplied after setup is complete is never silently ignored."""
+    _reset_setup_throttle()
+
+    async def scenario() -> int:
+        h = await _setup_harness()
+        async with h.client() as c:
+            # First pair, by blind TOFU (no code was ever minted): completes
+            # setup, same as it always has.
+            first = await c.post("/api/v1/pair", json={"client_name": "first"})
+            assert first.status_code == 200, first.text
+            r = await c.post(
+                "/api/v1/pair", json={"client_name": "Mallory", "setup_code": "7KF2-9QMD"}
+            )
+        await h.engine.dispose()
+        return r.status_code
+
+    assert run(scenario) == 422
+
+
+def test_throttle_trips_at_ten_failures() -> None:
+    _reset_setup_throttle()
+
+    async def scenario() -> dict[str, Any]:
+        h = await _setup_harness()
+        code = new_setup_code()
+        await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
+        async with h.client() as c:
+            for _ in range(10):
+                await c.post("/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"})
+            r = await c.post("/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"})
+        await h.engine.dispose()
+        return {"status": r.status_code, "retry_after": r.headers.get("Retry-After")}
+
+    out = run(scenario)
+    assert out["status"] == 429
+    assert out["retry_after"] is not None

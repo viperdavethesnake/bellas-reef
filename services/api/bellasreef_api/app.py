@@ -24,6 +24,7 @@ token buys, and it is the whole reason the pairing code needs no rate limiter.
 import asyncio
 import json
 import os
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ from bellasreef_api.registry import AssignmentPublisher, CapabilityConsumer, Reg
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
+    hash_setup_code,
     issue_access_token,
     verify_access_token,
 )
@@ -128,6 +130,13 @@ class Info(BaseModel):
     #: "an already-paired device will need to approve this one" at a person who
     #: has no such device, and they wait for something that can never arrive.
     approvers_available: bool
+    #: True until the first client has ever paired, by any method (spec
+    #: 2026-08-15, Feature 1). Drives the app's connect screen: while this is
+    #: true the client offers a setup-code entry field instead of the
+    #: request-and-wait flow. Derived from ``Store.setup_state()`` rather than
+    #: from ``pairing_open`` above — the two answer different questions and a
+    #: hub can (briefly) have one true and not the other.
+    setup_mode: bool
 
 
 class HistoryBucket(BaseModel):
@@ -464,6 +473,9 @@ class AlertsView(BaseModel):
 class PairRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     client_name: str = Field(min_length=1, max_length=128)
+    #: Setup-mode bootstrap (spec 2026-08-15). Non-null outside setup mode is
+    #: an error, never ignored.
+    setup_code: str | None = Field(default=None, max_length=16)
 
 
 class PairGranted(BaseModel):
@@ -559,6 +571,43 @@ class _PendingTokens:
 
     def take(self, request_id: UUID) -> tuple[UUID, str] | None:
         return self.tokens.pop(request_id, None)
+
+
+class _SetupThrottle:
+    """10 failed setup-code attempts per rolling minute, globally.
+
+    Module-level and in-process by ruling (spec 2026-08-15, Feature 1,
+    "Throttling"): "a restart resetting the throttle is acceptable at this
+    threat model." No database table, no counters that outlive the process —
+    this is a hobbyist reef controller on a home LAN, not an enterprise
+    product guarding against a patient adversary. A restart or a redeploy
+    simply reopens the ten-per-minute budget, which is fine here.
+
+    Deliberately module-level rather than per-app-instance: the whole point
+    is one shared budget across every ``POST /pair`` call this process
+    serves, the same way there is one hub. A counter scoped to `build_app`
+    would reset on nothing that actually threatens the intended limit.
+    """
+
+    def __init__(self, limit: int = 10, window_s: float = 60.0) -> None:
+        self._failures: deque[float] = deque()
+        self._limit = limit
+        self._window_s = window_s
+
+    def retry_after(self, now: float) -> int | None:
+        """Seconds until another attempt is allowed, or ``None`` if one is."""
+        while self._failures and now - self._failures[0] > self._window_s:
+            self._failures.popleft()
+        if len(self._failures) < self._limit:
+            return None
+        return int(self._window_s - (now - self._failures[0])) + 1
+
+    def record_failure(self, now: float) -> None:
+        self._failures.append(now)
+
+
+#: One throttle for the process, per the docstring above.
+_setup_throttle: Final = _SetupThrottle()
 
 
 # ------------------------------------------------------------------------ app
@@ -772,6 +821,7 @@ def build_app(
         version strings, and whether pairing is open.
         """
         total = await store.total_clients_ever()
+        _, completed_at = await store.setup_state()
         return Info(
             name="Bella's Reef",
             api_version=API_VERSION,
@@ -779,6 +829,7 @@ def build_app(
             paired_client_count=total,
             pairing_open=total == 0,
             approvers_available=await store.active_client_count() > 0,
+            setup_mode=completed_at is None,
         )
 
     # ------------------------------------------------------------------ pairing
@@ -797,10 +848,22 @@ def build_app(
             202: {"model": PairPending, "description": "Awaiting approval; poll."},
             403: {"description": "Nobody can approve; run `bellasreef pair`."},
             409: {"description": "The recovery window was spent by another client."},
+            422: {
+                "description": "A setup code was missing/wrong in setup mode, or supplied "
+                "outside setup mode. Never silently ignored."
+            },
+            429: {"description": "Too many failed setup-code attempts. See Retry-After."},
         },
     )
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
-        """Pair a client. Four outcomes, in this order.
+        """Pair a client.
+
+        A setup code, if present, is resolved first (spec 2026-08-15,
+        Feature 1): valid in setup mode grants immediately; anything else
+        about it is a 422, never a pending request nor a silent ignore — see
+        the checks at the top of the body.
+
+        Absent a setup code, four outcomes follow, in this order:
 
         1. No client has ever paired -> TOFU grant, and the window shuts.
         2. A recovery window is open -> grant and spend it.
@@ -812,10 +875,61 @@ def build_app(
 
         Outcome 2 has a fifth ending: losing the race for the window is a 409.
         """
+        code_hash, completed_at = await store.setup_state()
+        in_setup = completed_at is None
+
+        if body.setup_code is not None:
+            if not in_setup:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "This hub is already set up. Pair from an already-paired device, "
+                    "or run `bellasreef pair` on the hub.",
+                )
+            if (after := _setup_throttle.retry_after(monotonic())) is not None:
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "Too many attempts - wait a minute.",
+                    headers={"Retry-After": str(after)},
+                )
+            if code_hash is None or hash_setup_code(body.setup_code) != code_hash:
+                _setup_throttle.record_failure(monotonic())
+                await sink("pair.code_rejected", {"client_name": body.client_name})
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "That setup code is not right. It is on the deploy output on the "
+                    "hub; dashes and case do not matter.",
+                )
+            # Valid: grant exactly as the TOFU/window paths do below (same
+            # store call, not a second way to mint a client+token).
+            client_id, token = await store.create_client(body.client_name)
+            await store.complete_setup()
+            await sink(
+                "client.paired",
+                {
+                    "client_id": str(client_id),
+                    "client_name": body.client_name,
+                    "method": "setup_code",
+                },
+            )
+            return PairGranted(refresh_token=token, client_id=client_id)
+
+        if in_setup and code_hash is not None:
+            # A code has been minted; blind TOFU yields to it. Spec: a
+            # missing code in setup mode is an explicit rejection, not a
+            # pending request — there is nobody yet to approve it.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This hub is in setup. Enter the setup code from the deploy output.",
+            )
+
         total = await store.total_clients_ever()
 
         if total == 0:
+            # Blind TOFU: reachable only when no setup code was ever minted
+            # (the check above), so a hub deployed without the new deploy
+            # step still bootstraps exactly as before.
             client_id, token = await store.create_client(body.client_name)
+            await store.complete_setup()
             await sink(
                 "pair.tofu_granted",
                 {"client_id": str(client_id), "client_name": body.client_name},
@@ -850,12 +964,14 @@ def build_app(
                     "the recovery pairing window was spent by another client. Run "
                     "`bellasreef pair` on the hub to open another.",
                 )
+            await store.complete_setup()
             await sink(
                 "pair.window_used",
                 {
                     "window_id": str(window_id),
                     "client_id": str(client_id),
                     "client_name": body.client_name,
+                    "method": "window",
                 },
             )
             log.warning(
@@ -941,12 +1057,14 @@ def build_app(
             raise HTTPException(status.HTTP_409_CONFLICT, "pairing request is not pending")
         client_id, token = result
         pending.put(request_id, client_id, token)
+        await store.complete_setup()
         await sink(
             "pair.approved",
             {
                 "request_id": str(request_id),
                 "client_id": str(client_id),
                 "approved_by": str(approver),
+                "method": "approval",
             },
         )
 
