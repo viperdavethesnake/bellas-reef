@@ -466,6 +466,96 @@ leftover `period=1000000` from the 2026-08-13 bring-up; that 1 kHz is nobody's
 decision and must be set to 2 000 000 before it is used. CH0 and CH2 are now at
 2 000 000.
 
+**Stage 1 (PCA9685), CH0 — PASSED on hardware 2026-08-15.**
+
+Board rewired onto I2C bus 1 the same afternoon and answering at `0x40` plus
+`0x70` (ALLCALL) again. Raw `i2cset`/`i2cget` only, no Bella's Reef code in the
+loop. Power-on registers read identical to the 2026-08-09 baseline: MODE1
+`0x11`, MODE2 `0x04`, PRE_SCALE `0x1e`, ALLCALLADR `0xe0`.
+
+Configured as the driver does it: all channels parked full-off via ALL_LED,
+`PRE_SCALE = 0x0b` written while SLEEP was set, MODE2 `0x04` (totem-pole,
+INVRT clear), then MODE1 `0x21` to wake and `0xa1` to RESTART.
+
+Measured at 544.8 Hz, full scale 3.307 V. Every value is David's meter reading.
+
+| Commanded | LED0 registers | Off-count | Measured | As % of 3.307 |
+|---|---|---|---|---|
+| 0 % | `00 00 00 10` | full-off bit | **0 V** | 0 % |
+| 8.008 % | `00 00 48 01` | 328 | **265 mV** | 8.01 % |
+| 25 % | `00 00 00 04` | 1024 | **828 mV** | 25.04 % |
+| 50 % | `00 00 00 08` | 2048 | **1.654 V** | 50.02 % |
+| 75 % | `00 00 00 0c` | 3072 | **2.481 V** | 75.02 % |
+| 100 % | `00 10 00 00` | full-on bit | **3.307 V** | 100 % |
+
+Worst error across the range is 0.04 percentage points. The counted-duty
+encoding is correct and the full-on/full-off bits behave as distinct from
+counted values. At both extremes the meter reads 0 Hz, which is right: a static
+level has no edges.
+
+**1. `INVRT_ON = True` in the driver is WRONG for the stage measured here.**
+Duty 0 measured 0 V with MODE2 INVRT **clear**. Setting INVRT inverts that,
+so the driver as written would drive this channel to 3.307 V when commanded to
+its declared safe state. This is item 1's failure mode reached from the
+opposite direction: the code assumed inversion, the bench found none. Not
+changed yet, because whether this is the final output stage is David's ruling.
+Whichever stage ships, the constant must match a measurement rather than an
+expectation.
+
+**2. The internal oscillator runs ~7.1 % fast, and the error is a constant
+ratio.** Two prescaler values, both measured:
+
+| PRE_SCALE | Computed @ 25 MHz | Measured | Implied oscillator |
+|---|---|---|---|
+| 11 | 508.6 Hz | **544.7 / 544.8 Hz** | 26 773 094 |
+| 4 | 1220.7 Hz | **1307 Hz** | 26 767 360 |
+
+So `osc_hz ≈ 26.77 MHz` for this chip, stable across a 2.4× frequency span.
+One calibration number per chip is enough. This is why frequency-as-config
+needs a measured oscillator field and not a hardcoded 25 MHz: reef-pi's driver
+takes a configurable frequency and divides it by a constant `clockFreq =
+25000000`, so asking it for 500 Hz on a chip like this one silently returns
+545. See `docs/superpowers/specs/2026-08-15-driver-hardware-config.md`.
+
+**3. The ALL_LED registers (`0xFA`–`0xFD`) do not read back what is written.**
+They return `0x00` regardless. The write lands: after writing `00 00 00 10`
+every per-channel register read `00 00 00 10`. Verify an ALL_LED write through
+a per-channel register, never by reading it back, or a successful write looks
+like a failed one. The driver writes ALL_LED at open and deliberately does not
+read it back; adding a readback assert there would break startup in a way that
+presents as hardware failure.
+
+**4. Bench instrument note.** David's DMM duty function reads the **complement**
+of the commanded duty (50 % → 48, 25 % → 68, 75 % → 21.5) and saturates to 100
+below roughly 10 % duty. It is readable as `100 minus displayed`. The voltage
+ratio is the precise measurement and the duty readout is a sanity check.
+Recorded because it looks exactly like an inverted output on first sight, and
+is not: at 25 % commanded the voltage read 828 mV, which is 25 %, not 75 %.
+
+**5. CH1 agrees with CH0.** Three points measured on CH1 (registers `0x0A`–
+`0x0D`) after CH0's six, abbreviated because CH0 had already established the
+encoding:
+
+| Commanded | CH0 | CH1 |
+|---|---|---|
+| 0 % | 0 V, 0 Hz | **0.9 mV, 0 Hz** |
+| 50 % | 1.654 V, 544.9 Hz | **1.654 V, 544.8 Hz** |
+| 100 % | 3.307 V, 0 Hz | **3.308 V, 0 Hz** |
+
+As with the RP1 block, two channels agreeing characterises the chip rather
+than one lucky output. Same caveat: expected, not assumed, for the remaining
+fourteen.
+
+Both channels returned to `00 00 00 10` (duty 0) afterwards. Chip left awake at
+MODE1 `0x21`, MODE2 `0x04`, PRE_SCALE `0x0b`.
+
+**Cross-silicon agreement.** The PCA9685 and the RP1 PWM0 block produce the
+same voltages at the same commanded duty, within 2 mV at every comparable
+point (0 V, 265 mV, 1.654 V, ~3.308 V). Four channels across two chips. That
+is a strong check on the measurement method and it means either silicon can
+drive a channel with no change visible above hardware-io, which is what the
+driver interface promised and had not previously been tested.
+
 **Stage 2 — the same facts through our stack.** Register the channel via
 hardware-io (authoritative, role `light`, full safety triple), command the
 identical duty points through control-engine over the spine, David confirms the
