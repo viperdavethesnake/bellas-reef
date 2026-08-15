@@ -38,7 +38,12 @@ warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
 # --env-file), never a new SHA being rolled out — that part is entirely
 # deploy-pi.sh's job, invoked in step 4 below.
 compose() {
-    ssh "$PI_HOST" "docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
+    # -n: never read the script's stdin. The confirmation prompt below reads
+    # it, and the first run of this script (2026-08-15) proved that an ssh
+    # hop before the prompt silently swallows piped/typed input — the
+    # operator's "factory-reset" was eaten by the backup leg and the run
+    # aborted "not confirmed" through no fault of theirs.
+    ssh -n "$PI_HOST" "docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
 }
 
 # ------------------------------------------------------------- 1. backup
@@ -59,6 +64,11 @@ About to DESTROY on ${PI_HOST}:
 
 Pre-reset backup: ${BACKUP} (on the hub)
 DOOM
+# The word must be typed by a person — at the prompt, or written into the
+# command line itself (`echo factory-reset | ...`) where no interactive
+# stdin exists. Both satisfy the spec's intent: a human writes the word,
+# verbatim, with the destruction notice on screen. ssh -n above is what
+# makes the piped form work at all — without it the backup leg eats stdin.
 read -r -p "Type 'factory-reset' to proceed: " confirm || confirm=""
 [[ "$confirm" == "factory-reset" ]] || die "not confirmed; nothing touched"
 
