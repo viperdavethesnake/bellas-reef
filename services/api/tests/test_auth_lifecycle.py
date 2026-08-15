@@ -49,11 +49,35 @@ class Audit:
     def names(self) -> list[str]:
         return [e for e, _ in self.events]
 
+    def detail(self, event: str) -> dict[str, Any]:
+        """The detail of the first occurrence of ``event``, for asserting
+        payload fields (e.g. ``method``) rather than only event names."""
+        return next(d for e, d in self.events if e == event)
+
 
 async def fresh_engine() -> AsyncEngine:
+    """A clean database for one test, `hub_identity` included.
+
+    `hub_identity` is a singleton row shared by the whole test database —
+    every test file's own `fresh_engine()`-equivalent truncates the pairing
+    tables but none of them (this one included, before this fix) touched it.
+    A test in this file that mints a setup-code hash and never completes a
+    pair left `setup_code_hash` set with `setup_completed_at` still NULL,
+    which is a live "in setup mode, code required" gate on `POST /pair` —
+    every *other* test file that bootstraps via a code-less pair would then
+    422 the moment it ran after this one in the same pytest session. Seeding
+    the row via `Store.hub_id()` (idempotent — see that method's docstring)
+    and resetting both setup columns here, on every call, means no test in
+    this file depends on what a previous test — in this file or, since this
+    runs first alphabetically, in any file after it — left behind.
+    """
     engine = create_async_engine(os.environ[_PG], future=True)
+    await Store(engine).hub_id()
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE pairing_requests, paired_clients CASCADE"))
+        await conn.execute(
+            text("UPDATE hub_identity SET setup_code_hash = NULL, setup_completed_at = NULL")
+        )
     return engine
 
 
@@ -84,7 +108,7 @@ def test_the_tofu_window_grants_the_first_client_and_then_closes() -> None:
     """The window closes on first success — not on a timer, not on a count of
     live clients. Revoking everything must not reopen it."""
 
-    async def scenario() -> tuple[int, int, list[str]]:
+    async def scenario() -> tuple[int, int, list[str], str]:
         h = await harness()
         async with h.client() as c:
             info = (await c.get("/api/v1/info")).json()
@@ -100,13 +124,17 @@ def test_the_tofu_window_grants_the_first_client_and_then_closes() -> None:
 
             second = await c.post("/api/v1/pair", json={"client_name": "second"})
         await h.engine.dispose()
-        return first.status_code, second.status_code, h.audit.names()
+        method = h.audit.detail("pair.tofu_granted")["method"]
+        return first.status_code, second.status_code, h.audit.names(), method
 
-    first_code, second_code, events = run(scenario)
+    first_code, second_code, events, method = run(scenario)
     assert first_code == 200
     assert second_code == 202, "the TOFU window must be closed for the second client"
     assert "pair.tofu_granted" in events
     assert "pair.requested" in events
+    # Not one of the spec's three method values ("setup_code" | "window" |
+    # "approval") — a recorded amendment (review ruling, 2026-08-15).
+    assert method == "tofu"
 
 
 def test_revoking_every_client_does_not_reopen_the_tofu_window() -> None:
@@ -170,6 +198,7 @@ def test_the_202_poll_approve_path() -> None:
             out["client_count"] = len(clients)
         await h.engine.dispose()
         out["events"] = h.audit.names()
+        out["method"] = h.audit.detail("pair.approved")["method"]
         return out
 
     out = run(scenario)
@@ -179,6 +208,7 @@ def test_the_202_poll_approve_path() -> None:
     assert out["poll_granted_code"] == 200
     assert out["granted"]["refresh_token"]
     assert out["poll_again_code"] == 410, "an approval must yield exactly one credential"
+    assert out["method"] == "approval"
     assert out["client_count"] == 2
     assert "pair.approved" in out["events"]
     assert "pair.collected" in out["events"]
@@ -1175,29 +1205,6 @@ def test_a_window_is_not_needed_while_someone_can_still_approve() -> None:
 # instead of SSHing in to run `bellasreef pair`.
 
 
-async def _setup_ready_engine() -> AsyncEngine:
-    """`fresh_engine()` plus a real, clean `hub_identity` row.
-
-    Production always has this row by the time `POST /pair` runs — the API's
-    lifespan calls `Store.hub_id()` at boot (app.py) — but the ASGI transport
-    these tests use never runs lifespan, and `Store.set_setup_code_hash` /
-    `complete_setup` are plain UPDATEs that no-op against a missing row (same
-    reasoning as `test_setup_code.py`'s `_fresh_engine`). Setup-code tests
-    seed the row themselves rather than relying on production's boot path.
-    """
-    engine = await fresh_engine()
-    await Store(engine).hub_id()
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("UPDATE hub_identity SET setup_code_hash = NULL, setup_completed_at = NULL")
-        )
-    return engine
-
-
-async def _setup_harness(**kw: Any) -> Harness:
-    return Harness(await _setup_ready_engine(), Audit(), **kw)
-
-
 def _reset_setup_throttle() -> None:
     """`_setup_throttle` is a module-level, process-wide global by design
     (app.py's `_SetupThrottle` docstring) — one budget per process, not per
@@ -1207,22 +1214,49 @@ def _reset_setup_throttle() -> None:
     _setup_throttle._failures.clear()
 
 
-def test_info_reports_setup_mode_until_the_first_pair() -> None:
-    async def scenario() -> bool:
-        h = await harness()
-        async with h.client() as c:
-            info = (await c.get("/api/v1/info")).json()
-        await h.engine.dispose()
-        return bool(info["setup_mode"])
+async def _clear_setup_state(engine: AsyncEngine) -> None:
+    """Undo a minted-but-never-completed setup code before the engine is
+    disposed.
 
-    assert run(scenario) is True, "nobody has ever paired"
+    `fresh_engine()` resets `hub_identity` on every call, which makes each
+    test's *own* precondition order-independent — but that only protects
+    whoever calls `fresh_engine()` next. A test that mints a code and never
+    pairs leaves `setup_code_hash` set with `setup_completed_at` still NULL,
+    which is a live "code required" gate on `POST /pair`; if that happens to
+    be the last thing this file does before the next file's tests run in the
+    same pytest session (alphabetically, several do — see the CRITICAL
+    review this addresses), *their* code-less bootstrap pairs would 422.
+    Tests that mint a code without completing a pair call this before
+    disposing their engine so nothing is left dirty regardless of position.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE hub_identity SET setup_code_hash = NULL, setup_completed_at = NULL")
+        )
+
+
+def test_info_reports_setup_mode_until_the_first_pair() -> None:
+    async def scenario() -> dict[str, bool]:
+        h = await harness()
+        out: dict[str, bool] = {}
+        async with h.client() as c:
+            out["before"] = (await c.get("/api/v1/info")).json()["setup_mode"]
+            paired = await c.post("/api/v1/pair", json={"client_name": "first"})
+            assert paired.status_code == 200, paired.text
+            out["after"] = (await c.get("/api/v1/info")).json()["setup_mode"]
+        await h.engine.dispose()
+        return out
+
+    out = run(scenario)
+    assert out["before"] is True, "nobody has ever paired"
+    assert out["after"] is False, "the first pair must flip setup_mode, not just pairing_open"
 
 
 def test_setup_code_pairs_immediately_and_closes_setup_mode() -> None:
     _reset_setup_throttle()
 
     async def scenario() -> dict[str, Any]:
-        h = await _setup_harness()
+        h = await harness()
         out: dict[str, Any] = {}
         code = new_setup_code()
         await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
@@ -1236,12 +1270,17 @@ def test_setup_code_pairs_immediately_and_closes_setup_mode() -> None:
             out["info_after"] = (await c.get("/api/v1/info")).json()
         await h.engine.dispose()
         out["events"] = h.audit.names()
+        out["method"] = h.audit.detail("pair.code_granted")["method"]
         return out
 
     out = run(scenario)
     assert out["status"] == 200 and "refresh_token" in out["body"]
     assert out["info_after"]["setup_mode"] is False, "completed, never re-enters"
-    assert "client.paired" in out["events"]
+    # House naming (parallel to pair.tofu_granted/pair.window_used/
+    # pair.approved), not the spec's illustrative `client.paired` — one
+    # audit event per grant path (review ruling, 2026-08-15).
+    assert "pair.code_granted" in out["events"]
+    assert out["method"] == "setup_code"
 
 
 def test_wrong_code_is_rejected_not_pended() -> None:
@@ -1250,13 +1289,16 @@ def test_wrong_code_is_rejected_not_pended() -> None:
     _reset_setup_throttle()
 
     async def scenario() -> int:
-        h = await _setup_harness()
+        h = await harness()
         code = new_setup_code()
         await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
         async with h.client() as c:
             r = await c.post(
                 "/api/v1/pair", json={"client_name": "iPhone", "setup_code": "XXXX-XXXX"}
             )
+        # This scenario never pairs, so the minted hash would otherwise
+        # outlive the test — see `_clear_setup_state`.
+        await _clear_setup_state(h.engine)
         await h.engine.dispose()
         return r.status_code
 
@@ -1268,7 +1310,7 @@ def test_code_outside_setup_is_rejected() -> None:
     _reset_setup_throttle()
 
     async def scenario() -> int:
-        h = await _setup_harness()
+        h = await harness()
         async with h.client() as c:
             # First pair, by blind TOFU (no code was ever minted): completes
             # setup, same as it always has.
@@ -1287,16 +1329,49 @@ def test_throttle_trips_at_ten_failures() -> None:
     _reset_setup_throttle()
 
     async def scenario() -> dict[str, Any]:
-        h = await _setup_harness()
+        h = await harness()
         code = new_setup_code()
         await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
         async with h.client() as c:
             for _ in range(10):
                 await c.post("/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"})
             r = await c.post("/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"})
+        # This scenario never pairs, so the minted hash would otherwise
+        # outlive the test — see `_clear_setup_state`.
+        await _clear_setup_state(h.engine)
         await h.engine.dispose()
         return {"status": r.status_code, "retry_after": r.headers.get("Retry-After")}
 
     out = run(scenario)
     assert out["status"] == 429
     assert out["retry_after"] is not None
+
+
+def test_a_window_still_pairs_during_setup_mode_even_with_a_code_minted() -> None:
+    """Review ruling, 2026-08-15: the spec's "window flow... still works
+    during setup mode" wins over blind TOFU yielding to a minted code. A
+    code-less pair while a window is open must be granted via the window,
+    not rejected for lacking the code.
+    """
+    _reset_setup_throttle()
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        await _wipe_windows(h.engine)
+        out: dict[str, Any] = {}
+        store = Store(h.engine)
+        await store.set_setup_code_hash(hash_setup_code(new_setup_code()))
+        await store.open_pairing_window("david@hub", 300)
+        async with h.client() as c:
+            r = await c.post("/api/v1/pair", json={"client_name": "recovered"})
+            out["status"] = r.status_code
+            out["body"] = r.json()
+            out["info_after"] = (await c.get("/api/v1/info")).json()
+        await h.engine.dispose()
+        out["method"] = h.audit.detail("pair.window_used")["method"]
+        return out
+
+    out = run(scenario)
+    assert out["status"] == 200 and "refresh_token" in out["body"], out["body"]
+    assert out["info_after"]["setup_mode"] is False, "the window grant must complete setup too"
+    assert out["method"] == "window"

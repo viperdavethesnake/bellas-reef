@@ -223,7 +223,7 @@ class AuditEvent(BaseModel):
     subject: str
     device_id: str | None
     event: dict[str, Any]
-    #: The event name from the payload ("device.unbound", "client.paired"),
+    #: The event name from the payload ("device.unbound", "pair.window_used"),
     #: promoted to a typed field so clients render verbs, not subjects.
     action: str | None
 
@@ -863,7 +863,14 @@ def build_app(
         about it is a 422, never a pending request nor a silent ignore — see
         the checks at the top of the body.
 
-        Absent a setup code, four outcomes follow, in this order:
+        Absent a setup code, an open recovery window is consulted next —
+        `bellasreef pair` is a fire escape and must keep working even while
+        setup is incomplete and a code has been minted (review ruling,
+        2026-08-15: the spec's "window flow... still works during setup
+        mode" wins over blind TOFU yielding to a minted code). Only once no
+        window is open does a minted-but-unsupplied code become a rejection.
+
+        The remaining outcomes then follow, in this order:
 
         1. No client has ever paired -> TOFU grant, and the window shuts.
         2. A recovery window is open -> grant and spend it.
@@ -900,11 +907,15 @@ def build_app(
                     "hub; dashes and case do not matter.",
                 )
             # Valid: grant exactly as the TOFU/window paths do below (same
-            # store call, not a second way to mint a client+token).
+            # store call, not a second way to mint a client+token). House
+            # naming (parallel to pair.tofu_granted/pair.window_used/
+            # pair.approved) rather than the spec's illustrative
+            # `client.paired` — one audit event per grant, not a second event
+            # name layered on top of it.
             client_id, token = await store.create_client(body.client_name)
             await store.complete_setup()
             await sink(
-                "client.paired",
+                "pair.code_granted",
                 {
                     "client_id": str(client_id),
                     "client_name": body.client_name,
@@ -913,33 +924,8 @@ def build_app(
             )
             return PairGranted(refresh_token=token, client_id=client_id)
 
-        if in_setup and code_hash is not None:
-            # A code has been minted; blind TOFU yields to it. Spec: a
-            # missing code in setup mode is an explicit rejection, not a
-            # pending request — there is nobody yet to approve it.
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "This hub is in setup. Enter the setup code from the deploy output.",
-            )
-
-        total = await store.total_clients_ever()
-
-        if total == 0:
-            # Blind TOFU: reachable only when no setup code was ever minted
-            # (the check above), so a hub deployed without the new deploy
-            # step still bootstraps exactly as before.
-            client_id, token = await store.create_client(body.client_name)
-            await store.complete_setup()
-            await sink(
-                "pair.tofu_granted",
-                {"client_id": str(client_id), "client_name": body.client_name},
-            )
-            log.warning(
-                "TOFU window used and now closed",
-                extra={"client_id": str(client_id), "event": "pair_tofu"},
-            )
-            return PairGranted(refresh_token=token, client_id=client_id)
-
+        # Code-less path. A recovery window, if one is open, is consulted
+        # before the setup-code gate below — see the docstring.
         window_id = await store.open_window()
         if window_id is not None:
             client_id, token = await store.create_client(body.client_name)
@@ -977,6 +963,42 @@ def build_app(
             log.warning(
                 "recovery pairing window used and now spent",
                 extra={"window_id": str(window_id), "client_id": str(client_id)},
+            )
+            return PairGranted(refresh_token=token, client_id=client_id)
+
+        if in_setup and code_hash is not None:
+            # A code has been minted and no window is open; blind TOFU
+            # yields to the code. Spec: a missing code in setup mode is an
+            # explicit rejection, not a pending request — there is nobody
+            # yet to approve it.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This hub is in setup. Enter the setup code from the deploy output.",
+            )
+
+        total = await store.total_clients_ever()
+
+        if total == 0:
+            # Blind TOFU: reachable only when no setup code was ever minted
+            # (the check above), so a hub deployed without the new deploy
+            # step still bootstraps exactly as before.
+            client_id, token = await store.create_client(body.client_name)
+            await store.complete_setup()
+            await sink(
+                "pair.tofu_granted",
+                {
+                    "client_id": str(client_id),
+                    "client_name": body.client_name,
+                    # Not one of the spec's three method values
+                    # ("setup_code" | "window" | "approval") — a recorded
+                    # amendment (review ruling, 2026-08-15) rather than a
+                    # fourth duplicate audit row per pairing.
+                    "method": "tofu",
+                },
+            )
+            log.warning(
+                "TOFU window used and now closed",
+                extra={"client_id": str(client_id), "event": "pair_tofu"},
             )
             return PairGranted(refresh_token=token, client_id=client_id)
 
