@@ -8,6 +8,10 @@ One page. If a change makes this longer, the change is probably wrong.
 
 ### Changelog
 
+- **2.1 (2026-08-15)** — **setup mode**: `POST /pair` gains an optional
+  `setup_code`, so a new owner's first device pairs by typing a code the hub
+  printed rather than by winning a race on the LAN. §1a. Blind TOFU survives
+  unchanged on a hub where no code was ever minted.
 - **2.0 (2026-08-12)** — second-device pairing becomes **code-based**. v1
   specified approve-from-paired and it was never completable: no client could
   obtain a `request_id` to approve, so `POST /pair/{id}/approve` was unreachable
@@ -64,6 +68,43 @@ No usernames, no passwords, no scopes, no roles, no OAuth2 authorization flows.
 A paired device has full operator rights. Revocation is the only privilege
 operation, and any paired device can do it.
 
+## 1a. Setup mode
+
+A hub that has never completed a pairing is **in setup mode**
+(`hub_identity.setup_completed_at` IS NULL; `/info` reports `setup_mode`). On
+such a hub `bellasreef setup-code` — run by `scripts/deploy-pi.sh` and
+`scripts/factory-reset-pi.sh`, and by hand over SSH — mints an eight-character
+code, prints it once (grouped for reading as `7KF2-9QMD`; the dash and case are
+ignored on entry), and stores **only its hash**. There is no plaintext to
+reprint from: "I forgot it" is answered by minting a new one, which rotates the
+old out. The first pairing completes setup, and the code stops meaning anything.
+
+`POST /api/v1/pair` takes an optional `setup_code`. Three outcomes, and none of
+them is a silent ignore:
+
+- **Valid, in setup mode** → 200 `{ refresh_token, client_id }` immediately, by
+  the same store call the TOFU and window paths use — one way to mint a client,
+  not a fourth. Setup completes. Audited as `pair.code_granted`.
+- **422**, with the reason spelled out for the operator, in two cases: a code
+  that is missing or wrong while this hub is in setup mode *and* a code has been
+  minted, and a code supplied to a hub that is already set up. A rejection, not
+  a pending request — during setup there is nobody yet to approve one. A wrong
+  code is audited as `pair.code_rejected`.
+- **429** with `Retry-After` after **10 failed attempts in a minute**. Unlike
+  the six-digit pairing code of §1, this one *is* a secret defending the hub,
+  so it is counted and throttled.
+
+**Precedence during setup mode:** an open recovery window wins over the code
+gate. A code-less `POST /pair` with a window open is granted by the window path
+even while a minted code is outstanding — `bellasreef pair` is the fire escape
+and a minted code narrows the unauthenticated blind-TOFU path, not the
+operator's own way back in. Recorded as amendment (b) in
+`docs/superpowers/specs/2026-08-15-new-owner-experience-design.md`; amendment
+(a) covers the `method` field below.
+
+A hub deployed before this existed, where no code was ever minted, still
+bootstraps by blind TOFU exactly as §1 describes.
+
 ## 2. Flow
 
 ```
@@ -86,7 +127,10 @@ operation, and any paired device can do it.
               Everything else requires a bearer. (v1 claimed two. It listed
               three of the other three itself, two lines later.)
 
-3. PAIR       POST /api/v1/pair { client_name }
+3. PAIR       POST /api/v1/pair { client_name, setup_code? }
+              → setup_code, hub in setup mode : 200 + token, setup completes
+                           anything else about a code: 422, or 429 after ten
+                           failures in a minute (§1a)
               → count==0 : 200 { refresh_token, client_id }    window closes
               → count>0  : 202 { request_id, pairing_code, poll_after_s,
                                  expires_in_s }
@@ -158,8 +202,16 @@ token refresh and straight to the dashboard.
 - All auth events publish to `bellasreef.audit.auth` per the existing audit
   contract. **As built:** `pair.tofu_granted`, `pair.requested`,
   `pair.approved`, `pair.denied`, `pair.collected`, `pair.no_approver`,
-  `pair.window_opened`, `pair.window_used`, `token.minted`,
-  `token.rejected`, `client.revoked`.
+  `pair.window_opened`, `pair.window_used`, `pair.code_granted`,
+  `pair.code_rejected`, `token.minted`, `token.rejected`, `client.revoked`.
+
+  The four events that grant a credential carry a `method`:
+  `pair.code_granted` → `"setup_code"`, `pair.window_used` → `"window"`,
+  `pair.approved` → `"approval"`, `pair.tofu_granted` → `"tofu"`. One field on
+  the event that already exists per path, rather than a second `client.paired`
+  row layered on top of it — amendment (a) in the new-owner spec, which is also
+  where `"tofu"` joins the spec's original three values. `pair.code_rejected`
+  carries the client name and never the code.
 - Publishing failure is logged at CRITICAL but does **not** fail the request.
   An auth event missing the trail is bad; being locked out of your own tank
   by a logging problem is worse.
