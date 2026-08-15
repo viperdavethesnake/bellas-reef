@@ -347,6 +347,17 @@ class HardwareIO:
     def request_stop(self) -> None:
         self._stopping.set()
 
+    def _on_assignment_changed(self) -> None:
+        """The registry moved under us. Exit cleanly; the restart policy
+        rebuilds from the retained registry — the drilled path (ruled
+        2026-08-15, restart-on-change over a live add/remove path)."""
+        if not self._stopping.is_set():
+            log.info(
+                "assignment changed; exiting to rebuild from registry",
+                extra={"event": "assignment_restart"},
+            )
+        self.request_stop()
+
     async def _connect_spine(self) -> None:
         """Attach to the spine if one is configured.
 
@@ -367,6 +378,12 @@ class HardwareIO:
         # which is the whole point: hardware-io holds no credential and needs
         # none to learn what it owns.
         await self._build_from_registry()
+
+        # Subscribe after the build, not before: the initial read above drains
+        # the retained stream on a pull consumer, which this core subscription
+        # never sees — but ordering it after is what keeps that true by
+        # construction rather than by coincidence of transport.
+        await self.spine.watch_assignments(self._on_assignment_changed)
 
         # Capabilities before registrations: what the hardware can offer is
         # true whether or not anyone has bound it, and a client opening a "find

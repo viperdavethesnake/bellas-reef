@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
@@ -32,6 +33,7 @@ from bellasreef_contracts import (
 )
 from bellasreef_service.logging import get_logger
 from nats.aio.client import Client
+from nats.aio.msg import Msg
 from nats.js import JetStreamContext
 from nats.js.api import (
     AckPolicy,
@@ -257,6 +259,23 @@ class Spine:
         with contextlib.suppress(Exception):
             await sub.unsubscribe()
         return found
+
+    async def watch_assignments(self, on_event: Callable[[], None]) -> None:
+        """Core subscribe to live assignment traffic.
+
+        Deliberately payload-blind: any message here means the registry moved,
+        and the response — rebuild via restart — is the same regardless of
+        which device moved. Retained JetStream state is NOT redelivered on a
+        core subscription, so startup's own read never triggers this.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+
+        async def _cb(msg: Msg) -> None:
+            on_event()
+
+        await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_cb)
+        log.info("watching assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
 
     async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
         """Announce what one hardware source can offer.
