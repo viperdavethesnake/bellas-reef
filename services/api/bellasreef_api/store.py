@@ -135,6 +135,50 @@ class Store:
             winner = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
             return UUID(str(winner[0])) if winner is not None else hub
 
+    # --------------------------------------------------------------- setup
+
+    async def setup_state(self) -> tuple[str | None, datetime | None]:
+        """``(setup_code_hash, setup_completed_at)`` off the singleton row.
+
+        Both start NULL. Setup mode, per the spec, is exactly
+        ``setup_completed_at IS NULL`` — callers derive that from the second
+        element rather than this method deciding it, so there is one place
+        (the caller) that owns "what does setup mode mean," not two.
+        """
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT setup_code_hash, setup_completed_at FROM hub_identity")
+                )
+            ).first()
+            return (row[0], row[1]) if row else (None, None)
+
+    async def set_setup_code_hash(self, code_hash: str) -> None:
+        """Mint: exactly one code is valid at a time, so this overwrites
+        rather than appends — the old hash simply stops matching anything."""
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE hub_identity SET setup_code_hash = :h"), {"h": code_hash}
+            )
+
+    async def complete_setup(self) -> None:
+        """First successful pair, by any method. Never unset afterwards.
+
+        ``WHERE setup_completed_at IS NULL`` is what makes "never unset" true
+        rather than aspirational: a second call is a no-op, so revoking every
+        client later and pairing again cannot move the timestamp and
+        therefore cannot re-open setup mode. Also clears any live setup-code
+        hash — once a hub is set up, that code has no further use and must
+        not still verify.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE hub_identity SET setup_completed_at = now(), setup_code_hash = NULL "
+                    "WHERE setup_completed_at IS NULL"
+                )
+            )
+
     # ------------------------------------------------------------ capabilities
 
     async def replace_capabilities(
