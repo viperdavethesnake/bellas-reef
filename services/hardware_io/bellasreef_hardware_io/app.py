@@ -24,11 +24,14 @@ from typing import Any, Final
 from uuid import uuid4
 
 from bellasreef_contracts import (
+    ActuatorLevel,
     ActuatorRegistration,
+    ActuatorState,
     DeviceAssignment,
     Heartbeat,
     SensorReading,
     SensorRegistration,
+    StateReason,
 )
 from bellasreef_contracts.driver import SensorSample
 from bellasreef_service.httpd import Health, MetricsServer
@@ -493,6 +496,16 @@ class HardwareIO:
             extra={"actuators": len(self._registrations), "sensors": len(self.sensors)},
         )
 
+        # Once per actuator, after the safe-state assertion: the drill
+        # actuator was driven safe by supervisor.start() above, in run(),
+        # before the spine even connected; a registry-built actuator never
+        # goes through that call at all — it is registered here, later, after
+        # being freshly opened, and a guard starts ``at_safe_state=True`` by
+        # construction (safety.py's ``_Guard``). Either way, by this point
+        # every actuator in ``self._registrations`` is safe, so a freshly
+        # restarted hub tells clients the truth without waiting for a command.
+        await self._publish_startup_states()
+
         self.commands = CommandConsumer(self.spine, self.supervisor)
         await self.commands.subscribe()
 
@@ -602,6 +615,65 @@ class HardwareIO:
                 exc_info=True,
             )
 
+    async def _publish_startup_states(self) -> None:
+        """Once per registered actuator, tell the wire the post-assertion truth.
+
+        ``registration.safe_state`` rather than reading anything back off the
+        driver — no driver in this codebase exposes a current-level getter
+        (docs/driver interface), and it would be redundant besides: every
+        actuator here is either freshly asserted safe by
+        ``supervisor.start()`` or freshly opened and assumed safe by
+        construction (see the call site in ``_connect_spine``), so the
+        registration's own declared safe state IS the truth right now.
+        """
+        for registration in self._registrations:
+            # Non-None by construction: the supervisor refuses to register an
+            # authoritative actuator without the complete safety triple
+            # (safety.py's ``InterlockSupervisor.register``), and hardware-io
+            # registers authoritative actuators only.
+            safe_state = registration.safe_state
+            assert safe_state is not None
+            await self._publish_state(
+                registration.actuator_id,
+                safe_state,
+                reason="startup",
+                latched=self.supervisor.is_latched(registration.actuator_id),
+            )
+
+    async def _publish_state(
+        self,
+        actuator_id: str,
+        level: ActuatorLevel,
+        *,
+        reason: StateReason,
+        latched: bool = False,
+    ) -> None:
+        """Publish one ActuatorState. Guarded exactly like ``_publish_reading``:
+        no spine means no publish, and a publish failure is logged and
+        swallowed rather than allowed to break the caller.
+        """
+        if self.spine is None:
+            return
+        try:
+            await self.spine.publish_state(
+                ActuatorState(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source=SERVICE,
+                    actuator_id=actuator_id,
+                    level=level,
+                    reason=reason,
+                    since=datetime.now(UTC),
+                    latched=latched,
+                )
+            )
+        except Exception:
+            log.warning(
+                "failed to publish actuator state",
+                extra={"actuator_id": actuator_id, "reason": reason},
+                exc_info=True,
+            )
+
     def _refresh_clock_trust(self) -> None:
         self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
 
@@ -613,6 +685,26 @@ class HardwareIO:
 
     # ------------------------------------------------------------- reporting
 
+    #: Which SafetyEvent reasons correspond to the supervisor actually driving
+    #: an actuator to its safe state, as opposed to merely refusing a command
+    #: (clock_untrusted, command_expired, latched, unknown_actuator — none of
+    #: those move anything, so publishing a state for them would claim a
+    #: transition that never happened). "shutdown" is included per item 3's
+    #: scope, but see the report: by the time supervisor.stop() drives it, the
+    #: spine is already closed in HardwareIO.shutdown(), so in practice this
+    #: one is a no-op today rather than a state that reaches the wire.
+    _AUTONOMOUS_TRIP_REASONS: Final[frozenset[str]] = frozenset(
+        {"heartbeat_timeout", "max_runtime_exceeded", "shutdown"}
+    )
+
+    #: TripReason -> StateReason for the autonomous trips above. Both trips
+    #: land the actuator at its declared safe_state; only max_runtime latches.
+    _TRIP_STATE_REASON: Final[dict[str, StateReason]] = {
+        "heartbeat_timeout": "safe_state",
+        "max_runtime_exceeded": "interlock_latch",
+        "shutdown": "safe_state",
+    }
+
     async def _on_safety_event(self, event: SafetyEvent) -> None:
         self.metrics.safety_events.labels(event.reason).inc()
         log.warning(
@@ -623,6 +715,16 @@ class HardwareIO:
                 "detail": event.detail,
             },
         )
+        if event.reason in self._AUTONOMOUS_TRIP_REASONS:
+            registration = self.supervisor.registration_of(event.actuator_id)
+            safe_state = registration.safe_state
+            assert safe_state is not None
+            await self._publish_state(
+                event.actuator_id,
+                safe_state,
+                reason=self._TRIP_STATE_REASON[event.reason],
+                latched=self.supervisor.is_latched(event.actuator_id),
+            )
 
     def health(self) -> Health:
         stall = self.liveness.age_s()

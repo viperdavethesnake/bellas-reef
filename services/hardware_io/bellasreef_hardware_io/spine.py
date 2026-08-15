@@ -53,6 +53,11 @@ __all__ = ["STREAMS", "CommandConsumer", "Spine"]
 
 log = get_logger(__name__)
 
+#: ``source`` on every ActuatorState this process publishes. Not imported from
+#: app.py's ``SERVICE`` constant — app.py imports from this module, and a
+#: back-import would be circular for one shared literal.
+SOURCE: Final = "hardware-io"
+
 CMD_STREAM: Final = "BR_CMD"
 STATE_STREAM: Final = "BR_STATE"
 AUDIT_STREAM: Final = "BR_AUDIT"
@@ -442,6 +447,7 @@ class CommandConsumer:
 
             if outcome == "applied":
                 await msg.ack()
+                await self._publish_applied_state(command)
                 continue
 
             await self._audit(
@@ -535,6 +541,37 @@ class CommandConsumer:
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
         await self._spine.publish_audit("command", {"event": event_type, **detail})
+
+    async def _publish_applied_state(self, command: ActuatorCommand) -> None:
+        """Tell the wire what an applied command actually did.
+
+        This is the layer that has the spine: the supervisor (safety.py) must
+        keep enforcing interlocks with no broker at all, so it stays
+        publish-blind by design and this call site is the trade-off — not a
+        callback threaded through it. A publish failure must never make a
+        successfully applied command look like it failed, so it is logged and
+        swallowed exactly like a failed sensor reading (app.py's
+        ``_publish_reading``).
+        """
+        try:
+            await self._spine.publish_state(
+                ActuatorState(
+                    message_id=uuid4(),
+                    emitted_at=utcnow(),
+                    source=SOURCE,
+                    actuator_id=command.actuator_id,
+                    level=command.level,
+                    reason="commanded",
+                    since=utcnow(),
+                    latched=False,
+                )
+            )
+        except Exception:
+            log.warning(
+                "failed to publish actuator state",
+                extra={"actuator_id": command.actuator_id},
+                exc_info=True,
+            )
 
 
 def utcnow() -> datetime:
