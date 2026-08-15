@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import Callable, Coroutine
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
@@ -119,6 +120,46 @@ def hub(monkeypatch: pytest.MonkeyPatch) -> str:
     return dsn
 
 
+@pytest.fixture
+def fresh_db_env(hub: str) -> str:
+    """``hub``, with ``hub_identity``'s setup columns reset to never-set-up.
+
+    ``hub`` truncates the pairing tables but ``hub_identity`` is a singleton
+    that is never truncated — otherwise the hub would mint a new identity mid
+    suite. The setup-code tests need that row in a known state rather than
+    whatever the previous test in the run left it in, so this seeds the row
+    (``Store.hub_id()``, lazy like everything else that touches it) and then
+    clears both setup columns explicitly.
+    """
+
+    async def reset(engine: AsyncEngine) -> None:
+        await Store(engine).hub_id()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE hub_identity SET setup_completed_at = NULL, setup_code_hash = NULL")
+            )
+
+    engine_scoped(hub, reset)
+    return hub
+
+
+@pytest.fixture
+def paired_db_env(hub: str) -> str:
+    """``fresh_db_env``, then ``complete_setup()`` — the post-adoption state."""
+
+    async def complete(engine: AsyncEngine) -> None:
+        store = Store(engine)
+        await store.hub_id()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE hub_identity SET setup_completed_at = NULL, setup_code_hash = NULL")
+            )
+        await store.complete_setup()
+
+    engine_scoped(hub, complete)
+    return hub
+
+
 def add_client(dsn: str, name: str) -> tuple[UUID, str]:
     return engine_scoped(dsn, lambda engine: Store(engine).create_client(name))
 
@@ -176,6 +217,14 @@ def test_pair_opens_a_window_and_audits_it(hub: str, capsys: pytest.CaptureFixtu
     # The actor on every CLI event. Nothing else distinguishes a window opened
     # from the terminal from one opened by the API, which cannot open one.
     assert FakeSink.sources == ["bellasreef-cli"]
+
+
+def test_pair_output_carries_the_ux6_sentence(hub: str, capsys: pytest.CaptureFixture[str]) -> None:
+    """UX-6, 2026-08-14 iOS review: an operator who opens a second window while
+    a code is already showing in the app needs to be told the old one is dead
+    weight, not silently left to guess."""
+    assert cli.main(["pair", "--ttl", "60"]) == 0
+    assert "cancel and pair again" in capsys.readouterr().out
 
 
 def test_pair_json_is_machine_readable(hub: str, capsys: pytest.CaptureFixture[str]) -> None:
@@ -410,3 +459,37 @@ def test_revoke_with_no_target_asks_rather_than_guesses(
 
     assert "--list" in capsys.readouterr().err
     assert FakeSink.published == []
+
+
+# ----------------------------------------------------------------- setup-code
+
+#: SETUP_ALPHABET is Crockford base32 minus 0/O/1/I: digits 2-9, letters A-H,
+#: J, K, M, N, P-T, V-Z (I, L, O, U excluded). Adapted from the brief's
+#: `[2-9A-HJ-NP-Z]` to the actual alphabet in security.py.
+_SETUP_CODE = re.compile(r"\b[2-9A-HJKMNPQRSTVWXYZ]{4}-[2-9A-HJKMNPQRSTVWXYZ]{4}\b")
+
+
+def test_setup_code_mints_in_setup_mode(
+    fresh_db_env: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = cli.main(["setup-code"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert _SETUP_CODE.search(out)
+    assert "Open the Bella's Reef app" in out
+
+
+def test_setup_code_rotates(fresh_db_env: str, capsys: pytest.CaptureFixture[str]) -> None:
+    cli.main(["setup-code"])
+    first = capsys.readouterr().out
+    cli.main(["setup-code"])
+    second = capsys.readouterr().out
+    assert first != second  # old code is invalid now; only the new hash stored
+
+
+def test_setup_code_after_setup_is_informational(
+    paired_db_env: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = cli.main(["setup-code"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "Setup is complete" in out
