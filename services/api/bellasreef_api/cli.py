@@ -73,7 +73,9 @@ __all__ = ["main"]
 DEFAULT_WINDOW_S = 300
 
 
-async def _emit(nats_url: str | None, event: str, detail: dict[str, Any]) -> str | None:
+async def _emit(
+    nats_url: str | None, event: str, detail: dict[str, Any], category: str = "auth"
+) -> str | None:
     """Publish one audit event. Returns a warning to shout, or ``None``.
 
     Best effort by design — the window is already open, the client is already
@@ -98,7 +100,7 @@ async def _emit(nats_url: str | None, event: str, detail: dict[str, Any]) -> str
     from bellasreef_api.audit import NatsAuditSink
 
     sink = NatsAuditSink(nats_url, source="bellasreef-cli")
-    await sink(event, detail)
+    await sink(event, detail, category=category)
     await sink.close()
     if sink.failures:
         return (

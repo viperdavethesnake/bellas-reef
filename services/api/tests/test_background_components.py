@@ -49,7 +49,7 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 class Audit:
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
         return None
 
 

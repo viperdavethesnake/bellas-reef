@@ -24,13 +24,13 @@ token buys, and it is the whole reason the pairing code needs no rate limiter.
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
 from time import monotonic
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import DeviceAssignment
@@ -90,11 +90,21 @@ AUTH_401: Final[dict[str, str]] = {
 #: telemetry this is one extra query per client per ten seconds.
 STREAM_REVOKE_RECHECK_S: Final = 10.0
 
-#: Every auth event goes here, per auth.md §3 and the existing audit contract.
-AuditSink = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+class AuditSink(Protocol):
+    """Every audit event goes through one of these, per auth.md §3.
+
+    ``category`` defaults to ``"auth"`` — a plain ``Callable`` type alias
+    cannot express an optional trailing parameter, and most call sites
+    (pairing, tokens, revocation) are content with the default. Device
+    lifecycle and override sites pass ``category`` explicitly; see the
+    call-site mapping fixed in :mod:`bellasreef_api.audit`.
+    """
+
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = ...) -> None: ...
 
 
-async def _noop_audit(event: str, detail: dict[str, Any]) -> None:
+async def _noop_audit(event: str, detail: dict[str, Any], category: str = "auth") -> None:
     log.warning("auth event not audited: no sink configured", extra={"event": event})
 
 
@@ -204,6 +214,9 @@ class AuditEvent(BaseModel):
     subject: str
     device_id: str | None
     event: dict[str, Any]
+    #: The event name from the payload ("device.unbound", "client.paired"),
+    #: promoted to a typed field so clients render verbs, not subjects.
+    action: str | None
 
 
 class CapabilityView(BaseModel):
@@ -1234,6 +1247,7 @@ def build_app(
                 "channel": body.channel,
                 "created": created,
             },
+            category="config",
         )
         return BoundDevice(
             device_id=device_id,
@@ -1284,7 +1298,11 @@ def build_app(
         row = await store.set_display_name(device_id, body.display_name)
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
-        await sink("device.renamed", {"device_id": device_id, "display_name": body.display_name})
+        await sink(
+            "device.renamed",
+            {"device_id": device_id, "display_name": body.display_name},
+            category="config",
+        )
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
 
     @app.delete(
@@ -1356,6 +1374,7 @@ def build_app(
                 "driver_type": row["driver_type"],
                 "binding": row["binding"],
             },
+            category="config",
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1378,18 +1397,22 @@ def build_app(
         makes "the event was recorded" checkable from outside the hub — which is
         how the writer's absence stayed invisible for as long as it did.
         """
-        return [
-            AuditEvent(
-                message_id=str(row["message_id"]),
-                occurred_at=row["occurred_at"],
-                category=row["category"],
-                actor=row["actor"],
-                subject=row["subject"],
-                device_id=row["device_id"],
-                event=row["event"] if isinstance(row["event"], dict) else json.loads(row["event"]),
+        events = []
+        for row in await store.recent_audit(limit=limit, category=category):
+            payload = row["event"] if isinstance(row["event"], dict) else json.loads(row["event"])
+            events.append(
+                AuditEvent(
+                    message_id=str(row["message_id"]),
+                    occurred_at=row["occurred_at"],
+                    category=row["category"],
+                    actor=row["actor"],
+                    subject=row["subject"],
+                    device_id=row["device_id"],
+                    event=payload,
+                    action=(payload or {}).get("event"),
+                )
             )
-            for row in await store.recent_audit(limit=limit, category=category)
-        ]
+        return events
 
     @app.get(
         "/api/v1/history",
@@ -1548,6 +1571,7 @@ def build_app(
                 "maximum": body.maximum,
                 "clear_margin": body.clear_margin,
             },
+            category="config",
         )
         return AlertThresholdsView(
             device_id=row["device_id"],
@@ -1652,6 +1676,7 @@ def build_app(
                 "expires_at": placed.expires_at.isoformat(),
                 "actor": str(actor),
             },
+            category="command",
         )
         return OverrideView(
             id=placed.id,
@@ -1678,6 +1703,7 @@ def build_app(
         await sink(
             "override.released",
             {"override_id": str(override_id), "actor": str(actor)},
+            category="command",
         )
         return {"status": "released"}
 

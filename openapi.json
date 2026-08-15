@@ -361,6 +361,13 @@
         "additionalProperties": false,
         "description": "One persisted audit event.",
         "properties": {
+          "action": {
+            "title": "Action",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "actor": {
             "title": "Actor",
             "type": "string"
@@ -402,7 +409,8 @@
           "actor",
           "subject",
           "device_id",
-          "event"
+          "event",
+          "action"
         ],
         "title": "AuditEvent",
         "type": "object"
@@ -1600,7 +1608,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "3.6.0"
+    "version": "3.7.0"
   },
   "openapi": "3.1.0",
   "paths": {

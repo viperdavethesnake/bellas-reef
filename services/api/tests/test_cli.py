@@ -57,7 +57,7 @@ class FakeSink:
         self.failures = 0
         FakeSink.sources.append(source)
 
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
         if self.fails:
             self.failures += 1
             return

@@ -43,7 +43,7 @@ class Audit:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, Any]]] = []
 
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
         self.events.append((event, detail))
 
     def names(self) -> list[str]:
@@ -918,6 +918,52 @@ def test_a_broker_outage_does_not_break_pairing() -> None:
         return r.status_code
 
     assert run(scenario) == 200
+
+
+def test_audit_event_exposes_action() -> None:
+    """`event` JSONB carries the event name; `action` promotes it to a typed
+    field so a client can render "Unadopted Pretty Blue" instead of echoing
+    the subject line.
+
+    `list_audit` reads `audit_log` directly (PRD: Postgres is the system of
+    record, not the stream), so the row is seeded with a raw INSERT rather
+    than routed through the in-memory `Audit` fake — that fake never touches
+    Postgres, only the harness's assertions.
+    """
+
+    async def scenario() -> str | None:
+        h = await harness()
+        message_id = str(uuid4())
+        event = {
+            "message_id": message_id,
+            "event": "device.unbound",
+            "actor": "api",
+            "occurred_at": datetime.now(UTC).isoformat(),
+            "device_id": "pi-pwm-0",
+        }
+        async with h.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_log "
+                    "(message_id, occurred_at, category, actor, subject, device_id, event) "
+                    "VALUES (:message_id, now(), 'config', 'api', "
+                    "'bellasreef.audit.config', :device_id, CAST(:event AS JSONB))"
+                ),
+                {"message_id": message_id, "device_id": "pi-pwm-0", "event": json.dumps(event)},
+            )
+
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            rows: list[dict[str, Any]] = (
+                await c.get("/api/v1/audit", params={"limit": 200}, headers=headers)
+            ).json()
+        await h.engine.dispose()
+        action = next(row["action"] for row in rows if row["message_id"] == message_id)
+        assert action is None or isinstance(action, str)
+        return action
+
+    assert run(scenario) == "device.unbound"
 
 
 # ------------------------------------------------------------ recovery window

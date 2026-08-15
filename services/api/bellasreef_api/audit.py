@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
-"""Auth events onto the audit spine.
+"""Audit events onto the spine, on the subject their category names.
 
 auth.md §3: pair open/close, pair success/deny, token mint and revocation all
-publish to ``bellasreef.audit.auth``. That subject already works end to end —
-`auth` is in the audit_log category CHECK and the AuditWriter derives it from
-the trailing token — so this is the last mile, not new plumbing.
+publish to ``bellasreef.audit.auth`` — that is still the default, and every
+call site outside device/override lifecycle relies on it. But every event used
+to hardcode that subject regardless of what it was, so a device rebind and a
+token mint were indistinguishable on the trail. ``category`` picks the subject
+now; the writer already derives the category from the trailing token and
+normalises anything outside the CHECK constraint, so this is a routing
+decision at publish time, not new plumbing.
 
 Each event is stamped with a ``message_id`` in both the payload and the
 ``Nats-Msg-Id`` header, matching what hardware-io does, so the writer's
@@ -39,7 +43,11 @@ AUDIT_CATEGORY = "auth"
 
 
 class NatsAuditSink:
-    """Publishes auth events to ``bellasreef.audit.auth``.
+    """Publishes audit events, defaulting to ``bellasreef.audit.auth``.
+
+    Callers that know their event belongs to a different category (device
+    lifecycle → ``config``, overrides → ``command``) pass it explicitly; every
+    pairing/token/revoke call site is content with the default.
 
     Connects lazily on first use, for the same reason the signing key resolves
     lazily: the app must behave identically under uvicorn, under an ASGI test
@@ -70,7 +78,9 @@ class NatsAuditSink:
                 return None
         return self._nc
 
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
+    async def __call__(
+        self, event: str, detail: dict[str, Any], category: str = AUDIT_CATEGORY
+    ) -> None:
         client = await self._client()
         if client is None:
             self.failures += 1
@@ -88,7 +98,7 @@ class NatsAuditSink:
         try:
             js = client.jetstream()
             await js.publish(
-                subjects.audit(AUDIT_CATEGORY),
+                subjects.audit(category),
                 json.dumps(payload).encode(),
                 headers={"Nats-Msg-Id": message_id},
             )
