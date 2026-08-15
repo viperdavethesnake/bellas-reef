@@ -408,18 +408,75 @@ into this section.** Blocked until the FET stage is on the bench.
 The three measured voltages are what set `INVRT_ON` in the driver. They are
 ground truth with no stack in the loop.
 
-- FLAG (2026-08-13, unresolved, David decides at the bench): which output
-  stage drives the first real light — the PCA9685→FET chain items 0a–5
-  describe, or the RP1 pi-pwm channels that got the 2026-08-13 bring-up (4
-  channels announced, driver deployed). Stage 1 is blocked on this ruling; the
-  bench-plan items stay as written for the PCA9685 path and must not be
-  treated as superseded until ruled.
+- RESOLVED (output stage order, 2026-08-15): **RP1 native PWM first, the
+  PCA9685→FET chain second.** David's ruling at the bench. This is an ordering,
+  not an exclusion — items 0a–5 stay live and unamended for the PCA9685 path,
+  which gets its own Stage 1 when the board is back on the bus. The paragraph
+  above (`i2cset`/`i2cget`, DMM on the FET drain, `INVRT_ON`) describes the
+  PCA9685 leg specifically and is still pending; the RP1 leg ran 2026-08-15 and
+  is recorded below.
+- The PCA9685 is **not on I²C bus 1 as of 2026-08-15** — a full `i2cdetect -y 1`
+  is empty, no `0x40`, no `0x70`, where 2026-08-09 saw both. The board is off
+  the bench for now, by David. Re-verify presence before the PCA9685 Stage 1.
+- The PCA9685 is also **not discoverable in code**: `capabilities.py` announces
+  only `discover_pwm()` (RP1) and `discover_w1()`, despite its module docstring
+  promising "a PCA9685 if one answers". The driver and `factory.py`'s
+  `driver_type == "pca9685"` branch are complete, but nothing announces the
+  capability, so no channel is adoptable. A `discover_pca9685()` is a
+  prerequisite for the PCA9685 Stage 2, not for its Stage 1.
+
+**Stage 1 (RP1 native PWM), CH0 and CH2 — PASSED on hardware 2026-08-15.**
+
+Raw `/sys/class/pwm` writes only, no Bella's Reef code in the loop. DMM ground
+referenced, probed at the channel's own header pin. `pwmchip0` resolved to
+`1f00098000.pwm` (PWM0, ours) on this boot. Both channels held at
+`period=2000000` (500 Hz, the pinned frequency) and `polarity=normal`
+throughout. Every value below is David's meter reading, recorded as given.
+
+| Commanded duty | `duty_cycle` (ns) | CH0 — pin 32 (GPIO12) | CH2 — pin 12 (GPIO18) |
+|---|---|---|---|
+| 0 % | 0 | **0 V** | **0 V** (≤3 mV, called meter error) |
+| 8 % | 160 000 | **265 mV** | **265 mV** |
+| 50 % | 1 000 000 | **~1.654 V** | **~1.654 V** |
+| 100 % | 2 000 000 | **~3.309 V** | **~3.309 V** |
+
+**The two channels agree on every point.** CH2 was probed on a different header
+pin, at a different alt (`a3` vs CH0's `a0`), and produced identical readings —
+so the numbers characterise the RP1 PWM0 block, not one lucky channel, and CH1
+and CH3 can be expected to match without re-measuring each. Expected, not
+assumed: measure before trusting a channel that drives a real load.
+
+Two findings, both load-bearing:
+
+1. **`polarity=normal` is correct; duty 0 measures 0 V.** The safety inversion
+   that item 1 warns about does **not** apply to the RP1 path — the declared
+   safe state `PwmLevel(duty=0.0)` is genuinely off at the pin, proven by meter
+   rather than by reasoning. This says nothing about the PCA9685→FET chain,
+   whose stage is expected to invert and whose `INVRT_ON` is still unproven.
+2. **The points are linear to within a millivolt** (8 % of 3.309 V is 265 mV;
+   the 50 % midpoint is 1.6545 V). The channels are consistent across the whole
+   commandable range, which is what makes Stage 2 a real test: any nonlinearity
+   that appears through the stack is our code, not the silicon.
+
+Both channels returned to `duty_cycle=0, enable=0` afterwards. CH1
+(`pi-pwm-1`, owned and enabled by hardware-io) was untouched for the whole run
+— verified before and after, and it is the reason CH1 cannot be Stage-1'd by
+raw CLI without contending with the running service. CH3 remains exported at a
+leftover `period=1000000` from the 2026-08-13 bring-up; that 1 kHz is nobody's
+decision and must be set to 2 000 000 before it is used. CH0 and CH2 are now at
+2 000 000.
 
 **Stage 2 — the same facts through our stack.** Register the channel via
 hardware-io (authoritative, role `light`, full safety triple), command the
-identical three duty points through control-engine over the spine, David
-confirms the meter matches Stage 1 exactly. **Any divergence is a driver bug by
-definition** — the CLI numbers are the truth.
+identical duty points through control-engine over the spine, David confirms the
+meter matches Stage 1 exactly. **Any divergence is a driver bug by definition**
+— the CLI numbers are the truth.
+
+Run it on **the same channel and the same probe point** as that path's Stage 1,
+so the stack is the only variable. For RP1 that means CH0 / pin 32 against the
+four rows above — not CH1, which would introduce a second variable. The 8 % row
+is the one that exercises `snap_duty`; commands below 8 % must measure 0 V, not
+265 mV, because the driver snaps them down before they reach the pin.
 
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
