@@ -260,19 +260,25 @@ class Spine:
             await sub.unsubscribe()
         return found
 
-    async def watch_assignments(self, on_event: Callable[[], None]) -> None:
-        """Core subscribe to live assignment traffic.
+    async def watch_assignments(self, on_message: Callable[[bytes], None]) -> None:
+        """Core subscribe to live assignment traffic, payload and all.
 
-        Deliberately payload-blind: any message here means the registry moved,
-        and the response — rebuild via restart — is the same regardless of
-        which device moved. Retained JetStream state is NOT redelivered on a
-        core subscription, so startup's own read never triggers this.
+        The raw payload is handed on rather than swallowed (changed
+        2026-08-15). This was payload-blind on the reasoning that any message
+        here means the registry moved and the response is the same regardless
+        — true of a *change*, but the API republishes every adopted assignment
+        on every lifespan start, so most messages on this subject say nothing
+        new. Deciding which is which needs the payload; what to do about a real
+        change is unchanged, and still a restart.
+
+        Retained JetStream state is NOT redelivered on a core subscription, so
+        startup's own read never triggers this.
         """
         if self._nc is None:
             raise RuntimeError("spine not connected")
 
         async def _cb(msg: Msg) -> None:
-            on_event()
+            on_message(msg.data)
 
         await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_cb)
         log.info("watching assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
