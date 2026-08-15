@@ -14,6 +14,7 @@ separate task would report health the loop no longer has.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -24,6 +25,7 @@ from uuid import uuid4
 
 from bellasreef_contracts import (
     ActuatorRegistration,
+    DeviceAssignment,
     Heartbeat,
     SensorReading,
     SensorRegistration,
@@ -33,6 +35,7 @@ from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard
 from prometheus_client import CollectorRegistry, Counter, Gauge
+from pydantic import ValidationError
 
 from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
 from bellasreef_hardware_io.drivers.onewire import DS18B20
@@ -76,6 +79,28 @@ def clock_is_trusted() -> bool:
     if out.returncode != 0:
         return os.environ.get("BELLASREEF_ASSUME_CLOCK_TRUSTED") == "1"
     return out.stdout.strip().lower() == "yes"
+
+
+#: Everything about an assignment that changes what this process built:
+#: ``(adopted, role, driver_type, canonical binding)``. The binding is
+#: serialised with sorted keys so two dicts that differ only in key order
+#: compare equal — a re-serialised republish must not read as a change.
+#:
+#: ``role`` is in here even though it does not pick a driver: it is part of the
+#: registration the supervisor holds, so a role edit is a rebuild. When in
+#: doubt the tuple grows — a wasted restart costs seconds, a missed one leaves
+#: this process running a topology the registry no longer describes.
+_AssignmentFingerprint = tuple[bool, str | None, str | None, str]
+
+
+def _fingerprint(assignment: DeviceAssignment) -> _AssignmentFingerprint:
+    """Reduce an assignment to what hardware-io would build differently."""
+    return (
+        assignment.adopted,
+        assignment.role,
+        assignment.driver_type,
+        json.dumps(assignment.binding, sort_keys=True),
+    )
 
 
 class _Metrics:
@@ -154,6 +179,10 @@ class HardwareIO:
         self.spine: Spine | None = None
         self.commands: CommandConsumer | None = None
         self._registrations: list[ActuatorRegistration] = []
+        #: What the registry said when this process built its devices, keyed by
+        #: device_id. The yardstick the assignment watch measures live traffic
+        #: against — see ``_on_assignment_message``.
+        self._assignments: dict[str, _AssignmentFingerprint] = {}
         self._beat_seq = 0
         self._sensor_deadlines: dict[str, float] = {}
 
@@ -170,6 +199,11 @@ class HardwareIO:
         if self.spine is None:
             return
         assignments = await self.spine.read_assignments()
+        # Snapshot the registry as read, from the same list the factory
+        # consumes — including the unadopted tombstones, which build nothing
+        # but are still assignments this process has seen and must not be
+        # mistaken for news when they are republished.
+        self._remember_assignments(assignments)
         actuators, sensors = build_from_assignments(assignments, open_i2c=self._open_i2c)
 
         for sensor in sensors:
@@ -347,6 +381,61 @@ class HardwareIO:
     def request_stop(self) -> None:
         self._stopping.set()
 
+    def _remember_assignments(self, assignments: list[DeviceAssignment]) -> None:
+        """Record the registry as it was read, for the watch to compare against."""
+        self._assignments = {a.device_id: _fingerprint(a) for a in assignments}
+
+    def _on_assignment_message(self, data: bytes) -> None:
+        """Decide whether a live assignment message is news.
+
+        Payload-aware since 2026-08-15, and the reason is specific: the API
+        republishes *every* adopted assignment from Postgres on every lifespan
+        start, so each API restart or deploy put an exact copy of what this
+        process already built on the wire. Payload-blind, that echo restarted
+        hardware-io — roughly fifteen seconds with no monitoring, a deploy
+        telemetry gate that depended on which service came up first, and an API
+        crash-loop that flapped hardware-io with it.
+
+        Only an assignment that differs from what was built is news. Everything
+        else fails toward the restart path: a device this process never read, a
+        payload that will not parse, anything the fingerprint cannot vouch for.
+        A wasted restart costs seconds; a wrong ignore leaves the drivers and
+        the registry disagreeing with nobody watching.
+        """
+        try:
+            assignment = DeviceAssignment.model_validate_json(data)
+        except ValidationError:
+            log.warning(
+                "assignment did not validate; restarting to rebuild",
+                extra={"event": "assignment_restart"},
+            )
+            self._on_assignment_changed()
+            return
+
+        known = self._assignments.get(assignment.device_id)
+        if known is not None and known == _fingerprint(assignment):
+            log.debug(
+                "assignment echo ignored",
+                extra={"device_id": assignment.device_id, "event": "assignment_echo"},
+            )
+            return
+
+        self._on_assignment_changed()
+
+    def _on_assignment_changed(self) -> None:
+        """The registry moved under us. Exit cleanly; the restart policy
+        rebuilds from the retained registry — the drilled path (ruled
+        2026-08-15, restart-on-change over a live add/remove path).
+
+        The decision that a message *is* a change belongs to
+        ``_on_assignment_message``; this is only the response to it."""
+        if not self._stopping.is_set():
+            log.info(
+                "assignment changed; exiting to rebuild from registry",
+                extra={"event": "assignment_restart"},
+            )
+        self.request_stop()
+
     async def _connect_spine(self) -> None:
         """Attach to the spine if one is configured.
 
@@ -367,6 +456,12 @@ class HardwareIO:
         # which is the whole point: hardware-io holds no credential and needs
         # none to learn what it owns.
         await self._build_from_registry()
+
+        # Subscribe after the build, not before: the initial read above drains
+        # the retained stream on a pull consumer, which this core subscription
+        # never sees — but ordering it after is what keeps that true by
+        # construction rather than by coincidence of transport.
+        await self.spine.watch_assignments(self._on_assignment_message)
 
         # Capabilities before registrations: what the hardware can offer is
         # true whether or not anyone has bound it, and a client opening a "find

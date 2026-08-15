@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Callable, Coroutine
+import re
+from collections.abc import Callable, Coroutine, Iterator
 from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
@@ -48,7 +49,10 @@ class FakeSink:
     with the answer flipped.
     """
 
-    published: ClassVar[list[tuple[str, dict[str, Any]]]] = []
+    #: ``(event, detail, category)``. The category is kept rather than dropped:
+    #: it decides which audit subject the event lands on, and a call site that
+    #: lost it used to pass here unnoticed.
+    published: ClassVar[list[tuple[str, dict[str, Any], str]]] = []
     sources: ClassVar[list[str]] = []
     fails = False
 
@@ -57,22 +61,26 @@ class FakeSink:
         self.failures = 0
         FakeSink.sources.append(source)
 
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
         if self.fails:
             self.failures += 1
             return
-        FakeSink.published.append((event, detail))
+        FakeSink.published.append((event, detail, category))
 
     async def close(self) -> None:
         return None
 
     @classmethod
     def events(cls) -> list[str]:
-        return [event for event, _ in cls.published]
+        return [event for event, _, _ in cls.published]
 
     @classmethod
     def detail_for(cls, event: str) -> dict[str, Any]:
-        return next(detail for name, detail in cls.published if name == event)
+        return next(detail for name, detail, _ in cls.published if name == event)
+
+    @classmethod
+    def category_for(cls, event: str) -> str:
+        return next(category for name, _, category in cls.published if name == event)
 
 
 class DeadSink(FakeSink):
@@ -117,6 +125,52 @@ def hub(monkeypatch: pytest.MonkeyPatch) -> str:
 
     engine_scoped(dsn, truncate)
     return dsn
+
+
+def _clear_setup_state(dsn: str) -> None:
+    """Put ``hub_identity`` back to never-set-up.
+
+    ``hub_identity`` is a singleton that is never truncated — otherwise the hub
+    would mint a new identity mid suite — so it carries whatever the last test
+    to touch it left behind. A minted-but-never-used code is the state that
+    bites: ``setup_code_hash`` set with ``setup_completed_at`` still NULL is a
+    live "code required" gate on ``POST /pair``, and any later test that
+    bootstraps without a code would 422 against it. Same reasoning, and the
+    same name, as test_auth_lifecycle.py's helper.
+    """
+
+    async def reset(engine: AsyncEngine) -> None:
+        await Store(engine).hub_id()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE hub_identity SET setup_completed_at = NULL, setup_code_hash = NULL")
+            )
+
+    engine_scoped(dsn, reset)
+
+
+@pytest.fixture
+def fresh_db_env(hub: str) -> Iterator[str]:
+    """``hub``, with ``hub_identity``'s setup columns reset to never-set-up.
+
+    Cleared on the way out as well as on the way in. Entry alone made each
+    test's own precondition order-independent while leaving the *next* file's
+    tests to inherit a minted code — the two minting tests below leave one
+    behind by construction, and only this file's ordering rescued a
+    ``-k``-filtered run from it.
+    """
+    _clear_setup_state(hub)
+    yield hub
+    _clear_setup_state(hub)
+
+
+@pytest.fixture
+def paired_db_env(hub: str) -> Iterator[str]:
+    """``fresh_db_env``, then ``complete_setup()`` — the post-adoption state."""
+    _clear_setup_state(hub)
+    engine_scoped(hub, lambda engine: Store(engine).complete_setup())
+    yield hub
+    _clear_setup_state(hub)
 
 
 def add_client(dsn: str, name: str) -> tuple[UUID, str]:
@@ -176,6 +230,14 @@ def test_pair_opens_a_window_and_audits_it(hub: str, capsys: pytest.CaptureFixtu
     # The actor on every CLI event. Nothing else distinguishes a window opened
     # from the terminal from one opened by the API, which cannot open one.
     assert FakeSink.sources == ["bellasreef-cli"]
+
+
+def test_pair_output_carries_the_ux6_sentence(hub: str, capsys: pytest.CaptureFixture[str]) -> None:
+    """UX-6, 2026-08-14 iOS review: an operator who opens a second window while
+    a code is already showing in the app needs to be told the old one is dead
+    weight, not silently left to guess."""
+    assert cli.main(["pair", "--ttl", "60"]) == 0
+    assert "cancel and pair again" in capsys.readouterr().out
 
 
 def test_pair_json_is_machine_readable(hub: str, capsys: pytest.CaptureFixture[str]) -> None:
@@ -410,3 +472,37 @@ def test_revoke_with_no_target_asks_rather_than_guesses(
 
     assert "--list" in capsys.readouterr().err
     assert FakeSink.published == []
+
+
+# ----------------------------------------------------------------- setup-code
+
+#: SETUP_ALPHABET is Crockford base32 minus 0/O/1/I: digits 2-9, letters A-H,
+#: J, K, M, N, P-T, V-Z (I, L, O, U excluded). Adapted from the brief's
+#: `[2-9A-HJ-NP-Z]` to the actual alphabet in security.py.
+_SETUP_CODE = re.compile(r"\b[2-9A-HJKMNPQRSTVWXYZ]{4}-[2-9A-HJKMNPQRSTVWXYZ]{4}\b")
+
+
+def test_setup_code_mints_in_setup_mode(
+    fresh_db_env: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = cli.main(["setup-code"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert _SETUP_CODE.search(out)
+    assert "Open the Bella's Reef app" in out
+
+
+def test_setup_code_rotates(fresh_db_env: str, capsys: pytest.CaptureFixture[str]) -> None:
+    cli.main(["setup-code"])
+    first = capsys.readouterr().out
+    cli.main(["setup-code"])
+    second = capsys.readouterr().out
+    assert first != second  # old code is invalid now; only the new hash stored
+
+
+def test_setup_code_after_setup_is_informational(
+    paired_db_env: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = cli.main(["setup-code"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "Setup is complete" in out

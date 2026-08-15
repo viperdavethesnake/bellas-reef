@@ -361,6 +361,13 @@
         "additionalProperties": false,
         "description": "One persisted audit event.",
         "properties": {
+          "action": {
+            "title": "Action",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "actor": {
             "title": "Actor",
             "type": "string"
@@ -402,7 +409,8 @@
           "actor",
           "subject",
           "device_id",
-          "event"
+          "event",
+          "action"
         ],
         "title": "AuditEvent",
         "type": "object"
@@ -661,6 +669,10 @@
               "null"
             ]
           },
+          "adopted": {
+            "title": "Adopted",
+            "type": "boolean"
+          },
           "alert_clear_margin": {
             "title": "Alert Clear Margin",
             "type": [
@@ -782,7 +794,8 @@
           "display_name",
           "kind",
           "driver_id",
-          "enabled"
+          "enabled",
+          "adopted"
         ],
         "title": "DeviceView",
         "type": "object"
@@ -1021,6 +1034,10 @@
           "pairing_open": {
             "title": "Pairing Open",
             "type": "boolean"
+          },
+          "setup_mode": {
+            "title": "Setup Mode",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1029,7 +1046,8 @@
           "contracts_version",
           "paired_client_count",
           "pairing_open",
-          "approvers_available"
+          "approvers_available",
+          "setup_mode"
         ],
         "title": "Info",
         "type": "object"
@@ -1231,6 +1249,14 @@
             "minLength": 1,
             "title": "Client Name",
             "type": "string"
+          },
+          "setup_code": {
+            "maxLength": 16,
+            "title": "Setup Code",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1600,7 +1626,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "3.6.0"
+    "version": "3.7.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2194,6 +2220,127 @@
         ]
       }
     },
+    "/api/v1/devices/{device_id}/forget": {
+      "post": {
+        "description": "Delete a detached device row for good.\n\nThe Detached section's \"clear\" (ruled 2026-08-15). `unbind_device`'s\ndocstring explains why deletion is normally the wrong move: it severs\nhistory from hardware that might come back. This endpoint is the\noperator overruling that on purpose \u2014 the hardware is gone, and the\nname should stop appearing. Telemetry already written keeps its\ndevice_id; nothing here rewrites history.\n\nNo assignment publish: a detached device holds no channel claim to\nretract, and `unbind_device`'s tombstone already recorded the release.",
+        "operationId": "forgetDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. Identity and settings are gone."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "409": {
+            "description": "Still adopted. Unbind it first."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forget Device",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/readopt": {
+      "post": {
+        "description": "Reattach a detached device to the channel its row still remembers.\n\nThe Detached section's \"re-add\" (ruled 2026-08-15). `unbind_device`\nkeeps the row and its binding on purpose, and this is what makes that\nworth doing rather than merely quiet: the operator gets the *same*\ndevice back \u2014 name, thresholds and history intact \u2014 instead of\nre-binding through `bindDevice` and hoping the proposed id is the one\nthat lands (it is not always; see `bind_device`'s matching note).",
+        "operationId": "readoptDevice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceView"
+                }
+              }
+            },
+            "description": "Re-adopted onto the channel its row remembers."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device, or it is not detached."
+          },
+          "409": {
+            "description": "Its channel is now held by another adopted device."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Readopt Device",
+        "tags": [
+          "hardware"
+        ]
+      }
+    },
     "/api/v1/devices/{device_id}/thresholds": {
       "get": {
         "operationId": "getThresholds",
@@ -2605,7 +2752,7 @@
     },
     "/api/v1/pair": {
       "post": {
-        "description": "Pair a client. Four outcomes, in this order.\n\n1. No client has ever paired -> TOFU grant, and the window shuts.\n2. A recovery window is open -> grant and spend it.\n3. Someone is alive to approve -> 202, poll for a decision.\n4. Clients exist but every one is revoked -> 403. There is nobody to\n   approve, so the honest answer is to tell the operator to run\n   `bellasreef pair` on the hub rather than leave them polling a\n   request no one will ever see.\n\nOutcome 2 has a fifth ending: losing the race for the window is a 409.",
+        "description": "Pair a client.\n\nA setup code, if present, is resolved first (spec 2026-08-15,\nFeature 1): valid in setup mode grants immediately; anything else\nabout it is a 422, never a pending request nor a silent ignore \u2014 see\nthe checks at the top of the body.\n\nAbsent a setup code, an open recovery window is consulted next \u2014\n`bellasreef pair` is a fire escape and must keep working even while\nsetup is incomplete and a code has been minted (review ruling,\n2026-08-15: the spec's \"window flow... still works during setup\nmode\" wins over blind TOFU yielding to a minted code). Only once no\nwindow is open does a minted-but-unsupplied code become a rejection.\n\nThe remaining outcomes then follow, in this order:\n\n1. No client has ever paired -> TOFU grant, and the window shuts.\n2. A recovery window is open -> grant and spend it.\n3. Someone is alive to approve -> 202, poll for a decision.\n4. Clients exist but every one is revoked -> 403. There is nobody to\n   approve, so the honest answer is to tell the operator to run\n   `bellasreef pair` on the hub rather than leave them polling a\n   request no one will ever see.\n\nOutcome 2 has a fifth ending: losing the race for the window is a 409.",
         "operationId": "pair",
         "requestBody": {
           "content": {
@@ -2645,14 +2792,10 @@
             "description": "The recovery window was spent by another client."
           },
           "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
+            "description": "A setup code was missing/wrong in setup mode, or supplied outside setup mode. Never silently ignored."
+          },
+          "429": {
+            "description": "Too many failed setup-code attempts. See Retry-After."
           }
         },
         "summary": "Pair",

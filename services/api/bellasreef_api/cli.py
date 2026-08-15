@@ -64,6 +64,7 @@ from bellasreef_api.backup import (
     create_backup,
     restore_backup,
 )
+from bellasreef_api.security import format_setup_code, hash_setup_code, new_setup_code
 from bellasreef_api.store import ClientRow, Store
 
 __all__ = ["main"]
@@ -73,7 +74,9 @@ __all__ = ["main"]
 DEFAULT_WINDOW_S = 300
 
 
-async def _emit(nats_url: str | None, event: str, detail: dict[str, Any]) -> str | None:
+async def _emit(
+    nats_url: str | None, event: str, detail: dict[str, Any], category: str = "auth"
+) -> str | None:
     """Publish one audit event. Returns a warning to shout, or ``None``.
 
     Best effort by design — the window is already open, the client is already
@@ -98,7 +101,7 @@ async def _emit(nats_url: str | None, event: str, detail: dict[str, Any]) -> str
     from bellasreef_api.audit import NatsAuditSink
 
     sink = NatsAuditSink(nats_url, source="bellasreef-cli")
-    await sink(event, detail)
+    await sink(event, detail, category=category)
     await sink.close()
     if sink.failures:
         return (
@@ -366,6 +369,48 @@ def _revoke_command(args: Any, dsn: str) -> int:
     print("  Its refresh token is dead and any access token it holds stops working")
     print("  on the next request. The client row stays, revoked — that is what keeps")
     print("  the open-pairing window shut.")
+    return 0
+
+
+# --------------------------------------------------------------- setup-code
+
+
+async def _setup_code(dsn: str) -> str | None:
+    """Mint a new setup code, or report that there is nothing to mint.
+
+    Returns the freshly minted (unformatted) code, or ``None`` when setup is
+    already complete. ``hub_id()`` runs first to seed ``hub_identity`` if this
+    is the first thing to ever touch that row — ``setup_state`` and
+    ``set_setup_code_hash`` are both plain ``UPDATE``s that no-op on a missing
+    row rather than erroring, so skipping this would mint a code, "store" its
+    hash into nothing, and print a code that verifies against no hash at all.
+    """
+    engine = create_async_engine(dsn, future=True)
+    try:
+        store = Store(engine)
+        await store.hub_id()
+        _, completed_at = await store.setup_state()
+        if completed_at is not None:
+            return None
+        code = new_setup_code()
+        await store.set_setup_code_hash(hash_setup_code(code))
+        return code
+    finally:
+        await engine.dispose()
+
+
+def _setup_code_command(args: Any, dsn: str) -> int:
+    code = asyncio.run(_setup_code(dsn))
+    if code is None:
+        print(
+            "Setup is complete. Pair new devices from the approver "
+            "screen on an already-paired device, or open a window with "
+            "`bellasreef pair` as the fire-escape."
+        )
+        return 0
+
+    print(f"Setup code: {format_setup_code(code)}")
+    print("Open the Bella's Reef app on this network and enter this code when asked.")
     return 0
 
 
@@ -651,6 +696,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     pair.add_argument("--json", action="store_true", help="machine-readable output")
 
+    sub.add_parser(
+        "setup-code",
+        help="mint the first-pair setup code (setup mode only)",
+        description=(
+            "In setup mode: mint a new setup code, rotating out any previous one, "
+            "for the new-owner adoption flow — no SSH pairing window required. "
+            "After the first pair, informational only: setup mode is closed and "
+            "`bellasreef pair` is the fire escape from then on."
+        ),
+    )
+
     # A mode of `revoke` rather than a sibling `bellasreef clients`. The listing
     # has no reason to exist on its own — `GET /api/v1/clients` is the way to
     # look at clients, from a device that works. This one is for the operator
@@ -765,6 +821,8 @@ def main(argv: list[str] | None = None) -> int:
         return _restore_command(args, dsn)
     if args.command == "revoke":
         return _revoke_command(args, dsn)
+    if args.command == "setup-code":
+        return _setup_code_command(args, dsn)
 
     if args.ttl <= 0:
         print("--ttl must be greater than zero", file=sys.stderr)
@@ -788,6 +846,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  clients ever paired : {result['clients_ever']}")
     print(f"  clients still live  : {result['clients_active']}")
     print(f"  opened by           : {result['opened_by']}")
+    print()
+    print(
+        "If a code is already showing in the app, cancel and pair again — "
+        "requests created before this window stay pending."
+    )
     return 0
 
 

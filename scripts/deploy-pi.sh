@@ -75,6 +75,45 @@ compose() {
     ssh "$PI_HOST" "BELLASREEF_TAG=${SHA} docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} $*"
 }
 
+# New-owner bootstrap (spec 2026-08-15): if nobody has ever paired, every
+# deploy rotates and prints the setup code as its final output — harmless
+# before the first pair, impossible after it. Reuses the same direct-curl
+# mechanism the auth-leg check below uses (PI_HOST:API_PORT, not an
+# ssh+localhost hop), so there is exactly one way this script asks the hub
+# about itself. Retried briefly rather than asked once: called from the
+# --no-verify path too (factory-reset-pi.sh drives that one), right after
+# `up -d --wait`, before uvicorn has necessarily accepted its first
+# connection — api has no compose healthcheck for --wait to key off.
+print_setup_code_if_open() {
+    local deadline body setup_mode
+    deadline=$(($(date +%s) + 20))
+    body=""
+    while :; do
+        body="$(curl -sS --max-time 10 "http://${PI_HOST}:${API_PORT}/api/v1/info" 2>/dev/null || true)"
+        [[ -n "$body" ]] && break
+        [[ "$(date +%s)" -ge $deadline ]] && break
+        sleep 2
+    done
+    # [a-z]* rather than \(true\|false\): \| alternation is a GNU sed
+    # extension. This runs on this Mac's BSD /usr/bin/sed, where \| is
+    # literal and the GNU form matches nothing — verified against both
+    # true and false bodies (see the fix report in the sdd task file).
+    if [[ -z "$body" ]]; then
+        # Silence here used to mean the operator was simply never told a code
+        # existed. Whether this hub is in setup mode is now unknown, and
+        # unknown is worth a line: a new owner with no code has no way in
+        # short of finding this out for themselves.
+        warn "hub /info did not answer in time; if this hub is in setup mode, run \`bellasreef setup-code\` on it manually"
+        return 0
+    fi
+    setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$body")"
+    if [[ "$setup_mode" == "true" ]]; then
+        echo
+        compose "exec -T api bellasreef setup-code" \
+            || warn "could not read the setup code from ${PI_HOST} — check manually with 'docker compose exec -T api bellasreef setup-code'"
+    fi
+}
+
 # ---------------------------------------------------------------- preconditions
 
 step "checking the tree is deployable"
@@ -272,6 +311,7 @@ done
 
 if [[ $VERIFY -eq 0 ]]; then
     printf '\033[33mdeploy: skipping wire verification at your request\033[0m\n'
+    print_setup_code_if_open
     exit 0
 fi
 
@@ -348,5 +388,10 @@ if [[ $FOUND -eq 0 ]]; then
 fi
 
 latest="$(sed -n 's/.*"values":\[\([^,]*\).*/\1/p' <<<"$body" | tail -1)"
+
 printf '\033[32m✓ deployed %s — API answering at contracts %s, fresh sample on the wire (%s)\033[0m\n' \
     "${SHA:0:8}" "$CONTRACTS" "${latest:-ok}"
+
+# Spec: "the setup code ... as the final output of the deploy." Truly last,
+# below the banner above — not before it.
+print_setup_code_if_open

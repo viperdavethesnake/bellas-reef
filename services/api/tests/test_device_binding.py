@@ -45,11 +45,25 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 
 
 class Audit:
-    def __init__(self) -> None:
-        self.events: list[str] = []
+    """Captures the whole call, category included.
 
-    async def __call__(self, event: str, detail: dict[str, Any]) -> None:
-        self.events.append(event)
+    The category used to be accepted and dropped, so a device event that lost
+    its ``category="config"`` — and landed in the auth trail — passed here.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict[str, Any], str]] = []
+
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = "auth") -> None:
+        self.records.append((event, detail, category))
+
+    @property
+    def events(self) -> list[str]:
+        return [e for e, _, _ in self.records]
+
+    def category(self, event: str) -> str:
+        """The category the first occurrence of ``event`` was filed under."""
+        return next(c for e, _, c in self.records if e == event)
 
 
 async def fresh_engine() -> AsyncEngine:
@@ -796,7 +810,7 @@ def test_unbinding_publishes_the_tombstone_and_audits_it(
     RecordingPublisher.published = []
     monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
 
-    async def scenario() -> list[str]:
+    async def scenario() -> tuple[list[str], str, str]:
         engine = await fresh_engine()
         await announce(engine, "pi-pwm", "0")
         audit = Audit()
@@ -805,15 +819,21 @@ def test_unbinding_publishes_the_tombstone_and_audits_it(
             await bind_light(c, headers, "led-blue", "0")
             response = await c.delete("/api/v1/devices/led-blue", headers=headers)
             assert response.status_code == 204, response.text
-            return audit.events
+            return audit.events, audit.category("device.bound"), audit.category("device.unbound")
         finally:
             await c.aclose()
             await engine.dispose()
 
-    events = run(scenario)
+    events, bound_category, unbound_category = run(scenario)
     # Pairing and minting a token go through the same sink; only the device
     # events are this test's business.
     assert [e for e in events if e.startswith("device.")] == ["device.bound", "device.unbound"]
+
+    # A device change is config, not auth, and the category is what decides
+    # which subject it is published on. Asserted once for this area rather than
+    # on every event — the sink used to drop it, so nothing checked it at all.
+    assert bound_category == "config"
+    assert unbound_category == "config"
 
     assert [(a.device_id, a.adopted) for a in RecordingPublisher.published] == [
         ("led-blue", True),
@@ -859,3 +879,243 @@ def test_unbinding_needs_a_bearer() -> None:
             await engine.dispose()
 
     assert run(scenario) == 401
+
+
+# --------------------------------------------------- detached-device lifecycle
+
+
+def test_device_view_reports_adopted() -> None:
+    """A freshly bound device shows `adopted: true`."""
+
+    async def scenario() -> list[dict[str, Any]]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            body: list[dict[str, Any]] = (await c.get("/api/v1/devices", headers=headers)).json()
+            return body
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    devices = run(scenario)
+    assert devices, "the fixture bound at least one device"
+    assert all(d["adopted"] is True for d in devices)
+
+
+def test_unbound_device_is_listed_detached() -> None:
+    """Unbinding no longer makes a device vanish from the list — it detaches."""
+
+    async def scenario() -> dict[str, Any]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            return await get_device(c, headers, "pi-pwm-0")
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    row = run(scenario)
+    assert row["adopted"] is False
+    assert row["channel"] is None
+
+
+def test_readopt_restores_the_binding() -> None:
+    async def scenario() -> tuple[int, dict[str, Any]]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            r = await c.post("/api/v1/devices/pi-pwm-0/readopt", headers=headers)
+            return r.status_code, r.json()
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    code, body = run(scenario)
+    assert code == 200
+    assert body["adopted"] is True
+    assert body["channel"] == "0", "the same channel as before, from the remembered binding"
+
+
+def test_readopt_publishes_the_assignment_and_audits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-adoption re-publishes the retained subject and audits `config`.
+
+    Mirrors `test_unbinding_publishes_the_tombstone_and_audits_it`: a
+    hardware-io that was offline for the readopt must still be able to build
+    the driver from the retained last value on the device's subject.
+    """
+    RecordingPublisher.published = []
+    monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
+
+    async def scenario() -> list[str]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        audit = Audit()
+        c, headers = await client_for(engine, audit=audit, nats_url="nats://127.0.0.1:4222")
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            response = await c.post("/api/v1/devices/pi-pwm-0/readopt", headers=headers)
+            assert response.status_code == 200, response.text
+            return audit.events
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    events = run(scenario)
+    assert [e for e in events if e.startswith("device.")] == [
+        "device.bound",
+        "device.unbound",
+        "device.bound",
+    ]
+    assert [(a.device_id, a.adopted) for a in RecordingPublisher.published] == [
+        ("pi-pwm-0", True),
+        ("pi-pwm-0", False),
+        ("pi-pwm-0", True),
+    ]
+
+
+def test_readopt_refuses_a_device_that_was_never_bound() -> None:
+    """`NOT adopted` alone is not `detached` — a registered-but-unbound probe
+    has no remembered channel to reattach, and the devices CHECK constraint
+    (0013) refuses `adopted = true` without both `driver_type` and `binding`
+    set. `Store.readopt_device` must filter this out itself rather than let
+    that constraint violation surface as a 500 from the UPDATE.
+    """
+
+    async def scenario() -> dict[str, Any] | None:
+        engine = await fresh_engine()
+        store = Store(engine)
+        await store.upsert_sensor(
+            device_id="probe-1",
+            driver_id="ds18b20",
+            sensor_type="temp",
+            poll_interval_s=5.0,
+            transport="local",
+        )
+        try:
+            return await store.readopt_device("probe-1")
+        finally:
+            await engine.dispose()
+
+    assert run(scenario) is None
+
+
+def test_readopt_unknown_device_is_404() -> None:
+    async def scenario() -> int:
+        engine = await fresh_engine()
+        c, headers = await client_for(engine)
+        try:
+            r = await c.post("/api/v1/devices/no-such-device/readopt", headers=headers)
+            return r.status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    assert run(scenario) == 404
+
+
+def test_readopt_conflicts_when_channel_taken() -> None:
+    """A genuine channel conflict is unreachable through this store — pinned.
+
+    `Store.bind_device` matches an existing row on ``(driver_type, channel)``
+    regardless of ``adopted`` (see its docstring, and
+    `test_unbinding_frees_the_channel_to_be_bound_again` above, which already
+    pins the same finding for the plain bind endpoint). So binding a "new"
+    device onto pi-pwm-0's freed channel does not create a *second*, competing
+    row for `readopt_device`'s holder check to catch — it resurrects and
+    re-adopts pi-pwm-0's own row, discarding the proposed id. There is no
+    sequence through the public API that leaves one row detached and a
+    *different* row adopted on the same (driver_type, channel) pair at once.
+
+    `ChannelHeldError` stays in `readopt_device` anyway, as a guard against a
+    future change to `bind_device`'s matching rather than a path reachable
+    today (task-3 brief's own NOTE anticipates exactly this).  What this test
+    pins instead: the "competing" bind succeeds (200) and lands back on
+    pi-pwm-0 — not on the proposed id — and a subsequent explicit readopt on
+    that now-already-adopted row 404s, because it is no longer detached.
+    """
+
+    async def scenario() -> tuple[int, dict[str, Any], int]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            resurrect = await bind_light(c, headers, "led-red", "0")
+            again = await c.post("/api/v1/devices/pi-pwm-0/readopt", headers=headers)
+            return resurrect.status_code, resurrect.json(), again.status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    resurrect_code, resurrect_body, readopt_code = run(scenario)
+    assert resurrect_code == 200
+    assert resurrect_body["device_id"] == "pi-pwm-0", "the old row, not the proposed led-red"
+    assert readopt_code == 404, "already adopted (via the resurrection above), not detached"
+
+
+def test_forget_deletes_only_detached() -> None:
+    async def scenario() -> tuple[int, int, list[dict[str, Any]], int]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            still_bound = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            forgotten = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            devices = (await c.get("/api/v1/devices", headers=headers)).json()
+            again = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            return still_bound.status_code, forgotten.status_code, devices, again.status_code
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    still_bound, forgotten, devices, again = run(scenario)
+    assert still_bound == 409, "still bound"
+    assert forgotten == 204
+    assert all(d["device_id"] != "pi-pwm-0" for d in devices)
+    assert again == 404
+
+
+def test_forget_audits_and_publishes_no_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached device holds no channel claim to retract — no publish."""
+    RecordingPublisher.published = []
+    monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
+
+    async def scenario() -> list[str]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        audit = Audit()
+        c, headers = await client_for(engine, audit=audit, nats_url="nats://127.0.0.1:4222")
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            response = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            assert response.status_code == 204, response.text
+            return audit.events
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    events = run(scenario)
+    assert [e for e in events if e.startswith("device.")] == [
+        "device.bound",
+        "device.unbound",
+        "device.forgotten",
+    ]
+    # Bound, then unbound: no third publish for the forget.
+    assert len(RecordingPublisher.published) == 2

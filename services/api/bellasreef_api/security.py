@@ -30,11 +30,16 @@ import jwt
 __all__ = [
     "ACCESS_TOKEN_TTL_S",
     "REFRESH_TOKEN_BYTES",
+    "SETUP_ALPHABET",
     "TokenError",
+    "format_setup_code",
     "hash_refresh_token",
+    "hash_setup_code",
     "issue_access_token",
     "new_refresh_token",
+    "new_setup_code",
     "new_signing_secret",
+    "normalize_setup_code",
     "verify_access_token",
 ]
 
@@ -88,6 +93,44 @@ def issue_access_token(
         "exp": int(expires.timestamp()),
     }
     return jwt.encode(payload, secret, algorithm=_ALGORITHM), ttl_s
+
+
+#: Spec 2026-08-15 (Feature 1, "Semantics"): "8 characters from a
+#: confusable-free alphabet (Crockford base32 minus 0/O/1/I)". Crockford's
+#: own 32-symbol alphabet already excludes I, L, O, U; "minus 0/O/1/I" on
+#: top of that removes 0 and 1 (O and I are already gone), leaving 30
+#: characters, not 32 minus 4. Implemented per the spec's literal words
+#: rather than reasoning about what a "clean" confusable-free set would be.
+SETUP_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ".translate(str.maketrans("", "", "0OI1"))
+
+
+def new_setup_code() -> str:
+    """8 chars, ~40 bits (log2(30**8) ~= 39.5). Returned once; only the hash
+    is stored, so a lost code is answered by rotating (:func:`hash_setup_code`
+    + :meth:`Store.set_setup_code_hash`), not by reprinting."""
+    return "".join(secrets.choice(SETUP_ALPHABET) for _ in range(8))
+
+
+def format_setup_code(code: str) -> str:
+    """Grouped for display: ``7KF2-9QMD``. The dash is cosmetic — see
+    :func:`normalize_setup_code`, which is what entry actually validates
+    against."""
+    return f"{code[:4]}-{code[4:]}"
+
+
+def normalize_setup_code(entry: str) -> str:
+    """Case-insensitive; the grouping dash is cosmetic and ignored (spec)."""
+    return entry.replace("-", "").strip().upper()
+
+
+def hash_setup_code(code: str) -> str:
+    """Same construction as :func:`hash_refresh_token`: plain SHA-256 hex,
+    no salt, no KDF — over the *normalized* code so ``7kf2-9qmd`` and
+    ``7KF29QMD`` hash identically. Stored in ``hub_identity.setup_code_hash``;
+    "I forgot" is answered by rotating (mint a new code, overwrite the hash),
+    never by reprinting, so there is no plaintext anywhere to reprint from.
+    """
+    return hashlib.sha256(normalize_setup_code(code).encode()).hexdigest()
 
 
 def verify_access_token(token: str, secret: str) -> UUID:

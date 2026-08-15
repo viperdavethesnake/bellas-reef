@@ -24,13 +24,15 @@ token buys, and it is the whole reason the pairing code needs no rate limiter.
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+import secrets
+from collections import deque
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
 from time import monotonic
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import DeviceAssignment
@@ -57,10 +59,11 @@ from bellasreef_api.registry import AssignmentPublisher, CapabilityConsumer, Reg
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
+    hash_setup_code,
     issue_access_token,
     verify_access_token,
 )
-from bellasreef_api.store import PAIRING_TTL_S, Store
+from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, Store
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 from bellasreef_api.telemetry import TelemetryWriter
 
@@ -90,11 +93,21 @@ AUTH_401: Final[dict[str, str]] = {
 #: telemetry this is one extra query per client per ten seconds.
 STREAM_REVOKE_RECHECK_S: Final = 10.0
 
-#: Every auth event goes here, per auth.md §3 and the existing audit contract.
-AuditSink = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+class AuditSink(Protocol):
+    """Every audit event goes through one of these, per auth.md §3.
+
+    ``category`` defaults to ``"auth"`` — a plain ``Callable`` type alias
+    cannot express an optional trailing parameter, and most call sites
+    (pairing, tokens, revocation) are content with the default. Device
+    lifecycle and override sites pass ``category`` explicitly; see the
+    call-site mapping fixed in :mod:`bellasreef_api.audit`.
+    """
+
+    async def __call__(self, event: str, detail: dict[str, Any], category: str = ...) -> None: ...
 
 
-async def _noop_audit(event: str, detail: dict[str, Any]) -> None:
+async def _noop_audit(event: str, detail: dict[str, Any], category: str = "auth") -> None:
     log.warning("auth event not audited: no sink configured", extra={"event": event})
 
 
@@ -118,6 +131,13 @@ class Info(BaseModel):
     #: "an already-paired device will need to approve this one" at a person who
     #: has no such device, and they wait for something that can never arrive.
     approvers_available: bool
+    #: True until the first client has ever paired, by any method (spec
+    #: 2026-08-15, Feature 1). Drives the app's connect screen: while this is
+    #: true the client offers a setup-code entry field instead of the
+    #: request-and-wait flow. Derived from ``Store.setup_state()`` rather than
+    #: from ``pairing_open`` above — the two answer different questions and a
+    #: hub can (briefly) have one true and not the other.
+    setup_mode: bool
 
 
 class HistoryBucket(BaseModel):
@@ -204,6 +224,9 @@ class AuditEvent(BaseModel):
     subject: str
     device_id: str | None
     event: dict[str, Any]
+    #: The event name from the payload ("device.unbound", "pair.window_used"),
+    #: promoted to a typed field so clients render verbs, not subjects.
+    action: str | None
 
 
 class CapabilityView(BaseModel):
@@ -316,6 +339,10 @@ class DeviceView(BaseModel):
     #: lights are otherwise indistinguishable except by name (David's ruling
     #: 2026-08-13). Additive and optional — no existing client breaks.
     channel: str | None = None
+
+    #: False for a detached row: unbound, channel released, history kept.
+    #: Clients section on this, not on channel being null.
+    adopted: bool
 
     @property
     def name(self) -> str:
@@ -447,6 +474,9 @@ class AlertsView(BaseModel):
 class PairRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     client_name: str = Field(min_length=1, max_length=128)
+    #: Setup-mode bootstrap (spec 2026-08-15). Non-null outside setup mode is
+    #: an error, never ignored.
+    setup_code: str | None = Field(default=None, max_length=16)
 
 
 class PairGranted(BaseModel):
@@ -542,6 +572,43 @@ class _PendingTokens:
 
     def take(self, request_id: UUID) -> tuple[UUID, str] | None:
         return self.tokens.pop(request_id, None)
+
+
+class _SetupThrottle:
+    """10 failed setup-code attempts per rolling minute, globally.
+
+    Module-level and in-process by ruling (spec 2026-08-15, Feature 1,
+    "Throttling"): "a restart resetting the throttle is acceptable at this
+    threat model." No database table, no counters that outlive the process —
+    this is a hobbyist reef controller on a home LAN, not an enterprise
+    product guarding against a patient adversary. A restart or a redeploy
+    simply reopens the ten-per-minute budget, which is fine here.
+
+    Deliberately module-level rather than per-app-instance: the whole point
+    is one shared budget across every ``POST /pair`` call this process
+    serves, the same way there is one hub. A counter scoped to `build_app`
+    would reset on nothing that actually threatens the intended limit.
+    """
+
+    def __init__(self, limit: int = 10, window_s: float = 60.0) -> None:
+        self._failures: deque[float] = deque()
+        self._limit = limit
+        self._window_s = window_s
+
+    def retry_after(self, now: float) -> int | None:
+        """Seconds until another attempt is allowed, or ``None`` if one is."""
+        while self._failures and now - self._failures[0] > self._window_s:
+            self._failures.popleft()
+        if len(self._failures) < self._limit:
+            return None
+        return int(self._window_s - (now - self._failures[0])) + 1
+
+    def record_failure(self, now: float) -> None:
+        self._failures.append(now)
+
+
+#: One throttle for the process, per the docstring above.
+_setup_throttle: Final = _SetupThrottle()
 
 
 # ------------------------------------------------------------------------ app
@@ -755,6 +822,7 @@ def build_app(
         version strings, and whether pairing is open.
         """
         total = await store.total_clients_ever()
+        _, completed_at = await store.setup_state()
         return Info(
             name="Bella's Reef",
             api_version=API_VERSION,
@@ -762,6 +830,7 @@ def build_app(
             paired_client_count=total,
             pairing_open=total == 0,
             approvers_available=await store.active_client_count() > 0,
+            setup_mode=completed_at is None,
         )
 
     # ------------------------------------------------------------------ pairing
@@ -780,10 +849,29 @@ def build_app(
             202: {"model": PairPending, "description": "Awaiting approval; poll."},
             403: {"description": "Nobody can approve; run `bellasreef pair`."},
             409: {"description": "The recovery window was spent by another client."},
+            422: {
+                "description": "A setup code was missing/wrong in setup mode, or supplied "
+                "outside setup mode. Never silently ignored."
+            },
+            429: {"description": "Too many failed setup-code attempts. See Retry-After."},
         },
     )
     async def pair(body: PairRequest, response: Response) -> PairGranted | PairPending:
-        """Pair a client. Four outcomes, in this order.
+        """Pair a client.
+
+        A setup code, if present, is resolved first (spec 2026-08-15,
+        Feature 1): valid in setup mode grants immediately; anything else
+        about it is a 422, never a pending request nor a silent ignore — see
+        the checks at the top of the body.
+
+        Absent a setup code, an open recovery window is consulted next —
+        `bellasreef pair` is a fire escape and must keep working even while
+        setup is incomplete and a code has been minted (review ruling,
+        2026-08-15: the spec's "window flow... still works during setup
+        mode" wins over blind TOFU yielding to a minted code). Only once no
+        window is open does a minted-but-unsupplied code become a rejection.
+
+        The remaining outcomes then follow, in this order:
 
         1. No client has ever paired -> TOFU grant, and the window shuts.
         2. A recovery window is open -> grant and spend it.
@@ -795,20 +883,56 @@ def build_app(
 
         Outcome 2 has a fifth ending: losing the race for the window is a 409.
         """
-        total = await store.total_clients_ever()
+        code_hash, completed_at = await store.setup_state()
+        in_setup = completed_at is None
 
-        if total == 0:
+        if body.setup_code is not None:
+            if not in_setup:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "This hub is already set up. Pair from an already-paired device, "
+                    "or run `bellasreef pair` on the hub.",
+                )
+            if (after := _setup_throttle.retry_after(monotonic())) is not None:
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "Too many attempts - wait a minute.",
+                    headers={"Retry-After": str(after)},
+                )
+            # compare_digest, not `!=`: the comparison is over a hash rather
+            # than the code itself, but a hub answers this endpoint
+            # unauthenticated and there is no reason to leak the shape of the
+            # miss in the response time.
+            if code_hash is None or not secrets.compare_digest(
+                hash_setup_code(body.setup_code), code_hash
+            ):
+                _setup_throttle.record_failure(monotonic())
+                await sink("pair.code_rejected", {"client_name": body.client_name})
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "That setup code is not right. It is on the deploy output on the "
+                    "hub; dashes and case do not matter.",
+                )
+            # Valid: grant exactly as the TOFU/window paths do below (same
+            # store call, not a second way to mint a client+token). House
+            # naming (parallel to pair.tofu_granted/pair.window_used/
+            # pair.approved) rather than the spec's illustrative
+            # `client.paired` — one audit event per grant, not a second event
+            # name layered on top of it.
             client_id, token = await store.create_client(body.client_name)
+            await store.complete_setup()
             await sink(
-                "pair.tofu_granted",
-                {"client_id": str(client_id), "client_name": body.client_name},
-            )
-            log.warning(
-                "TOFU window used and now closed",
-                extra={"client_id": str(client_id), "event": "pair_tofu"},
+                "pair.code_granted",
+                {
+                    "client_id": str(client_id),
+                    "client_name": body.client_name,
+                    "method": "setup_code",
+                },
             )
             return PairGranted(refresh_token=token, client_id=client_id)
 
+        # Code-less path. A recovery window, if one is open, is consulted
+        # before the setup-code gate below — see the docstring.
         window_id = await store.open_window()
         if window_id is not None:
             client_id, token = await store.create_client(body.client_name)
@@ -833,17 +957,55 @@ def build_app(
                     "the recovery pairing window was spent by another client. Run "
                     "`bellasreef pair` on the hub to open another.",
                 )
+            await store.complete_setup()
             await sink(
                 "pair.window_used",
                 {
                     "window_id": str(window_id),
                     "client_id": str(client_id),
                     "client_name": body.client_name,
+                    "method": "window",
                 },
             )
             log.warning(
                 "recovery pairing window used and now spent",
                 extra={"window_id": str(window_id), "client_id": str(client_id)},
+            )
+            return PairGranted(refresh_token=token, client_id=client_id)
+
+        if in_setup and code_hash is not None:
+            # A code has been minted and no window is open; blind TOFU
+            # yields to the code. Spec: a missing code in setup mode is an
+            # explicit rejection, not a pending request — there is nobody
+            # yet to approve it.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This hub is in setup. Enter the setup code from the deploy output.",
+            )
+
+        total = await store.total_clients_ever()
+
+        if total == 0:
+            # Blind TOFU: reachable only when no setup code was ever minted
+            # (the check above), so a hub deployed without the new deploy
+            # step still bootstraps exactly as before.
+            client_id, token = await store.create_client(body.client_name)
+            await store.complete_setup()
+            await sink(
+                "pair.tofu_granted",
+                {
+                    "client_id": str(client_id),
+                    "client_name": body.client_name,
+                    # Not one of the spec's three method values
+                    # ("setup_code" | "window" | "approval") — a recorded
+                    # amendment (review ruling, 2026-08-15) rather than a
+                    # fourth duplicate audit row per pairing.
+                    "method": "tofu",
+                },
+            )
+            log.warning(
+                "TOFU window used and now closed",
+                extra={"client_id": str(client_id), "event": "pair_tofu"},
             )
             return PairGranted(refresh_token=token, client_id=client_id)
 
@@ -924,12 +1086,14 @@ def build_app(
             raise HTTPException(status.HTTP_409_CONFLICT, "pairing request is not pending")
         client_id, token = result
         pending.put(request_id, client_id, token)
+        await store.complete_setup()
         await sink(
             "pair.approved",
             {
                 "request_id": str(request_id),
                 "client_id": str(client_id),
                 "approved_by": str(approver),
+                "method": "approval",
             },
         )
 
@@ -1234,6 +1398,7 @@ def build_app(
                 "channel": body.channel,
                 "created": created,
             },
+            category="config",
         )
         return BoundDevice(
             device_id=device_id,
@@ -1284,7 +1449,11 @@ def build_app(
         row = await store.set_display_name(device_id, body.display_name)
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
-        await sink("device.renamed", {"device_id": device_id, "display_name": body.display_name})
+        await sink(
+            "device.renamed",
+            {"device_id": device_id, "display_name": body.display_name},
+            category="config",
+        )
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
 
     @app.delete(
@@ -1356,7 +1525,111 @@ def build_app(
                 "driver_type": row["driver_type"],
                 "binding": row["binding"],
             },
+            category="config",
         )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/v1/devices/{device_id}/readopt",
+        response_model=DeviceView,
+        tags=["hardware"],
+        operation_id="readoptDevice",
+        responses={
+            200: {"description": "Re-adopted onto the channel its row remembers."},
+            401: AUTH_401,
+            404: {"description": "No such device, or it is not detached."},
+            409: {"description": "Its channel is now held by another adopted device."},
+        },
+    )
+    async def readopt_device(
+        device_id: str,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> DeviceView:
+        """Reattach a detached device to the channel its row still remembers.
+
+        The Detached section's "re-add" (ruled 2026-08-15). `unbind_device`
+        keeps the row and its binding on purpose, and this is what makes that
+        worth doing rather than merely quiet: the operator gets the *same*
+        device back — name, thresholds and history intact — instead of
+        re-binding through `bindDevice` and hoping the proposed id is the one
+        that lands (it is not always; see `bind_device`'s matching note).
+        """
+        try:
+            row = await store.readopt_device(device_id)
+        except ChannelHeldError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{device_id!r}'s channel is now held by {exc.holder!r}. Unbind it first.",
+            ) from exc
+        if row is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"no detached device {device_id!r}. It is unknown, or already adopted.",
+            )
+
+        # Same tombstone shape as unbind_device, adopted=True this time: the
+        # retained last value on this subject is what lets a hardware-io that
+        # was offline for the readopt still build the driver on its next start.
+        if assignments is not None:
+            await assignments.publish(
+                DeviceAssignment(
+                    message_id=uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="api",
+                    device_id=row["device_id"],
+                    adopted=True,
+                    role=row["role"],
+                    driver_type=row["driver_type"],
+                    binding=row["binding"],
+                )
+            )
+
+        await sink(
+            "device.bound",
+            {"device_id": device_id, "readopt": True},
+            category="config",
+        )
+        full = next(d for d in await store.list_devices() if d["device_id"] == device_id)
+        return DeviceView.model_validate(full)
+
+    @app.post(
+        "/api/v1/devices/{device_id}/forget",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        tags=["hardware"],
+        operation_id="forgetDevice",
+        responses={
+            204: {"description": "Deleted. Identity and settings are gone."},
+            401: AUTH_401,
+            404: {"description": "No such device."},
+            409: {"description": "Still adopted. Unbind it first."},
+        },
+    )
+    async def forget_device(
+        device_id: str,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> Response:
+        """Delete a detached device row for good.
+
+        The Detached section's "clear" (ruled 2026-08-15). `unbind_device`'s
+        docstring explains why deletion is normally the wrong move: it severs
+        history from hardware that might come back. This endpoint is the
+        operator overruling that on purpose — the hardware is gone, and the
+        name should stop appearing. Telemetry already written keeps its
+        device_id; nothing here rewrites history.
+
+        No assignment publish: a detached device holds no channel claim to
+        retract, and `unbind_device`'s tombstone already recorded the release.
+        """
+        outcome = await store.forget_device(device_id)
+        if outcome == "missing":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no device {device_id!r}.")
+        if outcome == "adopted":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{device_id!r} is adopted. Unbind it first.",
+            )
+        await sink("device.forgotten", {"device_id": device_id}, category="config")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get(
@@ -1378,18 +1651,22 @@ def build_app(
         makes "the event was recorded" checkable from outside the hub — which is
         how the writer's absence stayed invisible for as long as it did.
         """
-        return [
-            AuditEvent(
-                message_id=str(row["message_id"]),
-                occurred_at=row["occurred_at"],
-                category=row["category"],
-                actor=row["actor"],
-                subject=row["subject"],
-                device_id=row["device_id"],
-                event=row["event"] if isinstance(row["event"], dict) else json.loads(row["event"]),
+        events = []
+        for row in await store.recent_audit(limit=limit, category=category):
+            payload = row["event"] if isinstance(row["event"], dict) else json.loads(row["event"])
+            events.append(
+                AuditEvent(
+                    message_id=str(row["message_id"]),
+                    occurred_at=row["occurred_at"],
+                    category=row["category"],
+                    actor=row["actor"],
+                    subject=row["subject"],
+                    device_id=row["device_id"],
+                    event=payload,
+                    action=(payload or {}).get("event"),
+                )
             )
-            for row in await store.recent_audit(limit=limit, category=category)
-        ]
+        return events
 
     @app.get(
         "/api/v1/history",
@@ -1548,6 +1825,7 @@ def build_app(
                 "maximum": body.maximum,
                 "clear_margin": body.clear_margin,
             },
+            category="config",
         )
         return AlertThresholdsView(
             device_id=row["device_id"],
@@ -1652,6 +1930,7 @@ def build_app(
                 "expires_at": placed.expires_at.isoformat(),
                 "actor": str(actor),
             },
+            category="command",
         )
         return OverrideView(
             id=placed.id,
@@ -1678,6 +1957,7 @@ def build_app(
         await sink(
             "override.released",
             {"override_id": str(override_id), "actor": str(actor)},
+            category="command",
         )
         return {"status": "released"}
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from bellasreef_api.security import hash_refresh_token, new_refresh_token, new_signing_secret
 
-__all__ = ["ClientRow", "PairingOutcome", "Store"]
+__all__ = ["ChannelHeldError", "ClientRow", "PairingOutcome", "Store"]
 
 #: auth.md §2: a pairing request lives 5 minutes.
 PAIRING_TTL_S = 300
@@ -50,6 +50,15 @@ class ClientRow:
     created_at: datetime
     last_seen_at: datetime | None
     revoked_at: datetime | None
+
+
+class ChannelHeldError(Exception):
+    """Raised by :meth:`Store.readopt_device` when the row's remembered
+    channel is now claimed by a different adopted device."""
+
+    def __init__(self, holder: str) -> None:
+        self.holder = holder
+        super().__init__(f"channel now held by {holder!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +134,50 @@ class Store:
             )
             winner = (await conn.execute(text("SELECT id FROM hub_identity"))).first()
             return UUID(str(winner[0])) if winner is not None else hub
+
+    # --------------------------------------------------------------- setup
+
+    async def setup_state(self) -> tuple[str | None, datetime | None]:
+        """``(setup_code_hash, setup_completed_at)`` off the singleton row.
+
+        Both start NULL. Setup mode, per the spec, is exactly
+        ``setup_completed_at IS NULL`` — callers derive that from the second
+        element rather than this method deciding it, so there is one place
+        (the caller) that owns "what does setup mode mean," not two.
+        """
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT setup_code_hash, setup_completed_at FROM hub_identity")
+                )
+            ).first()
+            return (row[0], row[1]) if row else (None, None)
+
+    async def set_setup_code_hash(self, code_hash: str) -> None:
+        """Mint: exactly one code is valid at a time, so this overwrites
+        rather than appends — the old hash simply stops matching anything."""
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE hub_identity SET setup_code_hash = :h"), {"h": code_hash}
+            )
+
+    async def complete_setup(self) -> None:
+        """First successful pair, by any method. Never unset afterwards.
+
+        ``WHERE setup_completed_at IS NULL`` is what makes "never unset" true
+        rather than aspirational: a second call is a no-op, so revoking every
+        client later and pairing again cannot move the timestamp and
+        therefore cannot re-open setup mode. Also clears any live setup-code
+        hash — once a hub is set up, that code has no further use and must
+        not still verify.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE hub_identity SET setup_completed_at = now(), setup_code_hash = NULL "
+                    "WHERE setup_completed_at IS NULL"
+                )
+            )
 
     # ------------------------------------------------------------ capabilities
 
@@ -398,6 +451,114 @@ class Store:
             first = row.first()
             return dict(first) if first is not None else None
 
+    async def readopt_device(self, device_id: str) -> dict[str, Any] | None:
+        """Re-adopt a detached device onto the channel its row remembers.
+
+        The inverse of :meth:`unadopt_device`, with the same soft philosophy:
+        the row never moved, so identity and history reattach by construction.
+
+        The holder check copies :meth:`bind_device`'s own matching predicate —
+        ``driver_type`` plus ``COALESCE(binding ->> 'channel', binding ->>
+        'rom')`` — rather than inventing a second opinion about what "the same
+        channel" means. Note that predicate is what makes a genuine conflict
+        here hard to hit in practice: `bind_device` matches on the same key
+        regardless of `adopted`, so a channel this row remembers is not
+        available for a *different* row to claim while this one still exists.
+        The check stays anyway, as the one guard that can never be bypassed by
+        a caller who assumes it is unreachable.
+
+        ``driver_type IS NOT NULL AND binding IS NOT NULL`` excludes a device
+        that was announced but never bound — a sensor `upsert_sensor` just
+        registered, say. Such a row is also ``NOT adopted``, but it is not
+        *detached*: it has no remembered channel to reattach, and the devices
+        CHECK constraint (0013) already refuses ``adopted = true`` without
+        both columns set. Filtering here turns that into a clean 404 instead
+        of a raised constraint violation from the UPDATE below.
+        """
+        async with self._engine.begin() as conn:
+            target = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT device_id, kind, role, driver_type, binding FROM devices "
+                            " WHERE device_id = :device_id AND NOT adopted "
+                            "   AND driver_type IS NOT NULL AND binding IS NOT NULL"
+                        ),
+                        {"device_id": device_id},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if target is None:
+                return None
+
+            channel = None
+            if target["binding"] is not None:
+                channel = target["binding"].get("channel") or target["binding"].get("rom")
+
+            holder = (
+                await conn.execute(
+                    text(
+                        "SELECT device_id FROM devices "
+                        " WHERE driver_type = :driver_type "
+                        "   AND COALESCE(binding ->> 'channel', binding ->> 'rom') = :channel "
+                        "   AND adopted AND device_id <> :device_id"
+                    ),
+                    {
+                        "driver_type": target["driver_type"],
+                        "channel": channel,
+                        "device_id": device_id,
+                    },
+                )
+            ).first()
+            if holder is not None:
+                raise ChannelHeldError(str(holder[0]))
+
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE devices SET adopted = true "
+                            " WHERE device_id = :device_id "
+                            " RETURNING device_id, kind, role, driver_type, binding"
+                        ),
+                        {"device_id": device_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            return dict(row)
+
+    async def forget_device(self, device_id: str) -> Literal["forgotten", "adopted", "missing"]:
+        """Hard delete a detached device row. Returns the outcome, not a bool.
+
+        The one sanctioned identity break in this file. Everywhere else
+        "delete" means soft — see :meth:`unadopt_device` — because dropping a
+        row severs telemetry, thresholds and alert history from the hardware
+        that produced them. This method means it literally, and is gated on
+        ``NOT adopted`` so an operator can never delete history out from under
+        a channel that is still claimed; they must unbind first, which is the
+        409 this returns "adopted" for.
+        """
+        async with self._engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT adopted FROM devices WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            ).first()
+            if row is None:
+                return "missing"
+            if row[0]:
+                return "adopted"
+            await conn.execute(
+                text("DELETE FROM devices WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+            return "forgotten"
+
     async def adopted_assignments(self) -> list[dict[str, Any]]:
         """Every device an operator has claimed, for republishing on startup.
 
@@ -571,6 +732,12 @@ class Store:
             "poll_interval_s, actuator_class, role, control_authority, "
             "failsafe_capable, transport, safe_state, max_runtime_s, "
             "heartbeat_timeout_s, enabled, alert_min, alert_max, alert_clear_margin, "
+            # False for a detached row: unbound, channel released, history
+            # kept — see unadopt_device. Surfaced so a client can section on
+            # this rather than on `channel` being null, which two different
+            # states could otherwise produce (a sensor with no binding at
+            # all, and a detached actuator).
+            "adopted, "
             # Only an adopted device's channel is live. `binding` survives an
             # unadopt so re-binding recognises the same hardware (see
             # unadopt_device), so gating on `adopted` alone — not on `binding
