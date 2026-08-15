@@ -166,4 +166,28 @@ saying so and pointing here.
   pairing stays on the hub.
 - Re-entering setup mode by revoking all clients (fire-escape covers it).
 - Web UI (separate spec, 2026-08-14, held).
+
+## Amendments (2026-08-15, recorded during implementation)
+
+- (a) This spec's "the `client.paired` audit event gains a `method`
+  field" is realized as a `method` field on each existing per-path grant
+  event instead of on a single `client.paired` event: `pair.window_used`
+  (`"window"`), `pair.approved` (`"approval"`), `pair.tofu_granted`
+  (`"tofu"`), and the new `pair.code_granted` (`"setup_code"`). The repo
+  never had a single `client.paired` event to begin with, and adding one
+  alongside the existing per-path events would double the row count per
+  pairing and degrade the audit view rather than clarify it. The
+  `method` enum therefore also gains `"tofu"` for the pre-existing
+  blind-TOFU bootstrap path, which the original spec text did not name.
+- (b) The recovery window takes precedence over the setup-code gate: a
+  code-less `POST /pair` with an OPEN window is granted via the window
+  path even in setup mode with a minted code outstanding; the "enter the
+  setup code" rejection applies only when no window is open. This
+  preserves this spec's own guarantee, above, that "the window flow
+  (`bellasreef pair`) ... still work[s] during setup mode" — a minted
+  code narrows the *unauthenticated* blind-TOFU path, not the
+  operator-invoked fire escape.
+- (c) No other semantic changes. The three-outcome (grant / pending /
+  reject) `POST /pair` protocol, the throttle, and the code-rotation
+  semantics shipped as specified.
 - Persistent throttle state or per-IP tracking.
