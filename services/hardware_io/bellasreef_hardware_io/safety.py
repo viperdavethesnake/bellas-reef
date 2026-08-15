@@ -80,6 +80,18 @@ class SafetyEvent:
     at: datetime
     detail: str
 
+    #: Whether the actuator actually reached (or already was in) a safe state
+    #: as part of this event. True by default: every reason except a failed
+    #: ``drive_safe()`` on the ``shutdown`` path (start()'s and stop()'s own
+    #: except branches, the only two call sites that pass ``False``) either is
+    #: a mere refusal — nothing moved — or, for heartbeat_timeout and
+    #: max_runtime_exceeded, only ever reaches ``_emit`` *after*
+    #: ``drive_safe()`` already succeeded (see ``_drive_safe`` below: a raise
+    #: there skips the emit inside it entirely). A consumer that publishes a
+    #: "safe" state from an event must check this first, or it claims a
+    #: transition that never happened.
+    reached_safe: bool = True
+
 
 EventSink = Callable[[SafetyEvent], Awaitable[None]]
 
@@ -207,7 +219,7 @@ class InterlockSupervisor:
                 # An actuator we could not prove safe is not one we will command.
                 guard.latched = True
                 guard.latch_detail = f"failed to reach safe state at startup: {exc!r}"
-                await self._emit(guard, "shutdown", guard.latch_detail)
+                await self._emit(guard, "shutdown", guard.latch_detail, reached_safe=False)
                 failures.append(exc)
             guard.watch_task = asyncio.create_task(
                 self._watch_heartbeat(guard), name=f"hb-{guard.actuator_id}"
@@ -237,7 +249,12 @@ class InterlockSupervisor:
             try:
                 await self._drive_safe(guard, "shutdown", "supervisor stopping")
             except Exception as exc:
-                await self._emit(guard, "shutdown", f"drive_safe FAILED during shutdown: {exc!r}")
+                await self._emit(
+                    guard,
+                    "shutdown",
+                    f"drive_safe FAILED during shutdown: {exc!r}",
+                    reached_safe=False,
+                )
                 failures.append(exc)
 
         if failures:
@@ -371,13 +388,16 @@ class InterlockSupervisor:
             guard.runtime_task = None
         await self._emit(guard, reason, detail)
 
-    async def _emit(self, guard: _Guard, reason: TripReason, detail: str) -> None:
+    async def _emit(
+        self, guard: _Guard, reason: TripReason, detail: str, *, reached_safe: bool = True
+    ) -> None:
         await self._on_event(
             SafetyEvent(
                 actuator_id=guard.actuator_id,
                 reason=reason,
                 at=self._now(),
                 detail=detail,
+                reached_safe=reached_safe,
             )
         )
 
@@ -403,6 +423,14 @@ class InterlockSupervisor:
 
     def registration_of(self, actuator_id: str) -> ActuatorRegistration:
         return self._guards[actuator_id].registration
+
+    def driver_of(self, actuator_id: str) -> ActuatorDriver:
+        """Read-only access to a registered driver.
+
+        Broker-free, like every other accessor here — it exists so a spine-
+        holding caller (CommandConsumer) can ask a driver what it actually did
+        (``read_back()``) without safety.py taking any dependency on NATS."""
+        return self._guards[actuator_id].driver
 
     def is_latched(self, actuator_id: str) -> bool:
         return self._guards[actuator_id].latched

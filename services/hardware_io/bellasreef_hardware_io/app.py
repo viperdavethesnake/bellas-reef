@@ -56,6 +56,11 @@ SERVICE: Final = "hardware-io"
 #: liability in production; it exists for the restart drill and nothing else.
 FREEZE_DRILL_ENV: Final = "BELLASREEF_ENABLE_FREEZE_DRILL"
 
+#: Bounds one ActuatorState publish. Matches spine.py's own
+#: ``_PUBLISH_TIMEOUT_S`` (not shared across modules — each already carries a
+#: short module-local rationale comment where it's declared).
+_PUBLISH_TIMEOUT_S: Final = 2.0
+
 
 def clock_is_trusted() -> bool:
     """Whether the host clock can be believed.
@@ -618,21 +623,30 @@ class HardwareIO:
     async def _publish_startup_states(self) -> None:
         """Once per registered actuator, tell the wire the post-assertion truth.
 
-        ``registration.safe_state`` rather than reading anything back off the
-        driver — no driver in this codebase exposes a current-level getter
-        (docs/driver interface), and it would be redundant besides: every
-        actuator here is either freshly asserted safe by
-        ``supervisor.start()`` or freshly opened and assumed safe by
-        construction (see the call site in ``_connect_spine``), so the
-        registration's own declared safe state IS the truth right now.
+        ``registration.safe_state`` rather than a driver's ``read_back()`` —
+        unlike the applied-command path (spine.py's ``_publish_applied_state``,
+        which reads back precisely because a command's post-hardware state can
+        legitimately differ from what was asked for), nothing was just
+        commanded here: every actuator in ``self._registrations`` is either
+        freshly asserted safe by ``supervisor.start()`` or freshly opened and
+        assumed safe by construction (see the call site in
+        ``_connect_spine``), so the registration's own declared safe state IS
+        the truth right now, with no snap or hardware round-trip to reconcile.
         """
         for registration in self._registrations:
             # Non-None by construction: the supervisor refuses to register an
             # authoritative actuator without the complete safety triple
             # (safety.py's ``InterlockSupervisor.register``), and hardware-io
-            # registers authoritative actuators only.
+            # registers authoritative actuators only. Guarded rather than
+            # asserted — an assert strips under -O, and one bad registration
+            # must not stop the rest of the loop.
             safe_state = registration.safe_state
-            assert safe_state is not None
+            if safe_state is None:  # pragma: no cover - contract validator guarantees this
+                log.error(
+                    "authoritative registration missing safe_state; no startup state published",
+                    extra={"actuator_id": registration.actuator_id},
+                )
+                continue
             await self._publish_state(
                 registration.actuator_id,
                 safe_state,
@@ -649,23 +663,27 @@ class HardwareIO:
         latched: bool = False,
     ) -> None:
         """Publish one ActuatorState. Guarded exactly like ``_publish_reading``:
-        no spine means no publish, and a publish failure is logged and
-        swallowed rather than allowed to break the caller.
+        no spine means no publish, and a publish failure — including one that
+        overruns ``_PUBLISH_TIMEOUT_S`` — is logged and swallowed rather than
+        allowed to break the caller.
         """
         if self.spine is None:
             return
         try:
-            await self.spine.publish_state(
-                ActuatorState(
-                    message_id=uuid4(),
-                    emitted_at=datetime.now(UTC),
-                    source=SERVICE,
-                    actuator_id=actuator_id,
-                    level=level,
-                    reason=reason,
-                    since=datetime.now(UTC),
-                    latched=latched,
-                )
+            await asyncio.wait_for(
+                self.spine.publish_state(
+                    ActuatorState(
+                        message_id=uuid4(),
+                        emitted_at=datetime.now(UTC),
+                        source=SERVICE,
+                        actuator_id=actuator_id,
+                        level=level,
+                        reason=reason,
+                        since=datetime.now(UTC),
+                        latched=latched,
+                    )
+                ),
+                timeout=_PUBLISH_TIMEOUT_S,
             )
         except Exception:
             log.warning(
@@ -715,15 +733,47 @@ class HardwareIO:
                 "detail": event.detail,
             },
         )
-        if event.reason in self._AUTONOMOUS_TRIP_REASONS:
+        if event.reason not in self._AUTONOMOUS_TRIP_REASONS:
+            return
+
+        # This callback runs *inside* safety.py's own call stack — it is the
+        # ``on_event`` the supervisor awaits directly from _emit/_drive_safe,
+        # including from background heartbeat/runtime-deadline tasks. Nothing
+        # below this line may be allowed to raise back into it: the whole
+        # point of safety.py staying publish-blind is that a broker problem,
+        # or a bookkeeping bug here, must never be able to interrupt an
+        # interlock trip. Everything is inside one try, not just the publish.
+        try:
+            if not event.reached_safe:
+                # I2: a "shutdown" event from a drive_safe() that raised
+                # (safety.py's start()/stop() except branches) is not a
+                # transition — the actuator's real level is unknown, and
+                # publishing anything here would be a guess dressed as a
+                # measurement. Skip rather than fabricate.
+                log.warning(
+                    "safety event did not reach a safe state; no state published",
+                    extra={"actuator_id": event.actuator_id, "reason": event.reason},
+                )
+                return
             registration = self.supervisor.registration_of(event.actuator_id)
             safe_state = registration.safe_state
-            assert safe_state is not None
+            if safe_state is None:  # pragma: no cover - contract validator guarantees this
+                log.error(
+                    "authoritative registration missing safe_state; no state published",
+                    extra={"actuator_id": event.actuator_id},
+                )
+                return
             await self._publish_state(
                 event.actuator_id,
                 safe_state,
                 reason=self._TRIP_STATE_REASON[event.reason],
                 latched=self.supervisor.is_latched(event.actuator_id),
+            )
+        except Exception:
+            log.warning(
+                "failed to handle safety event for state publishing",
+                extra={"actuator_id": event.actuator_id, "reason": event.reason},
+                exc_info=True,
             )
 
     def health(self) -> Health:
