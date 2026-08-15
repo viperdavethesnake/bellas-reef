@@ -27,6 +27,7 @@ import pytest
 from bellasreef_contracts import (
     ActuatorCommand,
     ActuatorRegistration,
+    ActuatorState,
     BinaryLevel,
     SensorReading,
     subjects,
@@ -238,6 +239,45 @@ def test_fresh_command_is_applied() -> None:
     outcomes, turned_on = run(scenario)
     assert outcomes == ["applied"]
     assert turned_on
+
+
+@pytest.mark.timeout(60)
+def test_applied_command_reaches_br_state() -> None:
+    """The real-wire twin of test_actuator_state.py's fake-spine unit tests.
+
+    Before actuator-state publishing existed, BR_STATE had zero production
+    publishers — this proves the full path an applied command actually takes:
+    drain_once() -> supervisor.apply() -> ack -> publish_state() -> BR_STATE,
+    through a real JetStream, not a fake.
+    """
+
+    async def scenario() -> ActuatorState:
+        spine = await fresh_spine()
+        supervisor = InterlockSupervisor(on_event=Recorder())
+        actuator = FakeActuator("ato-pump", OFF)
+        supervisor.register(registration("ato-pump"), actuator)
+        await supervisor.start()
+        supervisor.heartbeat()
+
+        consumer = CommandConsumer(spine, supervisor, durable=f"state-{uuid.uuid4().hex[:8]}")
+        await consumer.subscribe()
+        await spine.publish_command(command("ato-pump", ttl_s=60.0))
+
+        outcomes = await consumer.drain_once(timeout=5.0)
+        assert outcomes == ["applied"]
+
+        raw = await spine.js.get_last_msg("BR_STATE", subjects.state("ato-pump"))
+        assert raw.data is not None
+        state = ActuatorState.model_validate_json(raw.data)
+
+        await supervisor.stop()
+        await spine.close()
+        return state
+
+    state = run(scenario)
+    assert state.actuator_id == "ato-pump"
+    assert state.level == BinaryLevel(on=True)
+    assert state.reason == "commanded"
 
 
 @pytest.mark.timeout(60)

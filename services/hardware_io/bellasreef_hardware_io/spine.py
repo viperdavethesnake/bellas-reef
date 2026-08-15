@@ -22,6 +22,7 @@ from uuid import uuid4
 import nats
 from bellasreef_contracts import (
     ActuatorCommand,
+    ActuatorLevel,
     ActuatorRegistration,
     ActuatorState,
     CapabilityAnnouncement,
@@ -52,6 +53,21 @@ from bellasreef_hardware_io.safety import CommandOutcome, InterlockSupervisor
 __all__ = ["STREAMS", "CommandConsumer", "Spine"]
 
 log = get_logger(__name__)
+
+#: ``source`` on every ActuatorState this process publishes. Not imported from
+#: app.py's ``SERVICE`` constant — app.py imports from this module, and a
+#: back-import would be circular for one shared literal.
+SOURCE: Final = "hardware-io"
+
+#: I3: bounds one applied-command state publish, inside the liveness-guarded
+#: main loop (CommandConsumer.drain_once runs from HardwareIO._beat_and_serve,
+#: on the same loop iteration the 15s liveness guard watches). 2s keeps a
+#: hung publish from ever costing more than a fraction of that budget — chosen
+#: over Spine.publish_async because it needs no new Spine surface and keeps
+#: the same swallow-and-log contract as every other publish here. A batch of
+#: many simultaneously-timing-out publishes could still stack past 15s in the
+#: worst case; not addressed here; BR_CMD batches are not normally that large.
+_PUBLISH_TIMEOUT_S: Final = 2.0
 
 CMD_STREAM: Final = "BR_CMD"
 STATE_STREAM: Final = "BR_STATE"
@@ -442,6 +458,7 @@ class CommandConsumer:
 
             if outcome == "applied":
                 await msg.ack()
+                await self._publish_applied_state(command)
                 continue
 
             await self._audit(
@@ -535,6 +552,62 @@ class CommandConsumer:
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
         await self._spine.publish_audit("command", {"event": event_type, **detail})
+
+    async def _publish_applied_state(self, command: ActuatorCommand) -> None:
+        """Tell the wire what an applied command actually did.
+
+        This is the layer that has the spine: the supervisor (safety.py) must
+        keep enforcing interlocks with no broker at all, so it stays
+        publish-blind by design and this call site is the trade-off — not a
+        callback threaded through it. A publish failure must never make a
+        successfully applied command look like it failed, so it is logged and
+        swallowed exactly like a failed sensor reading (app.py's
+        ``_publish_reading``).
+
+        The published level is what the driver reports via ``read_back()`` —
+        the post-hardware truth, not the commanded one. A PWM driver's own
+        snap_duty rule (dimming.py) can turn a 5% command into a dark pin;
+        publishing ``command.level`` unconditionally would have shown 5% on
+        the truth line and archived 5% in VictoriaMetrics while the channel
+        sat at 0%. Falls back to the commanded level only when the driver
+        cannot report one at all (PCA9685, deliberately — see its
+        ``read_back()``), and on a ``read_back()`` failure.
+        """
+        level: ActuatorLevel = command.level
+        try:
+            driver = self._supervisor.driver_of(command.actuator_id)
+            read = await driver.read_back()
+            if read is not None:
+                level = read
+        except Exception:
+            log.warning(
+                "read_back failed; publishing the commanded level instead",
+                extra={"actuator_id": command.actuator_id},
+                exc_info=True,
+            )
+
+        try:
+            await asyncio.wait_for(
+                self._spine.publish_state(
+                    ActuatorState(
+                        message_id=uuid4(),
+                        emitted_at=utcnow(),
+                        source=SOURCE,
+                        actuator_id=command.actuator_id,
+                        level=level,
+                        reason="commanded",
+                        since=utcnow(),
+                        latched=False,
+                    )
+                ),
+                timeout=_PUBLISH_TIMEOUT_S,
+            )
+        except Exception:
+            log.warning(
+                "failed to publish actuator state",
+                extra={"actuator_id": command.actuator_id},
+                exc_info=True,
+            )
 
 
 def utcnow() -> datetime:
