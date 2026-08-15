@@ -854,7 +854,9 @@ throttles failures 10/min in process. First pair by any method
 completes setup permanently. client.paired now records its method."
 ```
 
----### Task 6: CLI `setup-code` subcommand + UX-6 pair copy
+---
+
+### Task 6: CLI `setup-code` subcommand + UX-6 pair copy
 
 **Files:**
 - Modify: `services/api/bellasreef_api/cli.py`
