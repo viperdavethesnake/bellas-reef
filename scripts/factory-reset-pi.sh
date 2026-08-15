@@ -82,9 +82,10 @@ ssh "$PI_HOST" "docker volume rm bellasreef_postgres-data bellasreef_vm-data bel
 # --no-verify is correct here by construction, not a shortcut: the deploy
 # telemetry gate cannot pass on an empty registry — no devices means no
 # readings means nothing on the wire to verify (2026-08-12, 2026-08-14 both
-# hit this). deploy-pi.sh's own --no-verify path prints the setup code
-# itself (Feature 1) once containers are up; step 6 below reprints it so it
-# cannot scroll off screen behind steps 5's checks.
+# hit this). deploy-pi.sh's own --no-verify path prints a setup code itself
+# (Feature 1) once containers are up — but step 6 below MINTS A NEW ONE,
+# which rotates that one out. Whatever this step prints is dead by the end of
+# the run; the code to type into the app is step 6's.
 step "redeploying from zero"
 "$(dirname "$0")/deploy-pi.sh" --host "$PI_HOST" --no-verify \
     || die "redeploy failed after the wipe — the hub has NO data volumes and is not confirmed running. Do not treat this as a completed reset; investigate deploy-pi.sh's output above before retrying."
@@ -200,12 +201,18 @@ done
     || die "hardware-io logged no capability announcements within 60s of the redeploy — discovery did not run or found nothing"
 echo "  hardware-io announced ${announced} capability line(s)"
 
-# ------------------------------------------------------- 6. setup code, again
-# deploy-pi.sh already printed the setup code once containers came up
-# (Feature 1, --no-verify path); step 5's checks above put several more
-# screens of output after it, so reprint here to make it the actual last
-# thing on screen.
-step "setup code"
+# --------------------------------------------------- 6. mint the final code
+# NOT a reprint. `bellasreef setup-code` ROTATES: it mints a new code and
+# stores only the hash, so the code deploy-pi.sh printed back in step 4 is
+# invalid the moment this runs. Reprinting is impossible by design — there is
+# no plaintext anywhere to reprint from (security.py, hash_setup_code).
+#
+# Running it here anyway is deliberate: step 5's checks put several screens of
+# output between the deploy's code and the end of the run, and the code an
+# operator scrolls back to must be the one that still works. This is the last
+# thing on screen and it is the only valid code afterwards.
+step "minting the final setup code — this invalidates the code printed earlier in this run"
 ssh "$PI_HOST" "cd ${DEPLOY_DIR} && docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} exec -T api bellasreef setup-code" \
-    || warn "could not reprint the setup code from ${PI_HOST} — check manually with 'docker compose exec -T api bellasreef setup-code'"
+    || warn "could not mint the final setup code on ${PI_HOST} — the code printed earlier in this run is still the valid one, or mint a fresh one with 'docker compose exec -T api bellasreef setup-code'"
+echo "Use the code directly above. Any setup code printed earlier in this run has been rotated out."
 echo "Reminder: adopt devices in the app before the deploy telemetry gate can pass again."

@@ -98,6 +98,14 @@ print_setup_code_if_open() {
     # extension. This runs on this Mac's BSD /usr/bin/sed, where \| is
     # literal and the GNU form matches nothing — verified against both
     # true and false bodies (see the fix report in the sdd task file).
+    if [[ -z "$body" ]]; then
+        # Silence here used to mean the operator was simply never told a code
+        # existed. Whether this hub is in setup mode is now unknown, and
+        # unknown is worth a line: a new owner with no code has no way in
+        # short of finding this out for themselves.
+        warn "hub /info did not answer in time; if this hub is in setup mode, run \`bellasreef setup-code\` on it manually"
+        return 0
+    fi
     setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$body")"
     if [[ "$setup_mode" == "true" ]]; then
         echo
