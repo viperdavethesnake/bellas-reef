@@ -40,6 +40,29 @@ class BuiltActuator:
         self.registration = registration
 
 
+def _last_per_device(assignments: list[DeviceAssignment]) -> list[DeviceAssignment]:
+    """Collapse to one assignment per device_id, keeping the last occurrence.
+
+    A deploy recreates api and hardware-io together: the api's startup
+    lifespan republishes every adopted assignment, and that republish can land
+    while :meth:`Spine.read_assignments` is mid-drain, so the same device_id
+    can appear twice in one drained list — the retained message plus its own
+    fresher echo on the same subject. The later copy is never older than the
+    earlier one, so last-wins is correct here even though nothing in this
+    list carries a timestamp to compare: arrival order on a single subject
+    already is the ordering.
+
+    Order of the surviving entries follows last occurrence, matching what a
+    consumer that only ever saw the final state of each subject would have
+    built.
+    """
+    last_index: dict[str, int] = {}
+    for index, assignment in enumerate(assignments):
+        last_index[assignment.device_id] = index
+    keep = set(last_index.values())
+    return [assignment for index, assignment in enumerate(assignments) if index in keep]
+
+
 def build_from_assignments(
     assignments: list[DeviceAssignment],
     *,
@@ -62,11 +85,18 @@ def build_from_assignments(
     topology — here it is one device among several, and taking a tank offline
     over one malformed row would be the larger failure.
     """
+    deduped = _last_per_device(assignments)
+    if len(deduped) != len(assignments):
+        log.info(
+            "duplicate assignments collapsed to last-per-device_id",
+            extra={"received": len(assignments), "deduped": len(deduped)},
+        )
+
     actuators: list[BuiltActuator] = []
     sensors: list[DS18B20] = []
     chips: dict[tuple[int, int], Pca9685Device] = {}
 
-    for assignment in assignments:
+    for assignment in deduped:
         if not assignment.adopted:
             log.info(
                 "assignment not adopted; nothing built",
