@@ -848,7 +848,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  opened by           : {result['opened_by']}")
     print()
     print(
-        "If a code is already showing in the app, cancel and pair again - "
+        "If a code is already showing in the app, cancel and pair again — "
         "requests created before this window stay pending."
     )
     return 0
