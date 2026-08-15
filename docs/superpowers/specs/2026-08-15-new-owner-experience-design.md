@@ -166,6 +166,7 @@ saying so and pointing here.
   pairing stays on the hub.
 - Re-entering setup mode by revoking all clients (fire-escape covers it).
 - Web UI (separate spec, 2026-08-14, held).
+- Persistent throttle state or per-IP tracking.
 
 ## Amendments (2026-08-15, recorded during implementation)
 
@@ -190,4 +191,3 @@ saying so and pointing here.
 - (c) No other semantic changes. The three-outcome (grant / pending /
   reject) `POST /pair` protocol, the throttle, and the code-rotation
   semantics shipped as specified.
-- Persistent throttle state or per-IP tracking.
