@@ -94,9 +94,51 @@ ih_parse_args() {
     done
 }
 
+# ------------------------------------------------------------------ phase 1
+
+# Three independent signals, because a half-finished install leaves only some
+# of them. Any one is enough to stop: this tool installs, it does not upgrade,
+# repair, or reconfigure, and guessing which of those an operator meant is how
+# a working hub gets damaged by a tool that was asked to help.
+ih_phase1_already_deployed() {
+    ih_step "1. is this machine already a hub?"
+    local found=0
+
+    local containers
+    containers="$(docker ps -a --filter 'name=bellasreef-' --format '{{.Names}}' 2>/dev/null)"
+    if [[ -n "$containers" ]]; then
+        ih_warn "containers present: $(printf '%s' "$containers" | tr '\n' ' ')"
+        found=1
+    fi
+
+    if [[ "$(systemctl is-enabled bellasreef.service 2>/dev/null)" == "enabled" ]]; then
+        ih_warn "bellasreef.service is enabled"
+        found=1
+    fi
+
+    local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
+    if [[ -s "$envfile" ]]; then
+        ih_warn "deploy/.env already exists and is not empty"
+        found=1
+    fi
+
+    if [[ $found -eq 1 ]]; then
+        printf '\n'
+        ih_warn "This machine already looks like a hub. Nothing has been changed."
+        ih_warn "install-hub installs; it does not upgrade or repair."
+        return 0
+    fi
+
+    ih_pass "no existing deployment found"
+    return 1
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
+    if ih_phase1_already_deployed; then
+        exit 0
+    fi
     return 0
 }
 

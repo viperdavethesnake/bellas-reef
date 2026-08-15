@@ -57,3 +57,39 @@ def test_unknown_flag_fails_loudly(tmp_path: Path) -> None:
     result = run_script("--wat", root=tmp_path)
     assert result.returncode != 0
     assert "--wat" in result.stderr
+
+
+def write_stub(stubs: Path, name: str, body: str) -> None:
+    """Create a stub executable on the fake PATH."""
+    stubs.mkdir(parents=True, exist_ok=True)
+    path = stubs / name
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    path.chmod(0o755)
+
+
+def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
+    stubs = tmp_path / "bin"
+    write_stub(stubs, "docker", "exit 0")
+    write_stub(stubs, "systemctl", "exit 1")
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "no existing deployment found" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_phase1_stops_when_a_container_is_running(tmp_path: Path) -> None:
+    stubs = tmp_path / "bin"
+    write_stub(stubs, "docker", 'echo "bellasreef-api-1"; exit 0')
+    write_stub(stubs, "systemctl", "exit 1")
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert result.returncode == 0
+    assert "bellasreef-api-1" in result.stdout
+    assert "already" in result.stdout.lower()
+
+
+def test_phase1_stops_when_the_boot_unit_is_enabled(tmp_path: Path) -> None:
+    stubs = tmp_path / "bin"
+    write_stub(stubs, "docker", "exit 0")
+    write_stub(stubs, "systemctl", "echo enabled; exit 0")
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "already" in result.stdout.lower()
+    assert "bellasreef.service" in result.stdout
