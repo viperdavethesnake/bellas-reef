@@ -106,27 +106,99 @@ done
 [[ -n "$info_body" ]] || die "GET /api/v1/info on ${PI_HOST}:${API_PORT} did not answer after the redeploy — cannot confirm factory-fresh state"
 
 paired="$(sed -n 's/.*"paired_client_count":\([0-9]*\).*/\1/p' <<<"$info_body")"
-setup_mode="$(sed -n 's/.*"setup_mode":\(true\|false\).*/\1/p' <<<"$info_body")"
+# [a-z]* rather than \(true\|false\): \| alternation is a GNU sed extension.
+# This runs on this Mac's BSD /usr/bin/sed, where \| is literal and the GNU
+# form matches nothing — verified against both true and false bodies (see
+# the fix report in the sdd task file).
+setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$info_body")"
 [[ "$paired" == "0" ]] \
     || die "post-reset /info reports paired_client_count=${paired:-<absent>} — expected 0. The reset did not clear pairings."
 [[ "$setup_mode" == "true" ]] \
     || die "post-reset /info reports setup_mode=${setup_mode:-<absent>} — expected true. The reset did not reopen setup mode."
 echo "  0 paired clients, setup mode open"
 
-# devices/audit_log counts: diagnostic, not gating — the destructive action
-# and the redeploy have already both succeeded by this point. -U/-d
+# devices/audit_log counts — asserted, not just printed: a nonzero count here
+# is "the reset left N devices behind", a real finding, not a footnote. -U/-d
 # reference $POSTGRES_USER/$POSTGRES_DB inside the postgres container's own
 # shell (single-quoted through both the ssh hop and docker compose exec, so
 # neither this script nor the Pi's login shell ever needs to know the real
 # values — the container already has them from deploy/.env via compose's
 # environment: block).
+#
+# Transport failures (can't reach the container at all) warn, since the wipe
+# and redeploy have already both succeeded by this point and a connectivity
+# hiccup here isn't itself evidence of a bad reset; a value that comes back
+# and is wrong is a real finding and dies.
 step "confirming devices and audit log are empty"
-ssh "$PI_HOST" "cd ${DEPLOY_DIR} && docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} exec -T postgres sh -c 'psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -tAc \"SELECT count(*) FROM devices; SELECT count(*) FROM audit_log;\"'" \
-    || warn "could not confirm devices/audit_log counts on ${PI_HOST} — check manually with 'docker compose exec -T postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB -c \"SELECT count(*) FROM devices;\"'"
+if psql_out="$(ssh "$PI_HOST" "cd ${DEPLOY_DIR} && docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} exec -T postgres sh -c 'psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -tAc \"SELECT count(*) FROM devices; SELECT count(*) FROM audit_log;\"'" 2>&1)"; then
+    device_count="$(sed -n '1p' <<<"$psql_out")"
+    audit_count="$(sed -n '2p' <<<"$psql_out")"
+    [[ "$device_count" == "0" ]] \
+        || die "the reset left ${device_count:-<unreadable>} device(s) behind in postgres on ${PI_HOST} — the wipe did not clear the devices table"
+    [[ "$audit_count" == "0" ]] \
+        || die "the reset left ${audit_count:-<unreadable>} audit_log row(s) behind in postgres on ${PI_HOST} — the wipe did not clear the audit log"
+    echo "  0 devices, 0 audit_log rows"
+else
+    warn "could not query devices/audit_log counts on ${PI_HOST} (transport failure: ${psql_out}) — check manually with 'docker compose exec -T postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB -c \"SELECT count(*) FROM devices;\"'"
+fi
 
+# alembic at head — the redeploy already ran 'alembic upgrade head' as part
+# of deploy-pi.sh's migration step; this confirms that landed rather than
+# trusting it silently. 'alembic current' prints the revision id with a
+# literal "(head)" suffix when the database is at the newest revision — the
+# standard alembic CLI convention, not project-specific behavior.
+step "confirming alembic is at head"
+if alembic_out="$(ssh "$PI_HOST" "cd ${DEPLOY_DIR} && docker compose -f ${COMPOSE_FILE} --env-file ${COMPOSE_ENV} exec -T api sh -c 'cd /app/db && alembic current' 2>&1")"; then
+    [[ "$alembic_out" == *"(head)"* ]] \
+        || die "alembic current on ${PI_HOST} reports '${alembic_out}' — not at head after the redeploy's migration step"
+    echo "  alembic at head"
+else
+    warn "could not check the alembic revision on ${PI_HOST} (transport failure: ${alembic_out}) — check manually with 'docker compose exec -T api sh -c \"cd /app/db && alembic current\"'"
+fi
+
+# All six JetStream streams — hardware-io's provision() (spine.py) logs one
+# structured "stream created" line per entry in STREAMS (BR_CMD, BR_STATE,
+# BR_REGISTRY, BR_CAPABILITY, BR_ASSIGNMENT, BR_AUDIT) at startup, against a
+# freshly wiped nats-data volume this always reads "created", never
+# "updated". Logs are JSON with compact separators (bellasreef_service.
+# logging.JsonFormatter), so the substring match is exact. `|| true` runs on
+# the REMOTE side deliberately: grep -c still prints "0" on no match but
+# exits 1, so ssh's own exit status would be nonzero and a local
+# `|| echo 0` fallback would fire on top of grep's own "0" — doubling the
+# output to "0\n0". Neutralizing the exit status remotely, before it crosses
+# the ssh boundary, is what keeps this to one line. Retried up to 60s:
+# hardware-io needs a few seconds after container start to connect and
+# provision.
+step "confirming all six JetStream streams were recreated"
+STREAM_DEADLINE=$(($(date +%s) + 60))
+stream_count=0
+while :; do
+    stream_count="$(ssh "$PI_HOST" "docker logs bellasreef-hardware-io-1 2>&1 | grep -c '\"msg\":\"stream created\"' || true" 2>/dev/null)"
+    stream_count="${stream_count:-0}"
+    [[ "$stream_count" -ge 6 ]] && break
+    [[ "$(date +%s)" -ge $STREAM_DEADLINE ]] && break
+    sleep 3
+done
+[[ "$stream_count" -ge 6 ]] \
+    || die "hardware-io logged only ${stream_count} of 6 expected 'stream created' lines (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY, BR_ASSIGNMENT, BR_AUDIT) within 60s of the redeploy — JetStream provisioning did not complete"
+echo "  all 6 JetStream streams recreated"
+
+# Capabilities announced — same log-substring approach, same remote-side
+# `|| true`, same bounded retry; a timeout here is now a real finding (die),
+# not narrated as "may still be discovering".
 step "checking hardware-io capability announcements"
-announced="$(ssh "$PI_HOST" "docker logs bellasreef-hardware-io-1 2>&1 | grep -c 'capability announced'" 2>/dev/null || echo 0)"
-echo "  hardware-io has announced ${announced} capability line(s) so far (may still be discovering)"
+CAP_DEADLINE=$(($(date +%s) + 60))
+announced=0
+while :; do
+    announced="$(ssh "$PI_HOST" "docker logs bellasreef-hardware-io-1 2>&1 | grep -c '\"msg\":\"capability announced\"' || true" 2>/dev/null)"
+    announced="${announced:-0}"
+    [[ "$announced" -ge 1 ]] && break
+    [[ "$(date +%s)" -ge $CAP_DEADLINE ]] && break
+    sleep 3
+done
+[[ "$announced" -ge 1 ]] \
+    || die "hardware-io logged no capability announcements within 60s of the redeploy — discovery did not run or found nothing"
+echo "  hardware-io announced ${announced} capability line(s)"
 
 # ------------------------------------------------------- 6. setup code, again
 # deploy-pi.sh already printed the setup code once containers came up

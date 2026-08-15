@@ -94,7 +94,11 @@ print_setup_code_if_open() {
         [[ "$(date +%s)" -ge $deadline ]] && break
         sleep 2
     done
-    setup_mode="$(sed -n 's/.*"setup_mode":\(true\|false\).*/\1/p' <<<"$body")"
+    # [a-z]* rather than \(true\|false\): \| alternation is a GNU sed
+    # extension. This runs on this Mac's BSD /usr/bin/sed, where \| is
+    # literal and the GNU form matches nothing — verified against both
+    # true and false bodies (see the fix report in the sdd task file).
+    setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$body")"
     if [[ "$setup_mode" == "true" ]]; then
         echo
         compose "exec -T api bellasreef setup-code" \
@@ -377,7 +381,9 @@ fi
 
 latest="$(sed -n 's/.*"values":\[\([^,]*\).*/\1/p' <<<"$body" | tail -1)"
 
-print_setup_code_if_open
-
 printf '\033[32m✓ deployed %s — API answering at contracts %s, fresh sample on the wire (%s)\033[0m\n' \
     "${SHA:0:8}" "$CONTRACTS" "${latest:-ok}"
+
+# Spec: "the setup code ... as the final output of the deploy." Truly last,
+# below the banner above — not before it.
+print_setup_code_if_open
