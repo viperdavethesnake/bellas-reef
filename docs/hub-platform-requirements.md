@@ -118,8 +118,15 @@ Pi 5 Model B Rev 1.0, 8 GB   ·   Debian 13 trixie, kernel 6.18, aarch64
 ## Evaluated platform: Banana Pi M64
 
 Surveyed read-only on 2026-08-15. **Viable on interfaces, blocked on hosting.**
-Not currently supported, and nothing below should be read as an endorsement to
-migrate.
+
+**This was a documentation exercise. Ruled by David 2026-08-15: nothing is being
+changed or built to support this board.** No code, no discovery path, no
+packaging, no CI target. It is written down because evaluating a second board is
+what turned an implicit standard into an explicit one, and because the next
+person to ask "what about board X" should find a worked example rather than
+start over.
+
+Read the section below as a measurement, not a plan.
 
 ```
 BananaPi-M64, Allwinner A64, 4 cores, aarch64
@@ -173,7 +180,10 @@ it would then expose is unmeasured. Not guessed at here.
 None of that changes the verdict, because of R2: with a PCA9685 on either of the
 two working I2C buses, the SoC PWM count stops mattering.
 
-### What would have to change
+### What would have to change, if anyone ever did this
+
+Hypothetical. Nobody is doing it. Listed so the size of the gap is on record
+rather than re-estimated from scratch later.
 
 1. Install Docker with Compose v2, and verify our arm64 images run on kernel
    6.1.63 sunxi64.
