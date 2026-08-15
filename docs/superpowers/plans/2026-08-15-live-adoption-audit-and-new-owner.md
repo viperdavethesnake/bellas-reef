@@ -341,15 +341,14 @@ async def test_readopt_conflicts_when_channel_taken(bound_device_client) -> None
 
 
 async def test_forget_deletes_only_detached(bound_device_client) -> None:
-    assert (await bound_device_client.post(
-        "/api/v1/devices/pi-pwm-0/forget")).status_code == 409  # still bound
+    assert (
+        await bound_device_client.post("/api/v1/devices/pi-pwm-0/forget")
+    ).status_code == 409  # still bound
     await bound_device_client.delete("/api/v1/devices/pi-pwm-0")
-    assert (await bound_device_client.post(
-        "/api/v1/devices/pi-pwm-0/forget")).status_code == 204
+    assert (await bound_device_client.post("/api/v1/devices/pi-pwm-0/forget")).status_code == 204
     devices = (await bound_device_client.get("/api/v1/devices")).json()
     assert all(d["device_id"] != "pi-pwm-0" for d in devices)
-    assert (await bound_device_client.post(
-        "/api/v1/devices/pi-pwm-0/forget")).status_code == 404
+    assert (await bound_device_client.post("/api/v1/devices/pi-pwm-0/forget")).status_code == 404
 ```
 
 NOTE (from session-log 2026-08-12): `Store.bind_device` matches an existing
@@ -385,24 +384,47 @@ async def readopt_device(self, device_id: str) -> dict[str, Any] | None:
     loudly if another adopted device now holds the channel.
     """
     async with self._engine.begin() as conn:
-        target = (await conn.execute(text(
-            "SELECT device_id, driver_type, binding FROM devices "
-            " WHERE device_id = :device_id AND NOT adopted"
-        ), {"device_id": device_id})).mappings().first()
+        target = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT device_id, driver_type, binding FROM devices "
+                        " WHERE device_id = :device_id AND NOT adopted"
+                    ),
+                    {"device_id": device_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
         if target is None:
             return None
-        holder = (await conn.execute(text(
-            "SELECT device_id FROM devices "
-            " WHERE driver_type = :driver_type AND binding = :binding "
-            "   AND adopted AND device_id <> :device_id"
-        ), {**target})).first()
+        holder = (
+            await conn.execute(
+                text(
+                    "SELECT device_id FROM devices "
+                    " WHERE driver_type = :driver_type AND binding = :binding "
+                    "   AND adopted AND device_id <> :device_id"
+                ),
+                {**target},
+            )
+        ).first()
         if holder is not None:
             raise ChannelHeldError(holder[0])
-        row = (await conn.execute(text(
-            "UPDATE devices SET adopted = true "
-            " WHERE device_id = :device_id "
-            " RETURNING device_id, kind, role, driver_type, binding"
-        ), {"device_id": device_id})).mappings().one()
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "UPDATE devices SET adopted = true "
+                        " WHERE device_id = :device_id "
+                        " RETURNING device_id, kind, role, driver_type, binding"
+                    ),
+                    {"device_id": device_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
         return dict(row)
 
 
@@ -410,16 +432,19 @@ async def forget_device(self, device_id: str) -> str:
     """Hard delete, detached rows only. The one sanctioned identity break:
     the operator is saying this hardware is gone for good."""
     async with self._engine.begin() as conn:
-        row = (await conn.execute(text(
-            "SELECT adopted FROM devices WHERE device_id = :device_id"
-        ), {"device_id": device_id})).first()
+        row = (
+            await conn.execute(
+                text("SELECT adopted FROM devices WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).first()
         if row is None:
             return "missing"
         if row[0]:
             return "adopted"
-        await conn.execute(text(
-            "DELETE FROM devices WHERE device_id = :device_id"
-        ), {"device_id": device_id})
+        await conn.execute(
+            text("DELETE FROM devices WHERE device_id = :device_id"), {"device_id": device_id}
+        )
         return "forgotten"
 ```
 
@@ -437,33 +462,38 @@ In `app.py`, after `unbind_device` (line 1290 block):
     "/api/v1/devices/{device_id}/readopt",
     tags=["hardware"],
     operation_id="readoptDevice",
-    responses={200: {"description": "Re-adopted onto its remembered channel."},
-               401: AUTH_401,
-               404: {"description": "No such device, or it is not detached."},
-               409: {"description": "Its channel is now held by another device."}},
+    responses={
+        200: {"description": "Re-adopted onto its remembered channel."},
+        401: AUTH_401,
+        404: {"description": "No such device, or it is not detached."},
+        409: {"description": "Its channel is now held by another device."},
+    },
 )
-async def readopt_device(
-    device_id: str, _: Annotated[UUID, Depends(current_client)]
-) -> DeviceView:
+async def readopt_device(device_id: str, _: Annotated[UUID, Depends(current_client)]) -> DeviceView:
     """Reattach a detached device to the channel its row still remembers."""
     try:
         row = await store.readopt_device(device_id)
     except ChannelHeldError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT,
-            f"channel now held by {exc.holder!r}. Unbind it first.") from exc
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"channel now held by {exc.holder!r}. Unbind it first."
+        ) from exc
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND,
-            f"no detached device {device_id!r}.")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no detached device {device_id!r}.")
     if assignments is not None:
-        await assignments.publish(DeviceAssignment(
-            message_id=uuid4(), emitted_at=datetime.now(UTC), source="api",
-            device_id=row["device_id"], adopted=True, role=row["role"],
-            driver_type=row["driver_type"], binding=row["binding"],
-        ))
-    await sink("device.bound", {"device_id": device_id, "readopt": True},
-               category="config")
-    full = next(d for d in await store.list_devices()
-                if d["device_id"] == device_id)
+        await assignments.publish(
+            DeviceAssignment(
+                message_id=uuid4(),
+                emitted_at=datetime.now(UTC),
+                source="api",
+                device_id=row["device_id"],
+                adopted=True,
+                role=row["role"],
+                driver_type=row["driver_type"],
+                binding=row["binding"],
+            )
+        )
+    await sink("device.bound", {"device_id": device_id, "readopt": True}, category="config")
+    full = next(d for d in await store.list_devices() if d["device_id"] == device_id)
     return DeviceView.model_validate(full)
 
 
@@ -473,14 +503,14 @@ async def readopt_device(
     response_class=Response,
     tags=["hardware"],
     operation_id="forgetDevice",
-    responses={204: {"description": "Deleted. Identity and settings are gone."},
-               401: AUTH_401,
-               404: {"description": "No such device."},
-               409: {"description": "Still adopted. Unbind it first."}},
+    responses={
+        204: {"description": "Deleted. Identity and settings are gone."},
+        401: AUTH_401,
+        404: {"description": "No such device."},
+        409: {"description": "Still adopted. Unbind it first."},
+    },
 )
-async def forget_device(
-    device_id: str, _: Annotated[UUID, Depends(current_client)]
-) -> Response:
+async def forget_device(device_id: str, _: Annotated[UUID, Depends(current_client)]) -> Response:
     """Delete a detached device row for good.
 
     The soft-unbind docstring explains why deletion is normally wrong: it
@@ -492,8 +522,7 @@ async def forget_device(
     if outcome == "missing":
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no device {device_id!r}.")
     if outcome == "adopted":
-        raise HTTPException(status.HTTP_409_CONFLICT,
-            f"{device_id!r} is adopted. Unbind it first.")
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{device_id!r} is adopted. Unbind it first.")
     await sink("device.forgotten", {"device_id": device_id}, category="config")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 ```
@@ -659,25 +688,27 @@ Following `hub_identity` access idioms (store.py:111):
 ```python
 async def setup_state(self) -> tuple[str | None, datetime | None]:
     async with self._engine.connect() as conn:
-        row = (await conn.execute(text(
-            "SELECT setup_code_hash, setup_completed_at FROM hub_identity"
-        ))).first()
+        row = (
+            await conn.execute(text("SELECT setup_code_hash, setup_completed_at FROM hub_identity"))
+        ).first()
         return (row[0], row[1]) if row else (None, None)
 
 
 async def set_setup_code_hash(self, code_hash: str) -> None:
     """Exactly one code valid at a time - minting rotates the old one out."""
     async with self._engine.begin() as conn:
-        await conn.execute(text(
-            "UPDATE hub_identity SET setup_code_hash = :h"), {"h": code_hash})
+        await conn.execute(text("UPDATE hub_identity SET setup_code_hash = :h"), {"h": code_hash})
 
 
 async def complete_setup(self) -> None:
     """First successful pair, any method. Never unset."""
     async with self._engine.begin() as conn:
-        await conn.execute(text(
-            "UPDATE hub_identity SET setup_completed_at = now(), "
-            " setup_code_hash = NULL WHERE setup_completed_at IS NULL"))
+        await conn.execute(
+            text(
+                "UPDATE hub_identity SET setup_completed_at = now(), "
+                " setup_code_hash = NULL WHERE setup_completed_at IS NULL"
+            )
+        )
 ```
 
 Add store tests only if the file's peers test store methods against a real DB
@@ -722,31 +753,36 @@ async def test_info_reports_setup_mode(fresh_client) -> None:
 
 
 async def test_setup_code_pairs_immediately(fresh_client, minted_setup_code) -> None:
-    r = await fresh_client.post("/api/v1/pair", json={
-        "client_name": "iPhone", "setup_code": minted_setup_code.lower()})
+    r = await fresh_client.post(
+        "/api/v1/pair", json={"client_name": "iPhone", "setup_code": minted_setup_code.lower()}
+    )
     assert r.status_code == 200 and "refresh_token" in r.json()
     info = (await fresh_client.get("/api/v1/info")).json()
     assert info["setup_mode"] is False  # completed, never re-enters
 
 
 async def test_wrong_code_is_rejected_not_pended(fresh_client, minted_setup_code) -> None:
-    r = await fresh_client.post("/api/v1/pair", json={
-        "client_name": "iPhone", "setup_code": "XXXX-XXXX"})
+    r = await fresh_client.post(
+        "/api/v1/pair", json={"client_name": "iPhone", "setup_code": "XXXX-XXXX"}
+    )
     assert r.status_code == 422
 
 
 async def test_code_outside_setup_is_rejected(paired_client_env) -> None:
-    r = await paired_client_env.post("/api/v1/pair", json={
-        "client_name": "Mallory", "setup_code": "7KF2-9QMD"})
+    r = await paired_client_env.post(
+        "/api/v1/pair", json={"client_name": "Mallory", "setup_code": "7KF2-9QMD"}
+    )
     assert r.status_code == 422  # never silently ignored
 
 
 async def test_throttle_trips_at_ten_failures(fresh_client, minted_setup_code) -> None:
     for _ in range(10):
-        await fresh_client.post("/api/v1/pair", json={
-            "client_name": "x", "setup_code": "WRONG-ONE"})
-    r = await fresh_client.post("/api/v1/pair", json={
-        "client_name": "x", "setup_code": "WRONG-ONE"})
+        await fresh_client.post(
+            "/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"}
+        )
+    r = await fresh_client.post(
+        "/api/v1/pair", json={"client_name": "x", "setup_code": "WRONG-ONE"}
+    )
     assert r.status_code == 429 and "Retry-After" in r.headers
 ```
 
@@ -800,31 +836,36 @@ class _SetupThrottle:
 Pair handler, at the top of the existing function body:
 
 ```python
-        code_hash, completed_at = await store.setup_state()
-        in_setup = completed_at is None
-        if body.setup_code is not None:
-            if not in_setup:
-                raise HTTPException(422, "This hub is already set up. Pair from "
-                    "an already-paired device, or run `bellasreef pair` on the hub.")
-            if (after := _setup_throttle.retry_after(time.monotonic())) is not None:
-                raise HTTPException(429, "Too many attempts - wait a minute.",
-                                    headers={"Retry-After": str(after)})
-            if code_hash is None or hash_setup_code(body.setup_code) != code_hash:
-                _setup_throttle.record_failure(time.monotonic())
-                await sink("pair.code_rejected", {"client_name": body.client_name})
-                raise HTTPException(422, "That setup code is not right. It is on "
-                    "the deploy output on the hub; dashes and case do not matter.")
-            # valid: grant exactly as the open-window path does (reuse the
-            # existing grant block), then:
-            await store.complete_setup()
-            await sink("client.paired", {"client_id": str(client_id),
-                                         "method": "setup_code"})
-            return granted
-        if in_setup and code_hash is not None:
-            # a code has been minted; blind TOFU yields to it (spec: missing
-            # code in setup mode is an explicit rejection, not a pending)
-            raise HTTPException(422, "This hub is in setup. Enter the setup "
-                "code from the deploy output.")
+code_hash, completed_at = await store.setup_state()
+in_setup = completed_at is None
+if body.setup_code is not None:
+    if not in_setup:
+        raise HTTPException(
+            422,
+            "This hub is already set up. Pair from "
+            "an already-paired device, or run `bellasreef pair` on the hub.",
+        )
+    if (after := _setup_throttle.retry_after(time.monotonic())) is not None:
+        raise HTTPException(
+            429, "Too many attempts - wait a minute.", headers={"Retry-After": str(after)}
+        )
+    if code_hash is None or hash_setup_code(body.setup_code) != code_hash:
+        _setup_throttle.record_failure(time.monotonic())
+        await sink("pair.code_rejected", {"client_name": body.client_name})
+        raise HTTPException(
+            422,
+            "That setup code is not right. It is on "
+            "the deploy output on the hub; dashes and case do not matter.",
+        )
+    # valid: grant exactly as the open-window path does (reuse the
+    # existing grant block), then:
+    await store.complete_setup()
+    await sink("client.paired", {"client_id": str(client_id), "method": "setup_code"})
+    return granted
+if in_setup and code_hash is not None:
+    # a code has been minted; blind TOFU yields to it (spec: missing
+    # code in setup mode is an explicit rejection, not a pending)
+    raise HTTPException(422, "This hub is in setup. Enter the setup code from the deploy output.")
 ```
 
 Read the existing handler carefully before splicing: reuse its grant block
@@ -925,24 +966,28 @@ def _setup_code_command(args: Any, dsn: str) -> int:
         store = Store(dsn)  # match how other commands construct/open the store
         _, completed_at = await store.setup_state()
         if completed_at is not None:
-            print("Setup is complete. Pair new devices from the approver "
-                  "screen on an already-paired device, or open a window with "
-                  "`bellasreef pair` as the fire-escape.")
+            print(
+                "Setup is complete. Pair new devices from the approver "
+                "screen on an already-paired device, or open a window with "
+                "`bellasreef pair` as the fire-escape."
+            )
             return 0
         code = new_setup_code()
         await store.set_setup_code_hash(hash_setup_code(code))
         print(f"Setup code: {format_setup_code(code)}")
-        print("Open the Bella's Reef app on this network and enter this "
-              "code when asked.")
+        print("Open the Bella's Reef app on this network and enter this code when asked.")
         return 0
+
     return asyncio.run(go())
 ```
 
 UX-6: in `_open_window`'s success output (cli.py:118), append:
 
 ```python
-    print("If a code is already showing in the app, cancel and pair again - "
-          "requests created before this window stay pending.")
+print(
+    "If a code is already showing in the app, cancel and pair again - "
+    "requests created before this window stay pending."
+)
 ```
 
 - [ ] **Step 4: Run, check, commit**
