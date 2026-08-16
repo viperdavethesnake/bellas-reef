@@ -521,3 +521,43 @@ exit 0
     )
     assert result.returncode != 0, result.stdout + result.stderr
     assert "docker group" in result.stdout.lower()
+
+
+def test_phase3_reports_interfaces_without_blocking(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    # Full, passing avahi fixture (not just the services/ directory): this
+    # test is about phase 3, and a phase-2 avahi FAIL would trip ih_main's
+    # failure gate and exit before phase 3 ever runs.
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-1").write_text("")
+    (root / "sys/bus/w1/devices").mkdir(parents=True)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "I2C" in result.stdout
+    assert "1-Wire" in result.stdout
+    assert result.returncode == 0, "a missing interface must not fail the run"
+
+
+def test_phase3_says_which_interfaces_are_absent(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    # A Pi 5, so the config.txt guidance (specific dtparam/dtoverlay lines) is
+    # expected rather than the "not a Raspberry Pi" branch.
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "not enabled" in result.stdout.lower()
+    assert "dtparam=i2c_arm=on" in result.stdout
+    assert result.returncode == 0
+
+
+def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Some Other Board\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "not a raspberry pi" in result.stdout.lower()

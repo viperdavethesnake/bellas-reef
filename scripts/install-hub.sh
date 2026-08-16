@@ -425,6 +425,101 @@ ih_phase2_requirements() {
     return 0
 }
 
+# ------------------------------------------------------------------ phase 3
+
+# Board class, not board model. Three cases matter and no others: a Pi 5 has
+# the RP1 and its own overlay names, an older Pi has config.txt but no RP1, and
+# anything else has neither.
+ih_detect_board() {
+    local model="${IH_ROOT}/proc/device-tree/model"
+    if [[ ! -r "$model" ]]; then
+        printf 'other'
+        return 0
+    fi
+    local text
+    text="$(tr -d '\0' < "$model")"
+    case "$text" in
+        *"Raspberry Pi 5"*) printf 'pi5' ;;
+        *"Raspberry Pi"*)   printf 'pi' ;;
+        *)                  printf 'other' ;;
+    esac
+}
+
+# Reported, never blocking. An owner may want temperature monitoring and no
+# lights at all, so a fixed list of required interfaces would be an opinion
+# about their tank. This mirrors capabilities.py, which announces what it can
+# prove and holds no view on what should be there.
+ih_phase3_hardware() {
+    ih_step "3. hardware inventory"
+
+    local board
+    board="$(ih_detect_board)"
+
+    local i2c_ok=0 w1_ok=0 pwm_ok=0
+    compgen -G "${IH_ROOT}/dev/i2c-*" >/dev/null 2>&1 && i2c_ok=1
+    [[ -d "${IH_ROOT}/sys/bus/w1/devices" ]] && w1_ok=1
+    compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1 && pwm_ok=1
+
+    if (( i2c_ok )); then
+        ih_pass "I2C          enabled       PCA9685 and other I2C devices available"
+    else
+        ih_warn "I2C          not enabled   no PCA9685 or I2C sensors"
+    fi
+
+    if (( w1_ok )); then
+        ih_pass "1-Wire       enabled       DS18B20 temperature probes available"
+    else
+        ih_warn "1-Wire       not enabled   no temperature probes"
+    fi
+
+    if (( pwm_ok )); then
+        ih_pass "SoC PWM      enabled       direct PWM channels available"
+    else
+        ih_warn "SoC PWM      not enabled   a PCA9685 still works over I2C"
+    fi
+
+    if (( i2c_ok && w1_ok && pwm_ok )); then
+        return 0
+    fi
+
+    printf '\n'
+    case "$board" in
+        pi5|pi)
+            ih_warn "To enable the missing interfaces, add to /boot/firmware/config.txt:"
+            (( i2c_ok )) || printf '      dtparam=i2c_arm=on\n'
+            if (( ! w1_ok )); then
+                if [[ "$board" == "pi5" ]]; then
+                    printf '      [pi5]\n      dtoverlay=w1-gpio-pi5,gpiopin=4\n'
+                else
+                    printf '      dtoverlay=w1-gpio,gpiopin=4\n'
+                fi
+            fi
+            (( pwm_ok )) || printf '      dtoverlay=pwm-4chan\n'
+            ih_warn "Never put a trailing # comment on those lines; the parser folds it in."
+            ih_warn "Then reboot and run this script again."
+            ;;
+        other)
+            ih_warn "This is not a Raspberry Pi, so boot config was not inspected."
+            ih_warn "Enable the interfaces you need however this board does it, then re-run."
+            ;;
+    esac
+
+    # --check-only is a read-only inspection: there is nothing to proceed to,
+    # so asking would stall a non-interactive run at a question with no
+    # consequence. Report the inventory and let ih_main's --check-only exit
+    # handle the rest.
+    if (( IH_CHECK_ONLY )); then
+        return 0
+    fi
+
+    printf '\n'
+    if ! ih_confirm "proceed with only the interfaces above?"; then
+        ih_warn "stopped at your request; nothing has been changed"
+        exit 0
+    fi
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -438,6 +533,12 @@ ih_main() {
         (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
         (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
         exit 1
+    fi
+    ih_phase3_hardware
+    if (( IH_CHECK_ONLY )); then
+        printf '\n'
+        ih_pass "checks complete (--check-only); nothing was changed"
+        exit 0
     fi
     return 0
 }
