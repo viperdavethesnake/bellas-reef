@@ -27,7 +27,15 @@
 # could have been broken on the hub through any number of green deploys. The
 # second verification leg below closes that.
 #
-# Usage:  ./scripts/deploy-pi.sh [--host H] [--no-verify] [--no-verify-ci]
+# Usage:  ./scripts/deploy-pi.sh [--host H] [--no-verify] [--no-verify-ci] [--no-setup-code]
+#
+# --no-setup-code: skip print_setup_code_if_open at both its call sites. For
+# standalone deploys this flag changes nothing about what gets deployed or
+# verified — it only silences the setup-code print. It exists for
+# factory-reset-pi.sh, whose own step 6 mints the real, final code; without
+# this flag the step-4 redeploy below would print a first code that step 6
+# immediately rotates out, leaving two codes on screen and only the second
+# one valid.
 
 set -uo pipefail
 
@@ -39,6 +47,7 @@ COMPOSE_ENV="${DEPLOY_DIR}/.env"
 API_PORT=8000
 VERIFY=1
 SKIP_CI_CHECK=0
+SETUP_CODE=1
 SERVICES=(hardware-io control-engine api)
 IMAGE_PREFIX="ghcr.io/viperdavethesnake/bellasreef"
 AVAHI_RECORD="deploy/avahi/bellasreef.service"
@@ -49,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --host) PI_HOST="$2"; shift 2 ;;
         --no-verify) VERIFY=0; shift ;;
         --no-verify-ci) SKIP_CI_CHECK=1; shift ;;
+        --no-setup-code) SETUP_CODE=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -311,7 +321,7 @@ done
 
 if [[ $VERIFY -eq 0 ]]; then
     printf '\033[33mdeploy: skipping wire verification at your request\033[0m\n'
-    print_setup_code_if_open
+    [[ $SETUP_CODE -eq 1 ]] && print_setup_code_if_open
     exit 0
 fi
 
@@ -394,4 +404,4 @@ printf '\033[32m✓ deployed %s — API answering at contracts %s, fresh sample 
 
 # Spec: "the setup code ... as the final output of the deploy." Truly last,
 # below the banner above — not before it.
-print_setup_code_if_open
+[[ $SETUP_CODE -eq 1 ]] && print_setup_code_if_open
