@@ -200,3 +200,105 @@ def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "service record" in result.stdout.lower()
     assert result.returncode != 0
+
+
+def test_dry_run_reports_actions_without_running_them(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    marker = tmp_path / "apt-was-run"
+    write_stub(stubs, "apt-get", f'touch "{marker}"; exit 0')
+    write_stub(stubs, "sudo", '"$@"')
+    result = run_script("--dry-run", "--yes", root=tmp_path / "root", stubs=stubs)
+    assert "would" in result.stdout.lower()
+    assert not marker.exists(), "--dry-run executed a mutating command"
+
+
+def test_yes_accepts_offers_without_prompting(tmp_path: Path) -> None:
+    # ih_confirm's --yes path prints "(--yes)" and returns without touching
+    # /dev/tty or stdin. Prove both: the marker is in the output, and the run
+    # completes with stdin closed rather than hanging waiting for an answer
+    # (a genuine hang would fail this test with a TimeoutExpired instead of
+    # an assertion — either way the "it blocked" case does not pass quietly).
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# nothing\n")
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "apt-get", "exit 0")
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--dry-run", "--yes"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "IH_ROOT": str(root),
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+        },
+        timeout=60,
+    )
+    assert result.returncode in (0, 1)
+    assert "(--yes)" in result.stdout
+
+
+def test_declining_an_offer_leaves_the_failure_standing(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        input="n\n" * 10,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "IH_ROOT": str(tmp_path / "root"),
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+        },
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "docker" in result.stdout.lower()
+
+
+def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> None:
+    # Controller ruling: ih_phase2_requirements must end with a verification
+    # pass. Without it, a check that fails, gets remediated, and now passes
+    # still leaves its original FAIL sitting in IH_FAILURES, so a successful
+    # install would still exit non-zero. Prove the opposite: docker is
+    # missing, --yes accepts the offered install, the stubbed "sh" (the
+    # convenience-script installer's interpreter) makes a working "docker"
+    # appear on PATH as its side effect, and the run reports success.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "usermod", "exit 0")
+    write_stub(
+        stubs,
+        "sh",
+        f'''
+cat > "{stubs}/docker" <<'DOCKER_STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; else echo ""; fi
+exit 0
+DOCKER_STUB
+chmod +x "{stubs}/docker"
+exit 0
+''',
+    )
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--yes"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "IH_ROOT": str(root),
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+        },
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "requirement(s) failed" not in result.stdout

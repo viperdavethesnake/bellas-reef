@@ -20,11 +20,11 @@
 # suite can point the whole script at a fixture directory with stub
 # executables on PATH. A literal /etc or /sys path in this file is a bug.
 #
-# SC2034 (appears unused): IH_DRY_RUN, IH_CHECK_ONLY, IH_YES and REPO_DIR are
-# this skeleton's declared interface (see Task 1's Interfaces block) — the
-# phases that read them land in later tasks of this plan. Disabled file-wide
-# rather than scattered per-line so the flag block below stays exactly the
-# shape later tasks extend.
+# SC2034 (appears unused): IH_CHECK_ONLY is this skeleton's declared
+# interface (see Task 1's Interfaces block) — the phase-gating that reads it
+# lands in a later task of this plan. Disabled file-wide rather than
+# scattered per-line so the flag block below stays exactly the shape later
+# tasks extend.
 # shellcheck disable=SC2034
 
 set -uo pipefail
@@ -259,8 +259,98 @@ ih_check_avahi() {
     return $rc
 }
 
+# ------------------------------------------------------------------ consent
+
+# Nothing is installed silently. --yes accepts everything, --dry-run refuses
+# everything at the point of execution rather than at the point of consent, so
+# a dry run shows the full set of actions rather than stopping at the first.
+ih_confirm() {
+    local prompt="$1"
+    if (( IH_YES )); then
+        printf '  %s [y/N] y (--yes)\n' "$prompt"
+        return 0
+    fi
+    local answer
+    read -r -p "  ${prompt} [y/N] " answer </dev/tty 2>/dev/null || answer="n"
+    [[ "$answer" =~ ^[Yy] ]]
+}
+
+ih_run() {
+    local description="$1"; shift
+    if (( IH_DRY_RUN )); then
+        ih_would "$description: $*"
+        return 0
+    fi
+    if ! "$@"; then
+        ih_fail "${description} failed"
+        return 1
+    fi
+    ih_pass "$description"
+    return 0
+}
+
+ih_offer_install() {
+    local label="$1"; shift
+    if ! ih_confirm "install ${label}?"; then
+        ih_warn "declined: ${label}"
+        return 1
+    fi
+    ih_run "installing ${label}" sudo apt-get install -y "$@"
+}
+
+# Runs a check with its PASS/FAIL/UNVERIFIED line suppressed. Used only for
+# phase 2's attempt pass below: each check already wrote its result to
+# IH_FAILURES/IH_UNVERIFIED before any remediation for it could run, so
+# printing here would show a FAIL for something the very next line is about
+# to offer to fix. The verification pass after remediation prints for real
+# and is what the arrays and the exit code are read from.
+ih_check_quietly() {
+    "$@" >/dev/null 2>&1
+}
+
 ih_phase2_requirements() {
     ih_step "2. hard requirements"
+
+    if ! ih_check_quietly ih_check_docker; then
+        if ih_confirm "install Docker with the official convenience script?"; then
+            ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
+            ih_run "adding ${USER} to the docker group" sudo usermod -aG docker "$USER"
+            ih_warn "log out and back in for the docker group to take effect, then re-run"
+        fi
+    fi
+
+    ih_check_quietly ih_check_arch
+    ih_check_quietly ih_check_kernel
+    ih_check_quietly ih_check_memory
+    ih_check_quietly ih_check_disk
+
+    if ! ih_check_quietly ih_check_clock; then
+        if ih_offer_install "chrony and fake-hwclock" chrony fake-hwclock; then
+            ih_run "enabling clock units" \
+                sudo systemctl enable chrony chrony-wait fake-hwclock-load fake-hwclock-save
+        fi
+    fi
+
+    if ! ih_check_quietly ih_check_avahi; then
+        ih_offer_install "avahi-daemon" avahi-daemon
+        if ih_confirm "set avahi allow-interfaces and install the service record?"; then
+            ih_run "installing the _bellasreef._tcp record" \
+                sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
+                        "${IH_ROOT}/etc/avahi/services/bellasreef.service"
+            ih_run "reloading avahi" sudo systemctl reload avahi-daemon
+        fi
+    fi
+
+    # The attempt pass above recorded every check's result before its own
+    # remediation had a chance to run, so IH_FAILURES/IH_UNVERIFIED describe
+    # a machine that (if anything was accepted and actually applied) no
+    # longer exists. Clear the slate and re-run every check once, for real —
+    # this pass, not the one above, is what ih_main reads to decide the exit
+    # code, and it is the only one the user sees printed in full.
+    IH_FAILURES=()
+    IH_UNVERIFIED=()
+    printf '\n'
+    ih_step "2. hard requirements (re-checking)"
     ih_check_docker
     ih_check_arch
     ih_check_kernel
@@ -268,6 +358,7 @@ ih_phase2_requirements() {
     ih_check_disk
     ih_check_clock
     ih_check_avahi
+
     return 0
 }
 
