@@ -68,10 +68,15 @@ def write_stub(stubs: Path, name: str, body: str) -> None:
 
 
 def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
-    stubs = tmp_path / "bin"
-    write_stub(stubs, "docker", "exit 0")
-    write_stub(stubs, "systemctl", "exit 1")
-    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    # Phase 1 finding nothing means ih_main falls through into phase 2, so a
+    # clean-machine fixture here needs phase 2 to also see a good machine —
+    # otherwise this is no longer testing phase 1 in isolation, it is
+    # testing phase 1 against a phase 2 that is bound to fail.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
     assert "no existing deployment found" in result.stdout
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -110,3 +115,66 @@ def test_phase1_stops_when_deploy_env_exists(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "already" in result.stdout.lower()
     assert "deploy/.env" in result.stdout
+
+
+FULL_STUBS = {
+    "docker": 'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; else echo ""; fi; exit 0',
+    "systemctl": "exit 1",
+    "uname": 'case "$1" in -m) echo aarch64 ;; -r) echo 6.18.39 ;; *) echo Linux ;; esac',
+    "free": 'echo "Mem: 8000000"',
+    "df": 'echo "100000000"',
+    "timedatectl": "echo yes",
+    "getent": "exit 2",
+}
+
+
+def make_stubs(tmp_path: Path, overrides: dict[str, str] | None = None) -> Path:
+    stubs = tmp_path / "bin"
+    merged = dict(FULL_STUBS)
+    if overrides:
+        merged.update(overrides)
+    for name, body in merged.items():
+        write_stub(stubs, name, body)
+    return stubs
+
+
+def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "FAIL" not in result.stdout, result.stdout
+    assert result.returncode == 0
+
+
+def test_phase2_fails_when_docker_is_absent(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "FAIL" in result.stdout
+    assert "docker" in result.stdout.lower()
+    assert result.returncode != 0
+
+
+def test_phase2_fails_when_compose_v2_is_missing(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path, {"docker": 'if [[ "$1" == "compose" ]]; then exit 1; fi; exit 0'})
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "FAIL" in result.stdout
+    assert "compose" in result.stdout.lower()
+
+
+def test_phase2_unverified_when_clock_state_is_unknown(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path, {"timedatectl": "exit 1"})
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "UNVERIFIED" in result.stdout
+    assert result.returncode != 0, "an unverified check must not exit green"
+
+
+def test_phase2_flags_avahi_advertising_docker_bridges(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "allow-interfaces" in result.stdout

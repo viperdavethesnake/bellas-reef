@@ -133,11 +133,159 @@ ih_phase1_already_deployed() {
     return 1
 }
 
+# ------------------------------------------------------------------ phase 2
+
+IH_MIN_KERNEL_MAJOR=6
+IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
+IH_MIN_DISK_KB=16000000      # 16 GB. Measured images are ~1.6 GB before data.
+
+ih_check_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        ih_fail "docker is not installed"
+        return 1
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        ih_fail "docker is installed but Compose v2 is not available"
+        return 1
+    fi
+    ih_pass "docker with Compose v2"
+    return 0
+}
+
+ih_check_arch() {
+    local arch
+    arch="$(uname -m 2>/dev/null)"
+    case "$arch" in
+        aarch64|arm64|x86_64|amd64) ih_pass "architecture ${arch}"; return 0 ;;
+        "") ih_unverified "could not read the architecture"; return 2 ;;
+        *)  ih_fail "architecture ${arch} is not supported; images are arm64 and amd64"; return 1 ;;
+    esac
+}
+
+ih_check_kernel() {
+    local release major
+    release="$(uname -r 2>/dev/null)"
+    if [[ -z "$release" ]]; then
+        ih_unverified "could not read the kernel version"
+        return 2
+    fi
+    major="${release%%.*}"
+    if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= IH_MIN_KERNEL_MAJOR )); then
+        ih_pass "kernel ${release}"
+        return 0
+    fi
+    ih_fail "kernel ${release} is below the ${IH_MIN_KERNEL_MAJOR}.x floor"
+    return 1
+}
+
+ih_check_memory() {
+    local kb
+    kb="$(awk '/^Mem/ {print $2; exit}' <(free -k 2>/dev/null) 2>/dev/null)"
+    if [[ -z "$kb" || ! "$kb" =~ ^[0-9]+$ ]]; then
+        ih_unverified "could not read total memory"
+        return 2
+    fi
+    if (( kb >= IH_MIN_MEM_KB )); then
+        ih_pass "memory $(( kb / 1024 )) MB"
+        return 0
+    fi
+    # Warn rather than fail: it may run, and refusing to try is not our call.
+    ih_warn "memory $(( kb / 1024 )) MB is below the recommended $(( IH_MIN_MEM_KB / 1024 )) MB"
+    return 0
+}
+
+ih_check_disk() {
+    local kb
+    kb="$(df -k --output=avail "${IH_ROOT}/" 2>/dev/null | tail -1 | tr -d ' ')"
+    if [[ -z "$kb" || ! "$kb" =~ ^[0-9]+$ ]]; then
+        ih_unverified "could not read free disk space"
+        return 2
+    fi
+    if (( kb >= IH_MIN_DISK_KB )); then
+        ih_pass "free disk $(( kb / 1024 / 1024 )) GB"
+        return 0
+    fi
+    ih_fail "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_MIN_DISK_KB / 1024 / 1024 )) GB floor"
+    return 1
+}
+
+# An override is a deadline and the API refuses to compute one from a clock
+# chrony is about to step. A hub with a wrong clock is a hub that doses at the
+# wrong hour, so this is a hard requirement rather than a nicety.
+ih_check_clock() {
+    local synced
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+    if [[ -z "$synced" ]]; then
+        ih_unverified "could not read clock synchronisation state"
+        return 2
+    fi
+    if [[ "$synced" == "yes" ]]; then
+        ih_pass "clock synchronised"
+        return 0
+    fi
+    ih_fail "clock is not synchronised; install and enable chrony"
+    return 1
+}
+
+# Two separate things, both required. The allowlist stops avahi advertising
+# Docker's bridge address, which is unreachable from the LAN and made clients
+# intermittently resolve the hub to an address that does not work. The
+# services directory is where the _bellasreef._tcp service record lives —
+# that record is how the app identifies a reef controller and learns its
+# port, a hostname A record alone is not enough — but writing the record
+# itself is remediation (a later task); here we only confirm avahi-daemon is
+# installed with a place to put it.
+ih_check_avahi() {
+    local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
+    local svcdir="${IH_ROOT}/etc/avahi/services"
+    local rc=0
+
+    if [[ ! -f "$conf" ]]; then
+        ih_fail "avahi-daemon is not installed"
+        return 1
+    fi
+
+    if grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$conf"; then
+        ih_pass "avahi allow-interfaces is set"
+    else
+        ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
+        rc=1
+    fi
+
+    if [[ -d "$svcdir" ]]; then
+        ih_pass "avahi services directory present for the _bellasreef._tcp record"
+    else
+        ih_fail "avahi services directory missing; the app cannot find this hub"
+        rc=1
+    fi
+
+    return $rc
+}
+
+ih_phase2_requirements() {
+    ih_step "2. hard requirements"
+    ih_check_docker
+    ih_check_arch
+    ih_check_kernel
+    ih_check_memory
+    ih_check_disk
+    ih_check_clock
+    ih_check_avahi
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
     if ih_phase1_already_deployed; then
         exit 0
+    fi
+    ih_phase2_requirements
+    if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 )); then
+        printf '\n'
+        (( ${#IH_FAILURES[@]} > 0 ))    && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
+        (( ${#IH_UNVERIFIED[@]} > 0 )) && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+        exit 1
     fi
     return 0
 }
