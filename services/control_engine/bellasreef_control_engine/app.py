@@ -355,6 +355,15 @@ class ControlEngine:
         An override whose deadline passed while we were down is closed by the
         store and never applied — the operator asked for thirty minutes, and
         honouring it hours later is not that.
+
+        This is the *only* place ``load_active`` is called, and it runs once,
+        before the loop's first tick. That matters: ``load_active`` lapses by
+        wall clock and re-arms every survivor from wall clock, which is the
+        right thing to do exactly once, at wake, when the monotonic origin
+        has just been reborn and the wall clock is all there is to go on.
+        Every tick after this, :meth:`_reload_overrides` reads with
+        ``list_active`` instead — no lapse, no re-arm — so a hold this process
+        is already watching keeps the monotonic deadline armed here.
         """
         if self.overrides is None:
             return
@@ -366,7 +375,21 @@ class ControlEngine:
         )
 
     async def _expire_overrides(self) -> None:
-        """Release anything whose monotonic deadline has passed."""
+        """Release anything whose *monotonic* deadline has passed.
+
+        Must run before :meth:`_reload_overrides` in :meth:`_tick`. The two
+        clocks matter here (see ``bellasreef_db.overrides``'s module
+        docstring): every override this process is already watching was armed
+        with a monotonic deadline precisely so a wall-clock step mid-run
+        (chrony correcting after a power cut) cannot shorten or lengthen it.
+        Deciding expiry here, against that monotonic deadline, and closing the
+        row ourselves with ``release_reason='expired'`` is what keeps that
+        promise. Nothing else closes a row mid-run: the reload below reads
+        with ``list_active``, which touches neither rows nor deadlines, so a
+        row this process is watching is released here, against the monotonic
+        clock, or by another client — never by a wall-clock comparison the
+        engine did not ask for.
+        """
         if self.overrides is None or not self._held:
             return
         for target, override in list(self._held.items()):
@@ -376,8 +399,51 @@ class ControlEngine:
                 self.metrics.suppressed.labels("override_expired").inc()
                 log.info("override expired", extra={"target": target})
 
+    async def _reload_overrides(self) -> None:
+        """Pick up creations and releases made by another client mid-run.
+
+        ``self._held`` was previously only ever populated once, by
+        ``_rearm_overrides`` at startup — an override the API created or
+        released against Postgres *after* that, on a running engine, never
+        touched this dict, so it was returned 200 and simply never acted on
+        until the next restart. Re-reading the store every tick is the fix:
+        a target missing from the fresh read (manual release, supersede)
+        drops out here exactly like it would have dropped out of the reply
+        to a fresh "what's active" query.
+
+        Two rules keep the monotonic promise intact while doing that:
+
+        * The read is ``list_active``, not ``load_active``. ``load_active``
+          lapses rows by wall clock and re-arms every survivor from wall
+          clock — right at wake, wrong on a running engine, where a chrony
+          step would shorten or lengthen a hold the operator already placed.
+        * A target already held **with the same override id** keeps the
+          object it was armed with, monotonic deadline and all. Only a row
+          this process has not seen before — a new hold, or a superseding
+          one on a target it was already watching — is armed here, from the
+          moment it is first seen. A never-held row already past its wall
+          deadline arms to "now" and is closed by ``_expire_overrides`` on
+          the next tick, with reason ``'expired'``.
+
+        ``_expire_overrides`` runs first and has already released anything
+        whose monotonic deadline passed, so those rows are no longer
+        unreleased by the time this reads and cannot come back.
+        """
+        if self.overrides is None:
+            return
+        held: dict[str, ActiveOverride] = {}
+        for fresh in await self.overrides.list_active():
+            current = self._held.get(fresh.target)
+            if current is not None and current.id == fresh.id:
+                held[fresh.target] = current
+            else:
+                fresh.arm()
+                held[fresh.target] = fresh
+        self._held = held
+
     async def _tick(self, now: datetime) -> None:
         await self._expire_overrides()
+        await self._reload_overrides()
         await self._sweep_silence(now)
         held = {t: o.duty for t, o in self._held.items()}
         intents = self.scheduler.due(now, held)

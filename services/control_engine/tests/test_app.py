@@ -10,14 +10,14 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from bellasreef_contracts import ActuatorCommand, DeviceAssignment
 from bellasreef_control_engine.app import ControlEngine, load_profiles
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
-from bellasreef_db.overrides import ActiveOverride
+from bellasreef_db.overrides import ActiveOverride, OverrideStore, ReleaseReason
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -67,6 +67,65 @@ class _FakePublisher(CommandPublisher):
         self.published.append(command)
 
 
+class _FakeOverrideStore(OverrideStore):
+    """An OverrideStore whose active rows live in a dict, not Postgres.
+
+    Subclasses OverrideStore (rather than duck-typing) for the same reason
+    _FakePublisher above subclasses CommandPublisher: ``engine.overrides``
+    stays a real ``OverrideStore | None`` under mypy --strict. Deliberately
+    does not call ``super().__init__`` — it needs no ``AsyncEngine``, since
+    every method Postgres-backed methods touch is overridden here.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, ActiveOverride] = {}
+        self.released: list[tuple[UUID, ReleaseReason]] = []
+        #: The store's idea of wall time. None means the real clock; a test
+        #: sets it to simulate chrony stepping the clock under a running engine.
+        self.wall_now: datetime | None = None
+
+    def _clock(self, now: datetime | None) -> datetime:
+        return now or self.wall_now or datetime.now(UTC)
+
+    @staticmethod
+    def _fresh(o: ActiveOverride) -> ActiveOverride:
+        # The real store builds a new ActiveOverride from the row on every
+        # read; it never hands back an object it returned before. Mirroring
+        # that is what lets these tests see whether the engine keeps its own
+        # armed deadline or takes whatever the latest read says.
+        return ActiveOverride(id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at)
+
+    async def load_active(self, *, now: datetime | None = None) -> list[ActiveOverride]:
+        # Same contract as the Postgres one: lapse-on-wake by *wall* clock,
+        # then re-arm every survivor from that same wall clock.
+        wall_now = self._clock(now)
+        for target, o in list(self.rows.items()):
+            if o.expires_at <= wall_now:
+                self.released.append((o.id, "lapsed"))
+                del self.rows[target]
+        live: list[ActiveOverride] = []
+        for o in self.rows.values():
+            fresh = self._fresh(o)
+            fresh.arm(wall_now=wall_now)
+            live.append(fresh)
+        return live
+
+    async def list_active(self) -> list[ActiveOverride]:
+        # Same contract as the Postgres one: a plain read of what is unreleased,
+        # touching neither the rows nor any deadline.
+        return [self._fresh(o) for o in self.rows.values()]
+
+    async def release(
+        self, override_id: UUID, reason: ReleaseReason, *, now: datetime | None = None
+    ) -> bool:
+        self.released.append((override_id, reason))
+        for target, override in list(self.rows.items()):
+            if override.id == override_id:
+                del self.rows[target]
+                return True
+        return False
+
+
 @pytest.fixture
 def engine_with_fake_publisher() -> tuple[ControlEngine, list[ActuatorCommand]]:
     """A ControlEngine with one channel profile ("led-blue") and a fake spine.
@@ -78,6 +137,21 @@ def engine_with_fake_publisher() -> tuple[ControlEngine, list[ActuatorCommand]]:
     fake = _FakePublisher()
     engine.publisher = fake
     return engine, fake.published
+
+
+@pytest.fixture
+def engine_with_fake_store() -> tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore]:
+    """Same shape as ``engine_with_fake_publisher``, plus a fake OverrideStore.
+
+    Used only by TestLiveOverridePickup below, which needs overrides to flow
+    through a store (not be poked directly into ``engine._held``) to prove
+    the per-tick reload actually happens.
+    """
+    store = _FakeOverrideStore()
+    engine = ControlEngine([profile()], metrics_port=0, override_store=store)
+    fake = _FakePublisher()
+    engine.publisher = fake
+    return engine, fake.published, store
 
 
 class TestClockTrustGate:
@@ -298,6 +372,187 @@ class TestHeldUnprofiledChannelPublishes:
         asyncio.run(engine._tick(datetime.now(UTC)))
         assert [c.actuator_id for c in published] == ["pi-pwm-0", "pi-pwm-0"]
         assert published[1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
+
+
+class TestLiveOverridePickup:
+    """An override created or released through the store while the engine is
+    already running must be picked up on the *next tick* — not only at the
+    next restart. Before this fix, ``self._held`` was populated exactly once,
+    by ``_rearm_overrides`` at startup; ``_expire_overrides`` only ever
+    deleted from it. A hold the API placed against a running engine was
+    stored and returned 200, and never once reached ``scheduler.due``."""
+
+    def test_an_override_created_after_start_is_commanded_on_the_next_tick(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        engine, published, store = engine_with_fake_store
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+
+        # First tick: nothing in the store yet, matching an engine that has
+        # been running for a while with no override placed.
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert published == []
+
+        # A client places an override directly against the store — exactly
+        # what the API's create endpoint does against a live engine.
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0"]
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+    def test_a_release_in_the_store_stops_actuation_on_the_next_tick(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        engine, published, store = engine_with_fake_store
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+        # Another client (a DELETE through the API) releases it directly in
+        # the store — not through this engine's ``_held`` at all.
+        del store.rows["pi-pwm-0"]
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0", "pi-pwm-0"]
+        assert published[1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
+
+    def test_expiry_bookkeeping_still_releases_and_audits_the_row(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """The monotonic-deadline expiry path (``_expire_overrides``) must
+        keep doing its own job — releasing with reason 'expired' and
+        recording the metric/log — rather than silently being subsumed by
+        the reload's ``load_active`` call."""
+        engine, _published, store = engine_with_fake_store
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        override_id = uuid4()
+        override = ActiveOverride(
+            id=override_id,
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        # Force the armed monotonic deadline into the past regardless of this
+        # process's real uptime, so the tick below sees it as already due.
+        override.arm(monotonic_now=-1_000_000.0, wall_now=datetime.now(UTC))
+        store.rows["pi-pwm-0"] = override
+        # Seed _held as _rearm_overrides would at startup, so the monotonic
+        # deadline armed above is the one _expire_overrides evaluates.
+        engine._held["pi-pwm-0"] = override
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+
+        samples = [s for m in engine.metrics.suppressed.collect() for s in m.samples]
+        expired_total = sum(
+            s.value
+            for s in samples
+            if s.name == "bellasreef_commands_suppressed_total"
+            and s.labels.get("cause") == "override_expired"
+        )
+        assert expired_total == 1.0
+        assert store.released == [(override_id, "expired")]
+        assert "pi-pwm-0" not in engine._held
+
+    def test_a_wall_clock_step_does_not_shorten_a_held_override(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """The per-tick reload must not re-couple a running override to the
+        wall clock. ``bellasreef_db.overrides`` promises that *within a run*
+        the deadline is monotonic: chrony stepping the clock (this board has
+        no RTC battery) can neither shorten nor lengthen a hold the operator
+        already placed. ``load_active`` lapses by wall clock and re-arms from
+        wall clock on every call — correct at wake, wrong every tick. So the
+        reload has to read without lapsing and keep the object (and armed
+        monotonic deadline) it is already watching for an unchanged id."""
+        engine, published, store = engine_with_fake_store
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        placed = datetime.now(UTC)
+        override_id = uuid4()
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=override_id,
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=placed + timedelta(hours=1),
+        )
+
+        asyncio.run(engine._tick(placed))
+        assert published[-1].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+        armed = engine._held["pi-pwm-0"]
+        assert armed.monotonic_deadline is not None
+
+        # chrony steps the clock two hours forward under the running engine.
+        # Monotonic time has barely moved: the operator's hour is still owed.
+        store.wall_now = placed + timedelta(hours=2)
+        asyncio.run(engine._tick(store.wall_now))
+
+        assert engine._held["pi-pwm-0"] is armed  # same object, same deadline
+        assert store.released == []
+        assert "pi-pwm-0" in store.rows
+        assert published[-1].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+    def test_a_superseding_override_on_the_same_target_is_re_armed(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """Keeping the held object is keyed on the override *id*, not the
+        target: a new row on the same target (the API superseded the old
+        one) is a different hold with its own deadline and must be armed
+        afresh — and its duty is what gets commanded."""
+        engine, published, store = engine_with_fake_store
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        first = engine._held["pi-pwm-0"]
+
+        replacement = uuid4()
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=replacement,
+            target="pi-pwm-0",
+            duty=0.8,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        asyncio.run(engine._tick(datetime.now(UTC)))
+
+        held = engine._held["pi-pwm-0"]
+        assert held is not first
+        assert held.id == replacement
+        assert held.monotonic_deadline is not None
+        assert published[-1].level.duty == pytest.approx(0.8)  # type: ignore[union-attr]
+
+    def test_overrides_none_drill_mode_ticks_without_crashing_or_commanding(self) -> None:
+        """No OverrideStore configured (drill mode) must not crash the reload
+        step, and must not conjure commands out of nowhere."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        assert engine.overrides is None
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+
+        assert fake.published == []
 
 
 class TestReconnectReDrain:
