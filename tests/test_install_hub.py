@@ -553,6 +553,85 @@ def test_phase3_says_which_interfaces_are_absent(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
+def full_root(tmp_path: Path) -> Path:
+    """A fixture root that clears every phase-1/2/3 gate cleanly, so a test
+    using it reaches phase 4.
+
+    Deliberately does NOT hand-roll the avahi files the way the task-6 brief
+    originally sketched (allow-interfaces set but no service record): that
+    combination fails ih_check_avahi's service-record check, which trips
+    ih_main's post-phase-2 failure gate and exits 1 before phase 3 or phase 4
+    ever run — verified empirically while writing these tests, the brief's
+    own phase4 tests could not pass against it. write_good_avahi_fixture
+    gives the one avahi state that actually clears phase 2.
+    """
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True, exist_ok=True)
+    (root / "dev/i2c-1").write_text("")
+    (root / "sys/bus/w1/devices").mkdir(parents=True)
+    (root / "sys/class/pwm/pwmchip0").mkdir(parents=True)
+    return root
+
+
+def test_phase4_reads_gids_off_the_machine(tmp_path: Path) -> None:
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": 'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac',
+        },
+    )
+    root = full_root(tmp_path)
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
+    assert "988" in result.stdout
+    assert "986" in result.stdout
+
+
+def test_phase4_reports_a_missing_group_rather_than_guessing(tmp_path: Path) -> None:
+    stubs = make_stubs(
+        tmp_path, {"getent": 'case "$2" in i2c) echo "i2c:x:108:" ;; *) exit 2 ;; esac'}
+    )
+    root = full_root(tmp_path)
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
+    assert "gpio" in result.stdout.lower()
+    assert "108" in result.stdout
+    assert "993" not in result.stdout, "a default GID was guessed"
+
+
+def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
+    # Controller ruling: the original version of this test only asserted
+    # result.returncode in (0, 1), which passes no matter what the script
+    # does. "Never overwrite deploy/.env" is a global constraint of this
+    # plan and needs a test that can actually fail: stage a real file at the
+    # exact path the script would write to (under IH_ROOT — see Ruling 1 on
+    # ih_phase4_configure itself, which is what makes staging under the
+    # fixture root instead of the real repo's deploy/.env possible at all),
+    # run the script for real (not --dry-run, so the write path is actually
+    # exercised), and assert the file comes out byte-identical.
+    #
+    # A non-empty sentinel here is intercepted by phase 1's own
+    # already-deployed check (it uses -s, non-empty) before phase 4's `-f`
+    # guard is ever reached — confirmed by running this fixture. That is
+    # still a faithful test of the stated invariant: from the outside,
+    # nothing about "never overwrite deploy/.env" says which phase has to be
+    # the one that stops it, and phase 1 stopping first is itself the
+    # correct behaviour for a host that looks already-configured.
+    stubs = make_stubs(tmp_path)
+    root = full_root(tmp_path)
+    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
+    envfile.write_text(sentinel)
+
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert envfile.read_text() == sentinel, "deploy/.env was modified"
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"

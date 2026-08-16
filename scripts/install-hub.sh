@@ -520,6 +520,76 @@ ih_phase3_hardware() {
     return 0
 }
 
+# ------------------------------------------------------------------ phase 4
+
+# Read, never defaulted. These are allocated by the OS when the package is
+# installed and differ between hosts: the reference Pi is 988 and 986, while
+# .env.example shipped 994 and 993, which were already wrong for it. A wrong
+# value fails as a permission error that reads like a hardware fault, so a
+# missing group is reported here and left empty rather than guessed.
+ih_gid_for() {
+    getent group "$1" 2>/dev/null | cut -d: -f3
+}
+
+ih_generate_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+}
+
+# The example file is read bare (real repo file, read-only, must exist for
+# the script to work at all) but the file this writes is always under
+# $IH_ROOT — unlike every other write in this script, deploy/.env is a real
+# path on the machine running the installer, and a bare path here would mean
+# any test that reaches this phase without --dry-run writes and chmod 600s
+# the developer's actual repository checkout.
+ih_phase4_configure() {
+    ih_step "4. configuration"
+
+    local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
+    local example="${REPO_DIR}/deploy/.env.example"
+
+    if [[ -f "$envfile" ]]; then
+        ih_pass "deploy/.env already exists; leaving it untouched"
+        return 0
+    fi
+
+    local i2c_gid gpio_gid
+    i2c_gid="$(ih_gid_for i2c)"
+    gpio_gid="$(ih_gid_for gpio)"
+
+    if [[ -n "$i2c_gid" ]]; then
+        ih_pass "i2c group GID ${i2c_gid}"
+    else
+        ih_fail "no i2c group on this machine; hardware-io cannot open /dev/i2c-*"
+    fi
+
+    if [[ -n "$gpio_gid" ]]; then
+        ih_pass "gpio group GID ${gpio_gid}"
+    else
+        ih_fail "no gpio group on this machine; compose requires GPIO_GID and will refuse to start"
+    fi
+
+    local password
+    password="$(ih_generate_password)"
+    ih_pass "generated a Postgres password (32 chars, not shown)"
+
+    if (( IH_DRY_RUN )); then
+        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>}"
+        return 0
+    fi
+
+    cp "$example" "$envfile"
+    sed -i.bak \
+        -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${password}|" \
+        -e "s|^BELLASREEF_DATABASE_URL=.*|BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:${password}@postgres:5432/bellasreef|" \
+        -e "s|^I2C_GID=.*|I2C_GID=${i2c_gid}|" \
+        -e "s|^GPIO_GID=.*|GPIO_GID=${gpio_gid}|" \
+        "$envfile"
+    rm -f "${envfile}.bak"
+    chmod 600 "$envfile"
+    ih_pass "wrote deploy/.env"
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -540,6 +610,7 @@ ih_main() {
         ih_pass "checks complete (--check-only); nothing was changed"
         exit 0
     fi
+    ih_phase4_configure
     return 0
 }
 
