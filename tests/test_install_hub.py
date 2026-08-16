@@ -93,3 +93,20 @@ def test_phase1_stops_when_the_boot_unit_is_enabled(tmp_path: Path) -> None:
     result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
     assert "already" in result.stdout.lower()
     assert "bellasreef.service" in result.stdout
+
+
+def test_phase1_stops_when_deploy_env_exists(tmp_path: Path) -> None:
+    stubs = tmp_path / "bin"
+    write_stub(stubs, "docker", "exit 0")
+    write_stub(stubs, "systemctl", "exit 1")
+    root = tmp_path / "root"
+    # REPO_DIR (as the script computes it) is this repo's absolute path, so
+    # under a fixture root the script reads ${root}${REPO_DIR}/deploy/.env.
+    # Derive that nested path instead of hardcoding it.
+    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile.parent.mkdir(parents=True, exist_ok=True)
+    envfile.write_text("SOME_SETTING=value\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert result.returncode == 0
+    assert "already" in result.stdout.lower()
+    assert "deploy/.env" in result.stdout
