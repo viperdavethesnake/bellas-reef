@@ -198,6 +198,13 @@ services:
     environment:
       BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
       BELLASREEF_NATS_URL: nats://nats:4222
+      # No timedatectl in the container; the host guarantees clock trust by
+      # ordering the stack After=time-sync.target — same declaration the other
+      # two app services carry. Its absence here 503'd every createOverride
+      # (found live 2026-08-15, the lighting screen's first real hold): the
+      # api is the service that clock-gates override deadlines, and it was
+      # the one service not told the host had vouched for the clock.
+      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
       # The telemetry writer lives here: it needs the spine to read and Postgres
       # to resolve each device's control_authority (docs/device-classes.md §4).
       BELLASREEF_VM_URL: http://victoria-metrics:8428
