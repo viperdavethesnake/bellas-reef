@@ -36,6 +36,18 @@ IH_YES=0
 IH_FAILURES=()
 IH_UNVERIFIED=()
 
+# A remediation step's own failure (the install ran and exited nonzero) is
+# distinct from a check's failure and lives in its own array: phase 2's
+# verification pass clears IH_FAILURES/IH_UNVERIFIED and re-derives them from
+# a fresh run of the checks, but a failed installer isn't something a check
+# can rediscover on its own, so it must survive that reset. IH_ASSUME_NO_TTY
+# is a test-only seam (undocumented in --help on purpose) that forces
+# ih_confirm's no-tty fail-closed path regardless of whether the process
+# actually has a controlling terminal, so tests don't depend on how they
+# happen to be launched.
+IH_ACTION_FAILURES=()
+IH_ASSUME_NO_TTY="${IH_ASSUME_NO_TTY:-0}"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ------------------------------------------------------------------ output
@@ -47,6 +59,15 @@ ih_warn() { printf '  \033[33mWARN\033[0m  %s\n' "$1"; }
 ih_fail() {
     printf '  \033[31mFAIL\033[0m  %s\n' "$1"
     IH_FAILURES+=("$1")
+}
+
+# Same presentation as ih_fail, but for a remediation action's own failure
+# (an install command that ran and exited nonzero) rather than a check's
+# result. Kept in a separate array — see IH_ACTION_FAILURES above — so phase
+# 2's verification-pass reset cannot silently erase it.
+ih_action_fail() {
+    printf '  \033[31mFAIL\033[0m  %s\n' "$1"
+    IH_ACTION_FAILURES+=("$1")
 }
 
 # A check that could not run is not a check that passed. It is recorded
@@ -270,8 +291,18 @@ ih_confirm() {
         printf '  %s [y/N] y (--yes)\n' "$prompt"
         return 0
     fi
+    # Fail closed with no controlling terminal, but do it as a readability
+    # test rather than by muting stderr: `read -p` writes its prompt to
+    # stderr, and redirecting stderr to /dev/null on the same line (the
+    # earlier bug here) mutes the prompt even when a real terminal is
+    # attached — the one case ih_confirm actually has to ask a human. Only
+    # fd 0 is redirected below, so the prompt still reaches the real
+    # terminal's stderr when one is present.
+    if [[ "$IH_ASSUME_NO_TTY" == "1" ]] || [[ ! -r /dev/tty ]]; then
+        return 1
+    fi
     local answer
-    read -r -p "  ${prompt} [y/N] " answer </dev/tty 2>/dev/null || answer="n"
+    read -r -p "  ${prompt} [y/N] " answer </dev/tty || answer="n"
     [[ "$answer" =~ ^[Yy] ]]
 }
 
@@ -282,7 +313,7 @@ ih_run() {
         return 0
     fi
     if ! "$@"; then
-        ih_fail "${description} failed"
+        ih_action_fail "${description} failed"
         return 1
     fi
     ih_pass "$description"
@@ -311,10 +342,18 @@ ih_check_quietly() {
 ih_phase2_requirements() {
     ih_step "2. hard requirements"
 
+    # --check-only means exactly phases 1-3, no mutation (see --help). Every
+    # remediation offer below is gated on this so that a failed check is
+    # still reported — the check calls themselves are unconditional — but
+    # never turns into a prompt or an action. `(( ! IH_CHECK_ONLY )) && ...`
+    # short-circuits before ih_confirm/ih_offer_install run at all, so
+    # --check-only --yes cannot install anything either.
     if ! ih_check_quietly ih_check_docker; then
-        if ih_confirm "install Docker with the official convenience script?"; then
+        if (( ! IH_CHECK_ONLY )) && ih_confirm "install Docker with the official convenience script?"; then
+            local target_user
+            target_user="${USER:-$(id -un)}"
             ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
-            ih_run "adding ${USER} to the docker group" sudo usermod -aG docker "$USER"
+            ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
             ih_warn "log out and back in for the docker group to take effect, then re-run"
         fi
     fi
@@ -324,20 +363,38 @@ ih_phase2_requirements() {
     ih_check_quietly ih_check_memory
     ih_check_quietly ih_check_disk
 
-    if ! ih_check_quietly ih_check_clock; then
-        if ih_offer_install "chrony and fake-hwclock" chrony fake-hwclock; then
+    # ih_check_clock can return 2 (UNVERIFIED — timedatectl unreadable) as
+    # well as 1 (FAIL — genuinely unsynchronised). Those are not the same
+    # thing: a check that could not run is not evidence the clock is wrong,
+    # so only a real FAIL offers to install chrony. `if !` on the bare
+    # return code would treat both as "failed" and install on the strength
+    # of a check that never ran.
+    local clock_rc=0
+    ih_check_quietly ih_check_clock || clock_rc=$?
+    if (( clock_rc == 1 )); then
+        if (( ! IH_CHECK_ONLY )) && ih_offer_install "chrony and fake-hwclock" chrony fake-hwclock; then
             ih_run "enabling clock units" \
                 sudo systemctl enable chrony chrony-wait fake-hwclock-load fake-hwclock-save
         fi
     fi
 
     if ! ih_check_quietly ih_check_avahi; then
-        ih_offer_install "avahi-daemon" avahi-daemon
-        if ih_confirm "set avahi allow-interfaces and install the service record?"; then
-            ih_run "installing the _bellasreef._tcp record" \
-                sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
-                        "${IH_ROOT}/etc/avahi/services/bellasreef.service"
-            ih_run "reloading avahi" sudo systemctl reload avahi-daemon
+        # ih_offer_install's own return gates the record install, the same
+        # way the clock branch above gates enabling units on its offer's
+        # result: declining the avahi-daemon package must not leave the
+        # script trying to cp a record into a services/ directory that was
+        # never created, or reload a daemon that was never installed.
+        #
+        # The prompt only promises the service record — nothing in this
+        # branch ever edits avahi-daemon.conf's allow-interfaces, so it must
+        # never claim to.
+        if (( ! IH_CHECK_ONLY )) && ih_offer_install "avahi-daemon" avahi-daemon; then
+            if ih_confirm "install the _bellasreef._tcp service record?"; then
+                ih_run "installing the _bellasreef._tcp record" \
+                    sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
+                            "${IH_ROOT}/etc/avahi/services/bellasreef.service"
+                ih_run "reloading avahi" sudo systemctl reload avahi-daemon
+            fi
         fi
     fi
 
@@ -347,6 +404,12 @@ ih_phase2_requirements() {
     # longer exists. Clear the slate and re-run every check once, for real —
     # this pass, not the one above, is what ih_main reads to decide the exit
     # code, and it is the only one the user sees printed in full.
+    #
+    # IH_ACTION_FAILURES is deliberately NOT cleared here: an installer that
+    # ran and failed is not something the checks above can rediscover (e.g.
+    # ih_check_docker has no way to tell "docker is present because the
+    # install worked" from "docker is present and the group-add silently
+    # failed") — see ih_main, which reads all three arrays.
     IH_FAILURES=()
     IH_UNVERIFIED=()
     printf '\n'
@@ -369,10 +432,11 @@ ih_main() {
         exit 0
     fi
     ih_phase2_requirements
-    if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 )); then
+    if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
         printf '\n'
-        (( ${#IH_FAILURES[@]} > 0 ))    && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
-        (( ${#IH_UNVERIFIED[@]} > 0 )) && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
+        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
         exit 1
     fi
     return 0

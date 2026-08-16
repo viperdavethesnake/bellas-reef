@@ -11,8 +11,13 @@ version would stop checking.
 
 from __future__ import annotations
 
+import fcntl
 import os
+import pty
+import select
 import subprocess
+import termios
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +152,40 @@ def make_stubs(tmp_path: Path, overrides: dict[str, str] | None = None) -> Path:
     return stubs
 
 
+# Every command install-hub.sh's phase-2 remediation can shell out to. Each
+# gets a stub that writes a marker file and does nothing real, so a test that
+# expects no remediation to run (dry-run, declined, --check-only) can assert
+# every marker is absent — a regression that lets a mutating command through
+# leaves evidence instead of silently curling and running a real installer,
+# editing group membership, or touching a real avahi config.
+_MUTATION_GUARD_COMMANDS = ("sh", "curl", "usermod", "apt-get", "cp")
+
+
+def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
+    """Stub every mutating command phase 2 can reach, marker-file-only.
+
+    systemctl is handled separately: phase 1 legitimately calls
+    `systemctl is-enabled` (read-only) on every run, so a stub that marks
+    itself on any invocation would false-positive on that call. Only
+    `enable`/`reload` — the two mutating subcommands remediation uses — are
+    marked.
+    """
+    markers: dict[str, Path] = {}
+    for name in _MUTATION_GUARD_COMMANDS:
+        marker = tmp_path / f"{name}-was-run"
+        write_stub(stubs, name, f'touch "{marker}"; exit 0')
+        markers[name] = marker
+
+    systemctl_marker = tmp_path / "systemctl-was-run"
+    write_stub(
+        stubs,
+        "systemctl",
+        f'case "$1" in enable|reload) touch "{systemctl_marker}"; exit 0 ;; *) exit 1 ;; esac',
+    )
+    markers["systemctl"] = systemctl_marker
+    return markers
+
+
 def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
@@ -203,14 +242,17 @@ def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None
 
 
 def test_dry_run_reports_actions_without_running_them(tmp_path: Path) -> None:
+    # No avahi fixture, so avahi is broken too: both the docker branch and
+    # the avahi branch have something to offer, exercising every mutating
+    # route --dry-run must refuse at the point of execution.
     stubs = make_stubs(tmp_path)
     (stubs / "docker").unlink()
-    marker = tmp_path / "apt-was-run"
-    write_stub(stubs, "apt-get", f'touch "{marker}"; exit 0')
     write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
     result = run_script("--dry-run", "--yes", root=tmp_path / "root", stubs=stubs)
     assert "would" in result.stdout.lower()
-    assert not marker.exists(), "--dry-run executed a mutating command"
+    for name, marker in markers.items():
+        assert not marker.exists(), f"--dry-run executed {name}"
 
 
 def test_yes_accepts_offers_without_prompting(tmp_path: Path) -> None:
@@ -219,12 +261,14 @@ def test_yes_accepts_offers_without_prompting(tmp_path: Path) -> None:
     # completes with stdin closed rather than hanging waiting for an answer
     # (a genuine hang would fail this test with a TimeoutExpired instead of
     # an assertion — either way the "it blocked" case does not pass quietly).
+    # Also guard every mutating command --dry-run should have refused, same
+    # as the test above, since this run reaches the avahi remediation branch.
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     (root / "etc/avahi").mkdir(parents=True)
     (root / "etc/avahi/avahi-daemon.conf").write_text("# nothing\n")
     write_stub(stubs, "sudo", '"$@"')
-    write_stub(stubs, "apt-get", "exit 0")
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
     result = subprocess.run(
         ["bash", str(SCRIPT), "--dry-run", "--yes"],
         stdin=subprocess.DEVNULL,
@@ -239,26 +283,155 @@ def test_yes_accepts_offers_without_prompting(tmp_path: Path) -> None:
     )
     assert result.returncode in (0, 1)
     assert "(--yes)" in result.stdout
+    for name, marker in markers.items():
+        assert not marker.exists(), f"--dry-run executed {name}"
 
 
-def test_declining_an_offer_leaves_the_failure_standing(tmp_path: Path) -> None:
+def test_confirm_prompt_is_visible_on_a_real_tty(tmp_path: Path) -> None:
+    # Regression test for a critical finding: `read -p` writes its prompt to
+    # stderr, and ih_confirm used to redirect stderr to /dev/null on the same
+    # line, muting the prompt in the one mode where it actually asks a human
+    # — the script would sit at a blank line while a real operator typed
+    # blind. A subprocess with no controlling terminal can't exercise this
+    # (ih_confirm fails closed before ever reading), so drive the script
+    # under a real pty, same as how the bug was originally found.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    env = {
+        **os.environ,
+        "IH_ROOT": str(root),
+        "PATH": f"{stubs}:{os.environ['PATH']}",
+    }
+
+    # subprocess.Popen with stdin/stdout/stderr pointed at a pty's slave fd
+    # does NOT by itself make that pty the child's controlling terminal (the
+    # fds are just dup'd in, not opened by path) — /dev/tty inside the
+    # script then fails with "Device not configured", a different bug than
+    # the one this test exists to catch. preexec_fn runs in the forked
+    # child, before Popen's own dup2/exec setup, so it can setsid() (detach
+    # from pytest's session) and then TIOCSCTTY the slave fd onto the new
+    # session — the same handshake a real login shell performs. Avoids a
+    # raw pty.fork() of the whole pytest interpreter, which hung: forking a
+    # multi-threaded process such as pytest can deadlock the child on a lock
+    # held by another thread at fork time.
+    master_fd, slave_fd = pty.openpty()
+
+    def _become_session_leader() -> None:
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=_become_session_leader,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = b""
+    prompt_seen = False
+    deadline = time.monotonic() + 20
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 1)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if b"install Docker" in output and b"[y/N]" in output:
+                # The prompt itself is all this test is about — stop here
+                # rather than answering and waiting for a clean exit, which
+                # risks a second interactive read or a canonical-mode echo
+                # loop the test has no need to navigate.
+                prompt_seen = True
+                break
+    finally:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        os.close(master_fd)
+
+    assert prompt_seen, f"prompt never appeared on the pty; captured: {output!r}"
+
+
+def test_no_tty_declines_and_leaves_the_failure_standing(tmp_path: Path) -> None:
+    # ih_confirm reads only /dev/tty, never stdin, so feeding "n" on stdin
+    # (the previous version of this test) never exercises anything — it
+    # passes regardless of what's on stdin, because the real deciding factor
+    # is whether the process has a controlling terminal at all, which is not
+    # something a test should depend on how it happens to be launched.
+    # IH_ASSUME_NO_TTY makes that path deterministic: it forces ih_confirm's
+    # fail-closed branch the same way a genuinely absent tty would.
     stubs = make_stubs(tmp_path)
     (stubs / "docker").unlink()
     write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
     result = subprocess.run(
         ["bash", str(SCRIPT)],
-        input="n\n" * 10,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         env={
             **os.environ,
             "IH_ROOT": str(tmp_path / "root"),
+            "IH_ASSUME_NO_TTY": "1",
             "PATH": f"{stubs}:{os.environ['PATH']}",
         },
         timeout=60,
     )
     assert result.returncode != 0
     assert "docker" in result.stdout.lower()
+    for name, marker in markers.items():
+        assert not marker.exists(), f"declining still ran {name}"
+
+
+def test_check_only_never_remediates_even_with_yes(tmp_path: Path) -> None:
+    # --check-only is documented as "phases 1 to 3 only" and is read by
+    # eight other tests in this file as a way to inspect checks without
+    # side effects. Once phase 2 gained remediation, --check-only had to
+    # gain a matching guard or it would silently stop meaning what its own
+    # --help text and every one of those tests assume it means.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    result = run_script("--check-only", "--yes", root=tmp_path / "root", stubs=stubs)
+    assert result.returncode != 0
+    assert "docker" in result.stdout.lower()
+    assert "install Docker" not in result.stdout, "--check-only prompted for an install"
+    for name, marker in markers.items():
+        assert not marker.exists(), f"--check-only --yes ran {name}"
+
+
+def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
+    # ih_check_clock returns 2 (UNVERIFIED) when timedatectl itself can't be
+    # read, which is not evidence the clock is wrong. Remediation must only
+    # fire on a genuine FAIL (rc 1, clock readable and not synchronised) —
+    # branching on "any nonzero" would install chrony on the strength of a
+    # check that never ran.
+    stubs = make_stubs(tmp_path, {"timedatectl": "exit 1"})
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "UNVERIFIED" in result.stdout
+    assert result.returncode != 0
+    assert not markers["apt-get"].exists(), "unverified clock triggered a chrony install"
+    assert not markers["systemctl"].exists(), "unverified clock triggered enabling clock units"
 
 
 def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> None:
@@ -302,3 +475,49 @@ exit 0
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "requirement(s) failed" not in result.stdout
+
+
+def test_action_failure_is_not_erased_by_the_verification_pass(tmp_path: Path) -> None:
+    # The verification pass clears IH_FAILURES/IH_UNVERIFIED and re-derives
+    # them from a fresh run of the checks — correct, that's Ruling 1. But
+    # ih_run's own failures (an installer step that ran and exited nonzero)
+    # are not something a check can rediscover: ih_check_docker has no way
+    # to tell "docker is present because the install worked" from "docker is
+    # present and the group-add silently failed." Docker itself installs
+    # successfully here (same "sh" side-effect stub as the test above) but
+    # `usermod` fails, so the verification pass sees an all-green docker
+    # check while a real remediation step failed — the run must still report
+    # failure.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "usermod", "exit 1")
+    write_stub(
+        stubs,
+        "sh",
+        f'''
+cat > "{stubs}/docker" <<'DOCKER_STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; else echo ""; fi
+exit 0
+DOCKER_STUB
+chmod +x "{stubs}/docker"
+exit 0
+''',
+    )
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--yes"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "IH_ROOT": str(root),
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+        },
+        timeout=60,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "docker group" in result.stdout.lower()
