@@ -442,7 +442,15 @@ def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> Non
     # missing, --yes accepts the offered install, the stubbed "sh" (the
     # convenience-script installer's interpreter) makes a working "docker"
     # appear on PATH as its side effect, and the run reports success.
-    stubs = make_stubs(tmp_path)
+    #
+    # This run is not --check-only, so it reaches phase 4, which now gates
+    # ih_main on IH_FAILURES the same way phase 2 does. A real i2c/gpio
+    # getent stub is needed here so phase 4's own groups check doesn't add
+    # an unrelated FAIL and mask what this test is actually about.
+    stubs = make_stubs(
+        tmp_path,
+        {"getent": 'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'},
+    )
     (stubs / "docker").unlink()
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "usermod", "exit 0")
@@ -596,6 +604,25 @@ def test_phase4_reports_a_missing_group_rather_than_guessing(tmp_path: Path) -> 
     assert "gpio" in result.stdout.lower()
     assert "108" in result.stdout
     assert "993" not in result.stdout, "a default GID was guessed"
+
+
+def test_phase4_gate_stops_the_run_when_a_group_is_missing(tmp_path: Path) -> None:
+    # Controller ruling, prompted by the same class of bug as Task 4's I1: a
+    # FAIL that only prints and does not count. This is not a hypothetical —
+    # it's the Task 10 Banana Pi target verbatim: i2c exists at GID 108,
+    # there is no gpio group at all. Without a post-phase-4 gate, the run
+    # would fall through to exit 0 with an empty GPIO_GID written into
+    # deploy/.env, and compose.yaml's ${GPIO_GID:?} would only surface that
+    # at `docker compose up`, after phase 5 has already pulled images and run
+    # migrations on a machine that was already known to be unable to start.
+    stubs = make_stubs(
+        tmp_path, {"getent": 'case "$2" in i2c) echo "i2c:x:108:" ;; *) exit 2 ;; esac'}
+    )
+    root = full_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, "a missing gpio group must not exit 0"
+    assert "gpio" in result.stdout.lower()
+    assert "108" in result.stdout
 
 
 def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:

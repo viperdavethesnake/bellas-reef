@@ -611,6 +611,21 @@ ih_main() {
         exit 0
     fi
     ih_phase4_configure
+    # Same gate as after phase 2, for the same reason: a FAIL that only
+    # prints is not a FAIL that stops anything. A missing i2c or gpio group
+    # ships an empty *_GID into deploy/.env, and compose.yaml interpolates
+    # both as ${I2C_GID:?}/${GPIO_GID:?} — the `:?` form refuses to start the
+    # *entire* stack, not just hardware-io, with an error that names the
+    # variable rather than the cause. Without this gate, phase 5 (once it
+    # exists) would proceed to pull images and run migrations on a machine
+    # this phase already proved cannot come up.
+    if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
+        printf '\n'
+        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
+        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+        exit 1
+    fi
     return 0
 }
 
