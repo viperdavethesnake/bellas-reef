@@ -229,15 +229,12 @@ ih_check_clock() {
 
 # Two separate things, both required. The allowlist stops avahi advertising
 # Docker's bridge address, which is unreachable from the LAN and made clients
-# intermittently resolve the hub to an address that does not work. The
-# services directory is where the _bellasreef._tcp service record lives —
-# that record is how the app identifies a reef controller and learns its
-# port, a hostname A record alone is not enough — but writing the record
-# itself is remediation (a later task); here we only confirm avahi-daemon is
-# installed with a place to put it.
+# intermittently resolve the hub to an address that does not work. The service
+# record is how the app identifies a reef controller and learns its port; a
+# hostname A record alone is not enough.
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
-    local svcdir="${IH_ROOT}/etc/avahi/services"
+    local svc="${IH_ROOT}/etc/avahi/services/bellasreef.service"
     local rc=0
 
     if [[ ! -f "$conf" ]]; then
@@ -252,10 +249,10 @@ ih_check_avahi() {
         rc=1
     fi
 
-    if [[ -d "$svcdir" ]]; then
-        ih_pass "avahi services directory present for the _bellasreef._tcp record"
+    if [[ -f "$svc" ]]; then
+        ih_pass "_bellasreef._tcp service record installed"
     else
-        ih_fail "avahi services directory missing; the app cannot find this hub"
+        ih_fail "_bellasreef._tcp service record missing; the app cannot find this hub"
         rc=1
     fi
 

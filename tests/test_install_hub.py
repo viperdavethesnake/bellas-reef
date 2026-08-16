@@ -67,6 +67,16 @@ def write_stub(stubs: Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
+def write_good_avahi_fixture(root: Path) -> None:
+    """Populate an $IH_ROOT fixture with everything ih_check_avahi wants:
+    the allowlisted daemon config and an installed _bellasreef._tcp record."""
+    (root / "etc/avahi/services").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    (root / "etc/avahi/services/bellasreef.service").write_text(
+        "<service-group><name>bellasreef</name></service-group>\n"
+    )
+
+
 def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
     # Phase 1 finding nothing means ih_main falls through into phase 2, so a
     # clean-machine fixture here needs phase 2 to also see a good machine —
@@ -74,8 +84,7 @@ def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
     # testing phase 1 against a phase 2 that is bound to fail.
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
-    (root / "etc/avahi/services").mkdir(parents=True)
-    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    write_good_avahi_fixture(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "no existing deployment found" in result.stdout
     assert result.returncode == 0, result.stdout + result.stderr
@@ -141,8 +150,7 @@ def make_stubs(tmp_path: Path, overrides: dict[str, str] | None = None) -> Path:
 def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
-    (root / "etc/avahi/services").mkdir(parents=True)
-    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    write_good_avahi_fixture(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "FAIL" not in result.stdout, result.stdout
     assert result.returncode == 0
@@ -178,3 +186,17 @@ def test_phase2_flags_avahi_advertising_docker_bridges(tmp_path: Path) -> None:
     (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces" in result.stdout
+
+
+def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None:
+    # The services/ directory exists (avahi-daemon is installed and the
+    # allowlist is set) but nobody has written bellasreef.service into it.
+    # This is exactly the case a later task's remediation must detect and
+    # fix, so the check has to name it and the run must not exit green.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "service record" in result.stdout.lower()
+    assert result.returncode != 0
