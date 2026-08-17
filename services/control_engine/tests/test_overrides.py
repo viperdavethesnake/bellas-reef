@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
-from bellasreef_control_engine.scheduler import LightingScheduler
+from bellasreef_control_engine.scheduler import HeldTarget, LightingScheduler
 from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -193,7 +193,7 @@ class TestSchedulerIntegration:
         s = LightingScheduler([profile()], deadband=0.0)
         noon = datetime(2026, 6, 1, 12, tzinfo=UTC)
         assert s.due(noon)[0].duty == pytest.approx(1.0)
-        assert s.due(noon, {"blue": 0.0})[0].duty == pytest.approx(0.0)
+        assert s.due(noon, {"blue": HeldTarget(0.0, "ramp")})[0].duty == pytest.approx(0.0)
 
     def test_release_slews_back_to_the_schedule(self) -> None:
         """§5: override release is one of the three slew causes.
@@ -206,7 +206,7 @@ class TestSchedulerIntegration:
         # Held dark; converge onto the override first.
         held = noon
         for _ in range(5):
-            for intent in s.due(held, {"blue": 0.0}):
+            for intent in s.due(held, {"blue": HeldTarget(0.0, "ramp")}):
                 s.mark_emitted(intent, held)
             held = held + timedelta(seconds=10)
 

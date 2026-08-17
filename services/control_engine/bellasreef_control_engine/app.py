@@ -48,7 +48,7 @@ from bellasreef_control_engine.alerts import AlertSupervisor, SilenceWatcher, Th
 from bellasreef_control_engine.assignments import AssignmentLedger
 from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
-from bellasreef_control_engine.scheduler import Intent, LightingScheduler
+from bellasreef_control_engine.scheduler import HeldTarget, Intent, LightingScheduler
 
 __all__ = ["ControlEngine", "load_profiles", "main"]
 
@@ -445,7 +445,7 @@ class ControlEngine:
         await self._expire_overrides()
         await self._reload_overrides()
         await self._sweep_silence(now)
-        held = {t: o.duty for t, o in self._held.items()}
+        held = {t: HeldTarget(o.duty, o.transition) for t, o in self._held.items()}
         intents = self.scheduler.due(now, held)
         for intent in intents:
             if not self.assignments.is_adopted(intent.channel_id):

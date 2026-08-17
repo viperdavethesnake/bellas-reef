@@ -93,7 +93,9 @@ class _FakeOverrideStore(OverrideStore):
         # read; it never hands back an object it returned before. Mirroring
         # that is what lets these tests see whether the engine keeps its own
         # armed deadline or takes whatever the latest read says.
-        return ActiveOverride(id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at)
+        return ActiveOverride(
+            id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at, transition=o.transition
+        )
 
     async def load_active(self, *, now: datetime | None = None) -> list[ActiveOverride]:
         # Same contract as the Postgres one: lapse-on-wake by *wall* clock,

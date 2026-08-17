@@ -8,7 +8,7 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
-from bellasreef_control_engine.scheduler import LightingScheduler
+from bellasreef_control_engine.scheduler import HeldTarget, LightingScheduler
 
 
 def ramp(channel: str = "blue") -> ChannelProfile:
@@ -180,19 +180,19 @@ class TestHeldUnprofiledChannels:
 
     def test_held_unprofiled_channel_is_emitted(self) -> None:
         sched = LightingScheduler([], max_duty_delta_per_s=None)  # no profiles
-        intents = sched.due(T0, {"pi-pwm-0": 0.5})
+        intents = sched.due(T0, {"pi-pwm-0": HeldTarget(0.5, "ramp")})
         assert [(i.channel_id, i.duty) for i in intents] == [("pi-pwm-0", 0.5)]
 
     def test_held_unprofiled_channel_slews_from_safe_start(self) -> None:
         # with a slew rate configured, the first emission climbs from
         # SAFE_DUTY toward the held duty rather than popping to it
         sched = LightingScheduler([], max_duty_delta_per_s=0.1)
-        first = sched.due(T0, {"pi-pwm-0": 0.5})
+        first = sched.due(T0, {"pi-pwm-0": HeldTarget(0.5, "ramp")})
         assert first and first[0].duty < 0.5  # converging, not popped
 
     def test_release_slews_back_to_safe_and_goes_quiet(self) -> None:
         sched = LightingScheduler([], max_duty_delta_per_s=None)
-        held = sched.due(T0, {"pi-pwm-0": 0.5})
+        held = sched.due(T0, {"pi-pwm-0": HeldTarget(0.5, "ramp")})
         sched.mark_emitted(held[0], T0)
         # override gone: target falls to SAFE_DUTY
         released = sched.due(T1, {})
@@ -204,9 +204,119 @@ class TestHeldUnprofiledChannels:
     def test_profiled_channels_unaffected_by_held_strangers(self) -> None:
         # a profile plus a held stranger: both emit, profile from its own curve
         sched = LightingScheduler([PROFILE_LED_BLUE], max_duty_delta_per_s=None)
-        intents = sched.due(T0, {"pi-pwm-0": 0.3})
+        intents = sched.due(T0, {"pi-pwm-0": HeldTarget(0.3, "ramp")})
         ids = {i.channel_id for i in intents}
         assert ids == {"led-blue", "pi-pwm-0"}
+
+
+def snap(duty: float) -> HeldTarget:
+    return HeldTarget(duty, "snap")
+
+
+def ramp_hold(duty: float) -> HeldTarget:
+    return HeldTarget(duty, "ramp")
+
+
+class TestHoldTransition:
+    """A target that comes from a hold moves the way that hold says
+    (spec 2026-08-17). Slew 0.01/s with ticks 5 s apart: a ramp moves at most
+    0.05 per tick, so anything larger in one intent is a snap."""
+
+    def test_snap_hold_arrives_in_one_intent(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [intent] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        assert (intent.duty, intent.reason, intent.hold) == (1.0, "hold", "snap")
+
+    def test_ramp_hold_still_slews(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [intent] = s.due(T0, {"pi-pwm-0": ramp_hold(1.0)})
+        assert intent.duty < 1.0
+        assert intent.hold == "ramp"
+
+    def test_snap_release_jumps_to_resting_then_goes_quiet(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01, refresh_s=3600)
+        [held] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(held, T0)
+        [released] = s.due(T1, {})
+        assert (released.duty, released.reason, released.hold) == (0.0, "release", None)
+        s.mark_emitted(released, T1)
+        assert s.due(T2, {}) == []
+
+    def test_ramp_release_still_slews(self) -> None:
+        # slew 0.1/s: T0 arrives at 0.0 (dt 0), T1 (+5 s) converges to 0.5,
+        # then release 2 s later may move at most 0.2 -> 0.3, reason converge
+        s = LightingScheduler([], max_duty_delta_per_s=0.1)
+        [a] = s.due(T0, {"pi-pwm-0": ramp_hold(1.0)})
+        s.mark_emitted(a, T0)
+        [b] = s.due(T1, {"pi-pwm-0": ramp_hold(1.0)})
+        assert b.duty == pytest.approx(0.5)
+        s.mark_emitted(b, T1)
+        [released] = s.due(at(9, 0, 7), {})
+        assert (released.reason, released.hold) == ("converge", None)
+        assert released.duty == pytest.approx(0.3)
+
+    def test_supersede_ramp_with_snap_jumps(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [first] = s.due(T0, {"pi-pwm-0": ramp_hold(1.0)})
+        s.mark_emitted(first, T0)
+        [second] = s.due(T1, {"pi-pwm-0": snap(1.0)})
+        assert (second.duty, second.reason, second.hold) == (1.0, "hold", "snap")
+
+    def test_supersede_snap_with_ramp_ramps_and_forgets_snap(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01, refresh_s=3600)
+        [first] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(first, T0)
+        [second] = s.due(T1, {"pi-pwm-0": ramp_hold(0.0)})
+        assert second.reason == "hold"  # arrival of the new hold is announced
+        assert second.hold == "ramp"
+        assert second.duty == pytest.approx(0.95)  # ramping down, not snapping
+        s.mark_emitted(second, T1)
+        # release now behaves as a ramp release: converge, not a jump
+        [released] = s.due(T2, {})
+        assert released.reason == "converge"
+        assert released.duty == pytest.approx(0.90)
+
+    def test_restart_rearm_honours_snap(self) -> None:
+        # cold scheduler (engine restart) with a snap hold already owed
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [intent] = s.due(T0, {"pi-pwm-0": snap(0.7)})
+        assert (intent.duty, intent.reason) == (0.7, "hold")
+
+    def test_forget_clears_release_memory(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [held] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(held, T0)
+        s.forget("pi-pwm-0")
+        # forgotten and unheld: nothing surfaces, and nothing snap-releases
+        assert s.due(T1, {}) == []
+
+    def test_reset_clears_release_memory(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [held] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(held, T0)
+        s.reset()
+        assert s.due(T1, {}) == []
+
+    def test_profiled_channel_snap_release_jumps_to_the_curve(self) -> None:
+        s = LightingScheduler([ramp()], deadband=0.0, max_duty_delta_per_s=0.01)
+        [held] = s.due(at(9), {"blue": snap(1.0)})
+        s.mark_emitted(held, at(9))
+        [released] = s.due(at(9, 0, 5), {})
+        # 09:00 on the 06:00→12:00 ramp is 0.5; jump straight there
+        assert released.reason == "release"
+        assert released.duty == pytest.approx(0.5, abs=0.001)
+
+    def test_snap_hold_at_target_refreshes_like_any_level(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01, refresh_s=10)
+        [held] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(held, T0)
+        assert s.due(T1, {"pi-pwm-0": snap(1.0)}) == []
+        [again] = s.due(T2, {"pi-pwm-0": snap(1.0)})
+        assert (again.reason, again.hold) == ("refresh", "snap")
+
+    def test_due_stays_pure_while_held(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        assert s.due(T0, {"pi-pwm-0": snap(1.0)}) == s.due(T0, {"pi-pwm-0": snap(1.0)})
 
 
 def test_refresh_uses_the_publish_time_not_the_decision_time() -> None:
