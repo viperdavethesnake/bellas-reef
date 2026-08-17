@@ -827,22 +827,34 @@ ih_phase6_verify() {
     if [[ -n "$info" ]]; then
         local setup_mode
         setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$info")"
-        if [[ "$setup_mode" == "true" ]]; then
-            local code
-            code="$(ih_compose exec -T api bellasreef setup-code 2>/dev/null | tr -d '\r')"
-            if [[ -n "$code" ]]; then
-                printf '\n'
-                ih_step "Pair your phone"
-                printf '\n      Setup code:  \033[1m%s\033[0m\n\n' "$code"
-                printf '      Open the Bella'"'"'s Reef app, pick this hub, and enter it.\n'
-                printf '      Multicast is not something this script can test from here;\n'
-                printf '      the app finding the hub is the proof.\n\n'
-            else
-                ih_fail "could not read the setup code"
-            fi
-        else
-            ih_pass "hub already paired; no setup code to show"
-        fi
+        # Three cases, not two. An empty extraction — a renamed field, a
+        # space after the colon, an HTML 200 from something that is not the
+        # API — is not evidence the hub is paired, and "already paired,
+        # nothing to show" is the reading that ends the install green while
+        # never showing the owner the code they cannot get in without. The
+        # unknown case is the whole reason this phase has an UNVERIFIED.
+        case "$setup_mode" in
+            true)
+                local code
+                code="$(ih_compose exec -T api bellasreef setup-code 2>/dev/null | tr -d '\r')"
+                if [[ -n "$code" ]]; then
+                    printf '\n'
+                    ih_step "Pair your phone"
+                    printf '\n      Setup code:  \033[1m%s\033[0m\n\n' "$code"
+                    printf '      Open the Bella'"'"'s Reef app, pick this hub, and enter it.\n'
+                    printf '      Multicast is not something this script can test from here;\n'
+                    printf '      the app finding the hub is the proof.\n\n'
+                else
+                    ih_fail "could not read the setup code"
+                fi
+                ;;
+            false)
+                ih_pass "hub already paired; no setup code to show"
+                ;;
+            *)
+                ih_unverified "could not read setup mode from /api/v1/info"
+                ;;
+        esac
     fi
 
     (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))

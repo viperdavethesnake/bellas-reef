@@ -1342,6 +1342,7 @@ def test_phase6_polls_the_api_rather_than_asking_once(tmp_path: Path) -> None:
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert result.returncode == 0, combined
     assert len(curl_log.read_text().splitlines()) >= 3, "the API probe did not retry"
     assert "7KF2-9QMD" in result.stdout, combined
@@ -1377,6 +1378,7 @@ def test_phase6_shows_no_setup_code_on_an_already_paired_hub(tmp_path: Path) -> 
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert result.returncode == 0, combined
     assert "already paired" in result.stdout.lower(), combined
     assert "Pair your phone" not in result.stdout
@@ -1417,6 +1419,7 @@ def test_phase6_is_unverified_when_avahi_cannot_be_confirmed(tmp_path: Path) -> 
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert "UNVERIFIED" in result.stdout, combined
     assert "avahi" in result.stdout.lower()
     assert result.returncode != 0, "an unverified check must not exit green"
@@ -1428,6 +1431,7 @@ def test_phase6_fails_when_a_container_is_not_running(tmp_path: Path) -> None:
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert result.returncode != 0, combined
     assert "bellasreef-hardware-io-1" in result.stdout, "the failing service was not named"
 
@@ -1441,8 +1445,12 @@ def test_phase6_fails_when_compose_reports_no_containers_at_all(tmp_path: Path) 
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert result.returncode != 0, combined
-    assert "FAIL" in result.stdout, combined
+    # The exact line, not a bare "FAIL": any earlier phase failing would
+    # satisfy that, which is how this test would keep passing against a
+    # phase 6 that never looked at the container list.
+    assert "no containers are running" in result.stdout, combined
 
 
 def test_phase6_fails_when_the_setup_code_is_empty(tmp_path: Path) -> None:
@@ -1454,8 +1462,35 @@ def test_phase6_fails_when_the_setup_code_is_empty(tmp_path: Path) -> None:
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
     assert result.returncode != 0, combined
-    assert "setup code" in result.stdout.lower(), combined
+    assert "could not read the setup code" in result.stdout, combined
+
+
+def test_phase6_is_unverified_when_setup_mode_cannot_be_read(tmp_path: Path) -> None:
+    # The API answered, but the body does not say what state the hub is in —
+    # a renamed field, a space after the colon, an HTML 200 from something
+    # that is not the API. Neither branch is knowable from that, and the one
+    # that reads as harmless ("already paired, nothing to show") is the one
+    # that ends the install green without ever showing the owner the code
+    # they need. Unknown has to look unknown.
+    stubs, markers = phase6_stubs(tmp_path)
+    curl_log = markers["curl"]
+    write_stub(
+        stubs,
+        "curl",
+        f'echo "$*" >> "{curl_log}"\nprintf \'{{"contracts_version":"3.7.0"}}\'\nexit 0',
+    )
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert "UNVERIFIED" in result.stdout, combined
+    assert "setup mode" in result.stdout.lower(), combined
+    assert result.returncode != 0, "an unreadable setup mode must not exit green"
+    assert "already paired" not in result.stdout.lower(), "guessed the hub was paired"
+    assert not markers["exec"].exists(), "minted a code on a hub of unknown state"
 
 
 def test_phase6_dry_run_probes_nothing(tmp_path: Path) -> None:
