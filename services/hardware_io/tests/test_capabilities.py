@@ -13,6 +13,7 @@ tank. Discovery filters to pin-backed channels so the registry's meaning is
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -234,7 +235,6 @@ class TestDiscoverPca9685:
         assert announcement.channels[0].detail == {
             "bus": 1,
             "address": "0x40",
-            "mode1": "0x11",
         }
 
     def test_the_presence_check_is_one_read_and_no_writes(self, tmp_path: Path) -> None:
@@ -245,6 +245,26 @@ class TestDiscoverPca9685:
         discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
         assert bus.reads == [(0x40, 0x00)]
         assert bus.writes == []
+
+    def test_mode1_is_logged_once_and_never_announced(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`detail` is the identity cue a client renders beside the channel.
+
+        MODE1 is a state snapshot — 0x11 asleep, 0x21 awake — so the same chip
+        would read as two different things across two discoveries. It belongs
+        in a log line, once, not in every one of the sixteen details. The read
+        itself is unchanged: still exactly one, still no writes.
+        """
+        bus = FakeI2CBus()
+        with caplog.at_level(logging.INFO):
+            announcement = discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert all("mode1" not in c.detail for c in announcement.channels)
+        assert bus.reads == [(0x40, 0x00)]
+        assert bus.writes == []
+        logged = [r for r in caplog.records if getattr(r, "mode1", None) == "0x11"]
+        assert len(logged) == 1, "MODE1 is reported once, at info, not per channel"
 
     def test_nothing_answering_announces_empty_not_silence(self, tmp_path: Path) -> None:
         bus = FakeI2CBus(mode1=None)
@@ -304,7 +324,6 @@ class TestDiscoverPca9685:
         assert announcement.channels[0].detail == {
             "bus": 3,
             "address": "0x41",
-            "mode1": "0x11",
         }
         assert bus.reads == [(0x41, 0x00)]
 
