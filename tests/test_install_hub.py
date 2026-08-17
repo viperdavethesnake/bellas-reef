@@ -69,6 +69,11 @@ HIDDEN_FROM_PATH = frozenset(
         "usermod",
         "cp",
         "install",
+        # Phase 6's boot-unit checks. systemd-analyze absent means the check
+        # is skipped, which is what the script must do on a host without it;
+        # a runner's own systemd-analyze answering here would make that path
+        # untestable and the tool's presence a property of the machine.
+        "systemd-analyze",
         # Phase 6's two probes. journalctl is the avahi evidence and curl is
         # the API probe: on a Linux runner the machine's own journalctl
         # answers for a service the fixture never installed, and either
@@ -249,11 +254,16 @@ def test_phase1_stops_when_the_boot_unit_is_enabled(tmp_path: Path) -> None:
     assert "bellasreef.service" in result.stdout
 
 
-def test_phase1_stops_when_deploy_env_exists(tmp_path: Path) -> None:
-    stubs = tmp_path / "bin"
-    write_stub(stubs, "docker", "exit 0")
-    write_stub(stubs, "systemctl", "exit 1")
+def test_phase1_warns_but_continues_when_deploy_env_exists(tmp_path: Path) -> None:
+    # A lone deploy/.env is not evidence of a hub — it is evidence that phase 4
+    # of some earlier run got that far. Phase 5 failing (a registry 401 is the
+    # expected first-run failure today) leaves exactly that state, and treating
+    # it as "already a hub" made every re-run exit 0 having done nothing. Only
+    # running containers or an enabled boot unit stop the run now; the file
+    # gets a warning and the run continues, because phase 4 never overwrites it.
+    stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
+    write_good_avahi_fixture(root)
     # REPO_DIR (as the script computes it) is this repo's absolute path, so
     # under a fixture root the script reads ${root}${REPO_DIR}/deploy/.env.
     # Derive that nested path instead of hardcoding it.
@@ -261,9 +271,10 @@ def test_phase1_stops_when_deploy_env_exists(tmp_path: Path) -> None:
     envfile.parent.mkdir(parents=True, exist_ok=True)
     envfile.write_text("SOME_SETTING=value\n")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert result.returncode == 0
-    assert "already" in result.stdout.lower()
+    assert result.returncode == 0, result.stdout + result.stderr
     assert "deploy/.env" in result.stdout
+    assert "already looks like a hub" not in result.stdout, result.stdout
+    assert "3. hardware" in result.stdout, "the run stopped at the .env latch"
 
 
 # The reference Pi's groups: i2c 988, gpio 986 (CLAUDE.md, verified host facts).
@@ -353,6 +364,27 @@ def systemctl_stub(marker: Path, log: Path | None = None) -> str:
     )
 
 
+def install_stub(log: Path | None = None) -> str:
+    """A stub for `install -m 0644 <src> <dst>` that really copies.
+
+    Phase 5 renders the boot unit for this host and phase 6 reads the
+    installed file back, so an install stub that merely exits 0 breaks the
+    link between the two — and a phase 6 that never sees a rendered unit
+    cannot fail when the rendering is wrong, which is the whole point of the
+    check. The real `install` is hidden from PATH (it writes to /etc), so this
+    is the only thing that ever runs.
+    """
+    record = f'echo install-unit >> "{log}"\n' if log is not None else ""
+    return (
+        record + 'src="${@: -2:1}"; dst="${@: -1}"\n'
+        # `install` takes either a file or a directory as its destination.
+        'if [[ "$dst" == */ || -d "$dst" ]]; then dst="${dst%/}/$(basename "$src")"; fi\n'
+        'mkdir -p "$(dirname "$dst")" || exit 1\n'
+        'cat "$src" > "$dst" || exit 1\n'
+        "exit 0"
+    )
+
+
 def boot_unit_marker(tmp_path: Path) -> Path:
     """Where systemctl_stub records that `systemctl enable` was run."""
     return tmp_path / "boot-unit-enabled"
@@ -375,7 +407,7 @@ def write_phase5_stubs(stubs: Path) -> None:
     argument at every call site.
     """
     write_stub(stubs, "sudo", '"$@"')
-    write_stub(stubs, "install", "exit 0")
+    write_stub(stubs, "install", install_stub())
     write_stub(stubs, "systemctl", systemctl_stub(boot_unit_marker(stubs.parent)))
     # Phase 6 runs off the end of phase 5 for exactly the same reason, and
     # reaches two more tools. A test that is not about phase 6 still has to
@@ -658,26 +690,49 @@ def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> Non
     # Controller ruling: ih_phase2_requirements must end with a verification
     # pass. Without it, a check that fails, gets remediated, and now passes
     # still leaves its original FAIL sitting in IH_FAILURES, so a successful
-    # install would still exit non-zero. Prove the opposite: docker is
-    # missing, --yes accepts the offered install, the stubbed "sh" (the
-    # convenience-script installer's interpreter) makes a working "docker"
-    # appear on PATH as its side effect, and the run reports success.
+    # install would still exit non-zero.
     #
-    # This run is not --check-only, so it reaches phase 4, which now gates
-    # ih_main on IH_FAILURES the same way phase 2 does. A real i2c/gpio
-    # getent stub is needed here so phase 4's own groups check doesn't add
-    # an unrelated FAIL and mask what this test is actually about.
+    # Proven through the clock branch rather than the docker one: installing
+    # Docker adds the user to a group that does not take effect until they log
+    # in again, so that remediation now deliberately stops the run (see the
+    # test below). Chrony has no such handover — the stubbed apt-get makes the
+    # clock synchronised as its side effect, the verification pass sees a good
+    # machine, and the run has to report success rather than carrying the
+    # original FAIL to the exit code.
+    #
+    # This run is not --check-only, so it reaches phase 4 and beyond. A real
+    # i2c/gpio getent stub is needed so phase 4's own groups check doesn't add
+    # an unrelated FAIL and mask what this test is about, and phases 5 and 6
+    # are stubbed inert for the same reason.
+    installed = tmp_path / "chrony-installed"
     stubs = make_stubs(
         tmp_path,
-        {"getent": GOOD_GETENT},
+        {
+            "getent": GOOD_GETENT,
+            "docker": inert_compose_docker(),
+            "timedatectl": f'if [[ -f "{installed}" ]]; then echo yes; else echo no; fi',
+        },
     )
+    write_stub(stubs, "apt-get", f'touch "{installed}"; exit 0')
+    write_phase5_stubs(stubs)
+    root = full_root(tmp_path)
+    staged_env_path(root)
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert installed.exists(), "the offered chrony install never ran"
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "requirement(s) failed" not in result.stdout
+
+
+def test_installing_docker_stops_the_run_rather_than_continuing(tmp_path: Path) -> None:
+    # `usermod -aG docker` does not take effect in the session that ran it.
+    # Every phase after this one talks to the daemon, so continuing means
+    # pulling images as a user who cannot reach it: a guaranteed failure,
+    # several phases later, that reads as a broken install rather than as the
+    # log-out the operator actually owes. Stop here and say so.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
     (stubs / "docker").unlink()
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "usermod", "exit 0")
-    # The docker the convenience script "installs" has to answer compose
-    # subcommands too, not just `compose version`: this run continues through
-    # phases 5 and 6, and a docker that echoes its version banner at
-    # `compose ps` reads to phase 6 as a container that is not running.
     write_stub(
         stubs,
         "sh",
@@ -690,27 +745,36 @@ chmod +x "{stubs}/docker"
 exit 0
 ''',
     )
-    # This run goes all the way through phases 5 and 6, which is not what the
-    # test is about: stub the mutations rather than letting them reach real
-    # sudo.
-    write_phase5_stubs(stubs)
+    root = full_root(tmp_path)
+    staged_env_path(root)
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "log out and back in" in result.stdout.lower()
+    assert "3. hardware" not in result.stdout, "the run continued past the docker install"
+
+
+def test_phase2_fails_when_the_daemon_is_unreachable(tmp_path: Path) -> None:
+    # docker on PATH and Compose v2 present says the package is installed; it
+    # says nothing about whether this user may talk to the socket. A user not
+    # in the docker group gets a permission denial at the first pull instead,
+    # in a phase with no idea what caused it. Probe it where the answer is
+    # cheap and the remedy can be named.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "docker": (
+                'if [[ "$1" == "compose" ]]; then echo "Compose version v2.29.0"; exit 0; fi\n'
+                'if [[ "$1" == "info" ]]; then exit 1; fi\n'
+                "exit 0"
+            )
+        },
+    )
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
-    # Phase 4 runs for real here, so it needs a deploy/ directory to write
-    # into — as a real machine has. Without one it used to "succeed" anyway:
-    # an unchecked cp let the run reach the PASS line with no file on disk.
-    # The write is checked now, so the fixture has to be honest.
-    staged_env_path(root)
-    result = subprocess.run(
-        ["bash", str(SCRIPT), "--yes"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=script_env(root, stubs),
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "requirement(s) failed" not in result.stdout
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "cannot reach the daemon" in result.stdout, result.stdout
+    assert "usermod -aG docker" in result.stdout
 
 
 def test_action_failure_is_not_erased_by_the_verification_pass(tmp_path: Path) -> None:
@@ -891,14 +955,14 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     # run the script for real (not --dry-run, so the write path is actually
     # exercised), and assert the file comes out byte-identical.
     #
-    # A non-empty sentinel here is intercepted by phase 1's own
-    # already-deployed check (it uses -s, non-empty) before phase 4's `-f`
-    # guard is ever reached — confirmed by running this fixture. That is
-    # still a faithful test of the stated invariant: from the outside,
-    # nothing about "never overwrite deploy/.env" says which phase has to be
-    # the one that stops it, and phase 1 stopping first is itself the
-    # correct behaviour for a host that looks already-configured.
-    stubs = make_stubs(tmp_path)
+    # Phase 1 used to intercept a non-empty sentinel before phase 4's own
+    # guard was ever reached. It no longer latches on deploy/.env (a failed
+    # phase 5 leaves one behind on a machine that is not a hub), so the file
+    # this test stages now reaches phase 4 for real — which is the guard the
+    # invariant actually rests on. The run continues into phases 5 and 6,
+    # neither of which this test is about, so both are stubbed inert.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
@@ -908,7 +972,7 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     real_envfile = REPO_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
-    result = run_script("--yes", root=root, stubs=stubs)
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
     assert envfile.read_text() == sentinel, "deploy/.env was modified"
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1134,6 +1198,44 @@ def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
 
 
+def test_a_failed_deploy_does_not_wedge_the_next_run(tmp_path: Path) -> None:
+    # The wedge, end to end: phase 4 writes deploy/.env, phase 5 fails on the
+    # registry (the expected first-run failure while the images are private),
+    # and the operator fixes their credentials and runs the script again. Phase
+    # 1 used to read that leftover .env as "already a hub", print "nothing has
+    # been changed" and exit 0 — a re-run that reports success having installed
+    # nothing, forever, on a machine one `docker login` away from working.
+    root = phase5_root(tmp_path)
+    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull='echo "denied: requested access to the resource is denied" >&2; exit 1'
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    first = run_script("--yes", root=root, stubs=stubs)
+    assert "5. deploy" in first.stdout, first.stdout + first.stderr
+    assert first.returncode != 0
+    assert envfile.exists(), "phase 4 wrote no .env, so this is not the wedge"
+
+    # Credentials fixed; nothing else about the machine has changed.
+    write_stub(stubs, "docker", inert_compose_docker())
+    write_phase5_stubs(stubs)
+    second = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = second.stdout + second.stderr
+    assert "already looks like a hub" not in second.stdout, combined
+    assert "5. deploy" in second.stdout, "the re-run never got past phase 1:\n" + combined
+    assert second.returncode == 0, combined
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
 def test_phase5_dry_run_pulls_nothing(tmp_path: Path) -> None:
     # --dry-run mutates nothing, and phase 5 is the phase with the most to
     # mutate: it pulls images, migrates a database and installs a boot unit.
@@ -1200,7 +1302,7 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
         },
     )
     write_stub(stubs, "sudo", '"$@"')
-    write_stub(stubs, "install", f'echo install-unit >> "{log}"; exit 0')
+    write_stub(stubs, "install", install_stub(log))
     write_phase6_stubs(stubs, tmp_path)
     root = phase5_root(tmp_path)
     real_envfile = REPO_ROOT / "deploy" / ".env"
@@ -1321,6 +1423,90 @@ def test_phase6_verifies_a_healthy_hub_and_hands_off(tmp_path: Path) -> None:
     # stub that says "enabled" no matter what.
     assert boot_unit_marker(tmp_path).exists(), "phase 5 never enabled the boot unit"
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def installed_unit_path(root: Path) -> Path:
+    """Where phase 5 installs the boot unit under a fixture root."""
+    return root / "etc/systemd/system/bellasreef.service"
+
+
+def test_phase5_renders_the_boot_unit_for_this_host(tmp_path: Path) -> None:
+    # deploy/systemd/bellasreef.service is written for the reference Pi:
+    # User=david, WorkingDirectory=/home/david/bellasreef, and absolute
+    # /home/david/bellasreef paths in ExecStart and ExecStop. deploy-pi.sh
+    # installs it verbatim, which is right for that one machine and wrong for
+    # every other. Installed verbatim on a stranger's hub it is a unit that
+    # fails at every boot — while phase 6's is-enabled cheerfully reports that
+    # the stack survives a power cut. Render it, and prove the rendering with
+    # the file that actually landed in /etc/systemd/system.
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    env = dict(FAST_POLL)
+    env["USER"] = "reef-tester"
+
+    result = run_script("--yes", root=root, stubs=stubs, env=env)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+
+    unit = installed_unit_path(root).read_text()
+    assert "User=reef-tester" in unit, unit
+    assert "/home/david/bellasreef" not in unit, unit
+    assert f"WorkingDirectory={REPO_ROOT}" in unit, unit
+    for line in ("ExecStart=", "ExecStop="):
+        rendered = next(ln for ln in unit.splitlines() if ln.startswith(line))
+        assert str(REPO_ROOT / "deploy") in rendered, rendered
+
+    # The repo's own copy is what deploy-pi.sh installs on the reference host.
+    # Rendering must not have edited it.
+    checked_in = (REPO_ROOT / "deploy/systemd/bellasreef.service").read_text()
+    assert "User=david" in checked_in
+    assert "/home/david/bellasreef" in checked_in
+
+
+def test_phase6_fails_when_the_installed_unit_names_a_foreign_host(tmp_path: Path) -> None:
+    # The failure this pair of checks exists for: a unit that systemd will
+    # happily enable and can never start, because its WorkingDirectory and its
+    # compose file paths belong to somebody else's machine. "bellasreef.service
+    # enabled; the stack survives a power cut" is exactly the wrong thing to
+    # print about that hub.
+    stubs, _ = phase6_stubs(tmp_path)
+    # An install that reports success and copies nothing, so the foreign unit
+    # staged below is what phase 6 reads.
+    write_stub(stubs, "install", "exit 0")
+    root = phase5_root(tmp_path)
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(
+        "[Service]\nUser=david\nWorkingDirectory=/home/david/bellasreef\n"
+        "ExecStart=/usr/bin/docker compose -f /home/david/bellasreef/deploy/compose.yaml up -d\n"
+    )
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert result.returncode != 0, combined
+    assert "boot unit" in result.stdout.lower(), combined
+    assert str(REPO_ROOT) in result.stdout, combined
+
+
+def test_phase6_runs_systemd_analyze_when_it_is_available(tmp_path: Path) -> None:
+    # systemd-analyze is hidden from PATH by default (see HIDDEN_FROM_PATH), so
+    # every other test here exercises the "not installed, skip it silently"
+    # path. This one gives the script a systemd-analyze that rejects the unit
+    # and proves the answer is read rather than merely obtained.
+    stubs, _ = phase6_stubs(tmp_path)
+    write_stub(
+        stubs,
+        "systemd-analyze",
+        'echo "bellasreef.service: Unknown key Frobnicate=" >&2; exit 1',
+    )
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert result.returncode != 0, combined
+    assert "Unknown key Frobnicate=" in result.stdout, combined
 
 
 def test_phase6_polls_the_api_rather_than_asking_once(tmp_path: Path) -> None:

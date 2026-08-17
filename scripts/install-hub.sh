@@ -123,10 +123,20 @@ ih_parse_args() {
 
 # ------------------------------------------------------------------ phase 1
 
-# Three independent signals, because a half-finished install leaves only some
-# of them. Any one is enough to stop: this tool installs, it does not upgrade,
-# repair, or reconfigure, and guessing which of those an operator meant is how
-# a working hub gets damaged by a tool that was asked to help.
+# Two signals stop the run, and one only reports.
+#
+# Containers or an enabled boot unit mean something got as far as running or
+# being supervised: this tool installs, it does not upgrade, repair, or
+# reconfigure, and guessing which of those an operator meant is how a working
+# hub gets damaged by a tool that was asked to help.
+#
+# deploy/.env is deliberately NOT one of them. It is written by phase 4, three
+# phases before anything starts, so a run that failed at the pull — a registry
+# 401, which is the expected first-run failure while the images are private —
+# leaves it behind on a machine that is not a hub at all. Latching on it made
+# every later run print "nothing has been changed" and exit 0, so the operator
+# fixed their credentials, re-ran, and got a green run that installed nothing.
+# Phase 4 never overwrites an existing file, so continuing past it is safe.
 ih_phase1_already_deployed() {
     ih_step "1. is this machine already a hub?"
     local found=0
@@ -145,8 +155,7 @@ ih_phase1_already_deployed() {
 
     local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
     if [[ -s "$envfile" ]]; then
-        ih_warn "deploy/.env already exists and is not empty"
-        found=1
+        ih_warn "deploy/.env from an earlier run exists; continuing — it will not be overwritten"
     fi
 
     if [[ $found -eq 1 ]]; then
@@ -173,6 +182,16 @@ ih_check_docker() {
     fi
     if ! docker compose version >/dev/null 2>&1; then
         ih_fail "docker is installed but Compose v2 is not available"
+        return 1
+    fi
+    # Installed is not the same as reachable. `docker` on PATH with Compose v2
+    # says the package is there; it says nothing about whether this user may
+    # talk to the socket. Without this probe the first evidence is a permission
+    # denial at the pull, three phases later, in a step with no idea what
+    # caused it — and the fix is a group membership plus a re-login, which is
+    # not guessable from "pull failed".
+    if ! docker info >/dev/null 2>&1; then
+        ih_fail "docker is installed but this user cannot reach the daemon; add yourself to the docker group (sudo usermod -aG docker \$USER), log out and back in"
         return 1
     fi
     ih_pass "docker with Compose v2"
@@ -360,7 +379,15 @@ ih_phase2_requirements() {
             target_user="${USER:-$(id -un)}"
             ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
             ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
-            ih_warn "log out and back in for the docker group to take effect, then re-run"
+            # Stop here, and do not run the rest of phase 2 or any phase after
+            # it. The group membership does not apply to the session that
+            # granted it, so this process still cannot reach the daemon — and
+            # every remaining phase talks to it. Continuing means pulling
+            # images as a user who is not yet in the group: a guaranteed
+            # failure, several phases later, that reads as a broken install
+            # rather than as the log-out the operator actually owes.
+            ih_warn "log out and back in for the docker group to take effect, then re-run this script"
+            return 1
         fi
     fi
 
@@ -708,11 +735,34 @@ ih_phase5_deploy() {
     fi
     ih_pass "migrations applied"
 
-    # deploy/systemd/*.service, matching how deploy-pi.sh installs it. The glob
-    # is today one file; the app units it once sat beside are deleted.
+    # Rendered for this host, not copied. The checked-in unit is written for
+    # the reference Pi — User=david, WorkingDirectory=/home/david/bellasreef,
+    # and absolute /home/david/bellasreef paths in ExecStart/ExecStop — which
+    # is correct for the machine deploy-pi.sh deploys to and wrong for every
+    # other one. Installed verbatim on a stranger's hub it is a unit that fails
+    # at every boot, while phase 6's is-enabled still reports that the stack
+    # survives a power cut. The repo file is left exactly as it is; only the
+    # copy under /etc/systemd/system is substituted.
+    local unit_src="${REPO_DIR}/deploy/systemd/bellasreef.service"
+    local unit_user="${USER:-$(id -un)}"
+    local rendered
+    rendered="$(mktemp)"
+    if [[ -z "$rendered" || ! -f "$rendered" ]]; then
+        ih_fail "could not create a temporary file for the boot unit"
+        return 1
+    fi
+    if ! sed -e "s|^User=.*|User=${unit_user}|" \
+             -e "s|/home/david/bellasreef|${REPO_DIR}|g" \
+             "$unit_src" > "$rendered"; then
+        rm -f "$rendered"
+        ih_fail "could not render the boot unit for this host from ${unit_src}"
+        return 1
+    fi
     ih_run "installing the boot unit" \
-        sudo install -m 0644 "${REPO_DIR}"/deploy/systemd/*.service \
-                             "${IH_ROOT}/etc/systemd/system/" || return 1
+        sudo install -m 0644 "$rendered" \
+                             "${IH_ROOT}/etc/systemd/system/bellasreef.service" \
+        || { rm -f "$rendered"; return 1; }
+    rm -f "$rendered"
     ih_run "reloading systemd" sudo systemctl daemon-reload || return 1
     ih_run "enabling bellasreef.service" sudo systemctl enable bellasreef.service || return 1
 
@@ -796,6 +846,43 @@ ih_phase6_verify() {
         ih_fail "bellasreef.service is NOT enabled; the stack will not return after a power cut"
     fi
 
+    # Enabled says systemd will try to start it at boot. It says nothing about
+    # whether the unit can work here, and the checked-in file names the
+    # reference host in four places — so an unrendered unit is enabled,
+    # reported green, and fails at every boot on a machine nobody is watching.
+    # Phase 5 renders it; this reads back what actually landed.
+    local unit_path="${IH_ROOT}/etc/systemd/system/bellasreef.service"
+    local unit_user="${USER:-$(id -un)}"
+    if [[ ! -r "$unit_path" ]]; then
+        ih_fail "no boot unit at /etc/systemd/system/bellasreef.service"
+    else
+        local exec_line user_line
+        exec_line="$(grep -m1 '^ExecStart=' "$unit_path")"
+        user_line="$(grep -m1 '^User=' "$unit_path")"
+        if [[ "$exec_line" != *"$REPO_DIR"* ]]; then
+            ih_fail "the installed boot unit does not run from ${REPO_DIR}; it will fail at boot"
+            printf '      %s\n' "${exec_line:-<no ExecStart line>}"
+        elif [[ "$user_line" != "User=${unit_user}" ]]; then
+            ih_fail "the installed boot unit runs as ${user_line#User=}, not ${unit_user}; it will fail at boot"
+        else
+            ih_pass "boot unit rendered for this host (${unit_user}, ${REPO_DIR})"
+        fi
+
+        # Skipped silently when the tool is absent rather than recorded as
+        # UNVERIFIED: the content assertion above is the check that matters,
+        # and systemd-analyze is a second opinion on syntax that not every
+        # host ships.
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            local verify_output
+            if verify_output="$(systemd-analyze verify "$unit_path" 2>&1)"; then
+                ih_pass "systemd-analyze accepts the boot unit"
+            else
+                ih_fail "systemd-analyze rejected the installed boot unit"
+                printf '%s\n' "$verify_output" | sed 's/^/      /'
+            fi
+        fi
+    fi
+
     local info
     info="$(ih_api_info)"
     if [[ -n "$info" ]]; then
@@ -866,8 +953,14 @@ ih_main() {
     if ih_phase1_already_deployed; then
         exit 0
     fi
-    ih_phase2_requirements
-    if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
+    # Phase 2 returns non-zero for the one thing the arrays cannot express: it
+    # installed Docker and the operator now has to log out before anything
+    # else in this script can work. That is not a failed check — every check
+    # may well pass on the next run — so it stops the run without necessarily
+    # adding to any of the three arrays.
+    local phase2_rc=0
+    ih_phase2_requirements || phase2_rc=$?
+    if (( phase2_rc != 0 || ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
         printf '\n'
         (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
         (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
