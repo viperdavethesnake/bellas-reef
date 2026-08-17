@@ -688,8 +688,16 @@ ih_phase5_deploy() {
     fi
     ih_pass "images pulled"
 
-    if ! ih_compose run --rm api sh -c 'cd /app/db && alembic upgrade head' >/dev/null 2>&1; then
+    # Captured, then tailed — not piped through tail in the pipeline. This is
+    # the one failure on a first install the operator has no other way to
+    # diagnose (unreachable database, a generated password Postgres never got,
+    # a broken revision chain), and deploy-pi.sh records why the obvious form
+    # is wrong: `cmd | tail` makes the exit status tail's, so the failure
+    # itself disappears along with the output that explains it.
+    local migrate_output
+    if ! migrate_output="$(ih_compose run --rm api sh -c 'cd /app/db && alembic upgrade head' 2>&1)"; then
         ih_fail "migrations failed; not starting services against an unmigrated schema"
+        printf '%s\n' "$migrate_output" | tail -5 | sed 's/^/      /'
         return 1
     fi
     ih_pass "migrations applied"

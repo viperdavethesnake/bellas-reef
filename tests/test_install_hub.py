@@ -1124,6 +1124,12 @@ def test_phase5_does_not_start_the_stack_on_a_failed_migration(tmp_path: Path) -
     # A service that meets a schema it was not built for is worse than one
     # that never started: it runs, answers, and is wrong. The `up` must not
     # happen, and the run must not report success.
+    #
+    # Alembic's own words have to reach the operator too. This is the one
+    # first-install failure with no other diagnostic route — an unreachable
+    # database, a generated password Postgres never received, and a broken
+    # revision chain all present identically as "migrations failed" without
+    # them, and none of the three is guessable from that line.
     started = tmp_path / "started"
     stubs = make_stubs(
         tmp_path,
@@ -1143,4 +1149,7 @@ def test_phase5_does_not_start_the_stack_on_a_failed_migration(tmp_path: Path) -
     assert "5. deploy" in result.stdout
     assert result.returncode != 0
     assert "migration" in result.stdout.lower()
+    assert "alembic: target database is not up to date" in result.stdout, (
+        "the migration failure hid alembic's output:\n" + result.stdout
+    )
     assert not started.exists(), "the stack was started against an unmigrated schema"
