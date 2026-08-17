@@ -59,6 +59,10 @@ HIDDEN_FROM_PATH = frozenset(
         "df",
         "timedatectl",
         "getent",
+        # Phase 4 pins BELLASREEF_TAG to the checkout's commit, so git is a
+        # tool the script now depends on — and "git is not installed" has to
+        # be reachable in a test on a machine that certainly has it.
+        "git",
         # Phase-2 remediation and phase-5 deployment: every command that
         # mutates a real machine. Hidden so a test that forgets to stub one
         # gets "command not found" instead of touching the developer's box.
@@ -69,6 +73,12 @@ HIDDEN_FROM_PATH = frozenset(
         "usermod",
         "cp",
         "install",
+        # Phase 3's pin-mux evidence. A sysfs pwmchip directory exists whether
+        # or not any header pin is muxed to PWM (the standing trap in
+        # CLAUDE.md's verified host facts), so pinctrl is what turns "chips
+        # present" into "pins muxed" — and its absence has to be testable on a
+        # machine that has it.
+        "pinctrl",
         # Phase 6's boot-unit checks. systemd-analyze absent means the check
         # is skipped, which is what the script must do on a host without it;
         # a runner's own systemd-analyze answering here would make that path
@@ -282,6 +292,21 @@ GOOD_GETENT = (
     'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'
 )
 
+# What git answers for a clean checkout sitting on a published commit. Phase 4
+# asks three questions before it will pin an image tag: is the tree dirty, is
+# HEAD an ancestor of origin/main, and what is HEAD.
+FAKE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+GOOD_GIT = "\n".join(
+    [
+        'case "$3" in',
+        "    status) exit 0 ;;",
+        f'    rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
+        "    merge-base) exit 0 ;;",
+        "    *) exit 1 ;;",
+        "esac",
+    ]
+)
+
 FULL_STUBS = {
     "docker": (
         'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; '
@@ -293,6 +318,7 @@ FULL_STUBS = {
     "df": 'echo "100000000"',
     "timedatectl": "echo yes",
     "getent": "exit 2",
+    "git": GOOD_GIT,
 }
 
 
@@ -484,12 +510,57 @@ def test_phase2_unverified_when_clock_state_is_unknown(tmp_path: Path) -> None:
 
 
 def test_phase2_flags_avahi_advertising_docker_bridges(tmp_path: Path) -> None:
+    # Nothing in this script edits avahi-daemon.conf, so the FAIL line is the
+    # entire remedy the operator gets. Naming the setting without naming the
+    # file or the line to write is a dead end — it sends someone to a
+    # configuration format they have never seen to fix a word they have just
+    # been told is wrong.
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     (root / "etc/avahi").mkdir(parents=True)
     (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces" in result.stdout
+    assert "/etc/avahi/avahi-daemon.conf" in result.stdout, result.stdout
+    assert "allow-interfaces=eth0,wlan0" in result.stdout, result.stdout
+
+
+def test_phase2_offers_only_the_record_when_avahi_is_installed(tmp_path: Path) -> None:
+    # ih_check_avahi returns 1 for either sub-failure, so a machine that has
+    # avahi and is only missing the service record used to be asked whether to
+    # install avahi-daemon — and declining that (or a package manager that has
+    # nothing to do) gated away the offer that would have fixed the actual
+    # problem. Two findings, two independent remediations.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "install avahi-daemon?" not in result.stdout, "offered to install an installed daemon"
+    assert "service record" in result.stdout
+    assert markers["cp"].exists(), "the service record was never installed"
+    assert not markers["apt-get"].exists(), "an installed avahi-daemon was reinstalled"
+
+
+def test_phase2_offers_the_daemon_when_avahi_is_absent(tmp_path: Path) -> None:
+    # The other half: with no avahi at all, the package offer is the one that
+    # has to come first — copying a service record into a services/ directory
+    # the package never created fails, and reloading a daemon that is not
+    # there fails after it.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "install avahi-daemon?" in result.stdout, result.stdout
+    assert markers["apt-get"].exists(), "the daemon install never ran"
+    # The stubbed apt-get installs nothing, so the daemon is still absent and
+    # the record offer must not fire against a machine with no services/ dir.
+    assert not markers["cp"].exists(), "copied a service record with no avahi installed"
 
 
 def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None:
@@ -1035,6 +1106,167 @@ def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
     assert leftovers == [], f"phase 4 left temporary files behind: {leftovers}"
 
 
+def test_phase4_pins_the_image_tag_to_the_checkouts_commit(tmp_path: Path) -> None:
+    # BELLASREEF_TAG=latest meant the images came from whatever CI last pushed
+    # while the compose file, the migrations and the contracts came from this
+    # clone. The two drift apart silently, and the symptom is migrations from
+    # one commit running against images built from another. The tag is the
+    # checkout's own commit — the same thing CI publishes and deploy-pi.sh
+    # pins to.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"BELLASREEF_TAG={FAKE_COMMIT}" in envfile.read_text(), envfile.read_text()
+    assert "BELLASREEF_TAG=latest" not in envfile.read_text()
+
+
+def test_phase4_refuses_a_dirty_checkout(tmp_path: Path) -> None:
+    # There is no image for what is sitting in the working tree. Pinning the
+    # tag to HEAD on a dirty checkout produces a hub running images that do
+    # not contain the change the operator is looking at.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "git": GOOD_GIT.replace(
+                "status) exit 0 ;;", 'status) echo " M services/api/main.py"; exit 0 ;;'
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "uncommitted" in result.stdout.lower(), result.stdout
+    assert not envfile.exists(), "a dirty checkout still wrote deploy/.env"
+
+
+def test_phase4_refuses_a_commit_that_never_landed_on_main(tmp_path: Path) -> None:
+    # CI publishes images for commits on main. A checkout on a branch (or on a
+    # commit that was rebased away) has no image, and the pull fails several
+    # phases later with a manifest error that names none of this.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "git": GOOD_GIT.replace("merge-base) exit 0 ;;", "merge-base) exit 1 ;;"),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "origin/main" in result.stdout, result.stdout
+    assert not envfile.exists()
+
+
+def test_phase4_is_unverified_when_origin_main_is_unknown(tmp_path: Path) -> None:
+    # A clone with no remote, or one that has never fetched, cannot answer
+    # whether this commit was published. That is not evidence that it was —
+    # and a check that could not run is not a check that passed.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "git": GOOD_GIT.replace(
+                f'rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
+                'rev-parse) if [[ "$4" == "--verify" ]]; then exit 1; fi;'
+                f' echo "{FAKE_COMMIT}"; exit 0 ;;',
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "UNVERIFIED" in result.stdout, result.stdout
+    assert "origin/main" in result.stdout
+    assert not envfile.exists()
+
+
+def test_phase4_fails_without_git(tmp_path: Path) -> None:
+    # The tag is derived from the checkout, so without git there is nothing to
+    # derive it from. Falling back to :latest is exactly the drift this change
+    # removes, so the honest answer is to stop.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
+    (stubs / "git").unlink()
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "git is not installed" in result.stdout, result.stdout
+    assert not envfile.exists()
+
+
+def test_phase4_rejects_an_env_missing_a_substituted_key(tmp_path: Path) -> None:
+    # The substitutions are only as good as the example file they run against.
+    # A key renamed or dropped in deploy/.env.example leaves sed with nothing
+    # to match, and the run continues with a file that is missing a value
+    # compose interpolates as ${VAR:?} — which stops the entire stack, several
+    # phases later, with an error naming a variable rather than a cause.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            # Only phase 4 calls sed with -e; the two `sed 's/^/      /'`
+            # output-indenting calls do not, so this cannot disturb them.
+            "sed": (
+                'if [[ "$1" == "-e" ]]; then\n'
+                '  "${IH_TEST_REAL_BIN}/sed" "$@" | grep -v "^I2C_GID="\n'
+                "else\n"
+                '  exec "${IH_TEST_REAL_BIN}/sed" "$@"\n'
+                "fi"
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "I2C_GID" in result.stdout, result.stdout
+    assert not envfile.exists(), "an incomplete deploy/.env was moved into place"
+
+
+def test_phase4_writes_over_an_empty_env(tmp_path: Path) -> None:
+    # An empty deploy/.env is not a configuration. It is a file somebody
+    # touched, or a write that died before its first byte — and the previous
+    # `-f` guard read it as "already configured, leave it alone", which hands
+    # the stack no password, no GIDs and no tag. compose interpolates all of
+    # those as ${VAR:?} and refuses to start on any one of them, several
+    # phases later, naming a variable rather than a cause. Overwriting an
+    # empty file loses nothing; the invariant is about files with content.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    envfile.write_text("")
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = envfile.read_text()
+    assert re.search(r"^POSTGRES_PASSWORD=[A-Za-z0-9]{32}$", text, re.MULTILINE), text
+    assert "I2C_GID=988" in text, text
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
 def test_phase4_a_failed_write_leaves_no_partial_env(tmp_path: Path) -> None:
     # The other half of the poisoned-file problem. Gating the write on the
     # GIDs stops a *failed check* from leaving a file behind; it does nothing
@@ -1101,6 +1333,72 @@ def test_phase4_rejects_a_password_that_is_not_32_chars(tmp_path: Path) -> None:
     assert "32 chars" not in result.stdout, "claimed 32 chars for a 5-char password"
     assert not envfile.exists(), "a bad password was still written to deploy/.env"
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase3_ignores_the_hdmi_i2c_buses(tmp_path: Path) -> None:
+    # The reference Pi has /dev/i2c-13 and /dev/i2c-14 — the HDMI DDC buses —
+    # present with i2c_arm off (CLAUDE.md, verified host facts). A glob over
+    # /dev/i2c-* announces I2C as enabled on that machine and the operator
+    # then wonders why their PCA9685 is unreachable. Only i2c-1 is the bus
+    # hardware-io uses.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-13").write_text("")
+    (root / "dev/i2c-14").write_text("")
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "I2C          not enabled" in result.stdout, result.stdout
+    assert "dtparam=i2c_arm=on" in result.stdout
+
+
+def test_phase3_reports_the_pin_mux_when_pinctrl_is_available(tmp_path: Path) -> None:
+    # A channel that exports in sysfs while its pin reads `none` is the
+    # standing trap: the pwmchip directory is there, the tank is dark, and
+    # nothing in the inventory said so. pinctrl is the only thing that proves
+    # a header pin is actually muxed to PWM.
+    stubs = make_stubs(tmp_path)
+    write_stub(
+        stubs,
+        "pinctrl",
+        "echo '12: a0    pn | lo // GPIO12 = PWM0_CHAN0'\n"
+        "echo '13: a0    pn | lo // GPIO13 = PWM0_CHAN1'\n"
+        "echo '18: no    pd | lo // GPIO18 = none'\n"
+        "echo '19: no    pd | lo // GPIO19 = none'\n"
+        "exit 0",
+    )
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "2 of 4" in result.stdout, result.stdout
+    assert "pin mux not verified" not in result.stdout
+
+
+def test_phase3_says_the_pin_mux_is_unverified_without_pinctrl(tmp_path: Path) -> None:
+    # No pinctrl (any board that is not a Pi, and a Pi whose OS does not ship
+    # it): the chips are visible and the mux is not knowable from here. Saying
+    # "direct PWM channels available" on that evidence is a claim the script
+    # cannot support.
+    stubs = make_stubs(tmp_path)
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "pin mux not verified" in result.stdout, result.stdout
+    assert result.returncode == 0, "an unverified pin mux must not fail a non-blocking phase"
+
+
+def test_phase3_flags_pwm_chips_with_no_muxed_pins(tmp_path: Path) -> None:
+    # The trap in full: sysfs says four channels, pinctrl says no header pin
+    # carries any of them. That is the overlay problem, and the config.txt
+    # guidance is exactly what fixes it.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
+    root = full_root(tmp_path)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "no header pin" in result.stdout, result.stdout
+    assert "dtoverlay=pwm-4chan" in result.stdout
 
 
 def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
@@ -1265,6 +1563,30 @@ def test_a_failed_deploy_does_not_wedge_the_next_run(tmp_path: Path) -> None:
     assert "5. deploy" in second.stdout, "the re-run never got past phase 1:\n" + combined
     assert second.returncode == 0, combined
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase5_names_an_unpublished_commit_on_a_pull_failure(tmp_path: Path) -> None:
+    # Now that the tag is the checkout's commit, the likeliest pull failure
+    # after credentials is a commit whose CI has not finished (or never ran):
+    # the registry answers "manifest unknown" for a tag that is perfectly
+    # correct and simply not there yet. That is not guessable from the raw
+    # error, so name it.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(pull='echo "manifest unknown" >&2; exit 1'),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    combined = result.stdout + result.stderr
+    assert "5. deploy" in result.stdout, combined
+    assert result.returncode != 0
+    assert "may not be published yet" in combined, combined
+    assert "manifest unknown" in combined, "docker's own words were swallowed"
 
 
 def test_phase5_dry_run_pulls_nothing(tmp_path: Path) -> None:

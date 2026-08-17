@@ -19,13 +19,6 @@
 # production) and every external tool is called by bare name, so the test
 # suite can point the whole script at a fixture directory with stub
 # executables on PATH. A literal /etc or /sys path in this file is a bug.
-#
-# SC2034 (appears unused): IH_CHECK_ONLY is this skeleton's declared
-# interface (see Task 1's Interfaces block) — the phase-gating that reads it
-# lands in a later task of this plan. Disabled file-wide rather than
-# scattered per-line so the flag block below stays exactly the shape later
-# tasks extend.
-# shellcheck disable=SC2034
 
 set -uo pipefail
 
@@ -278,12 +271,17 @@ ih_check_clock() {
 # intermittently resolve the hub to an address that does not work. The service
 # record is how the app identifies a reef controller and learns its port; a
 # hostname A record alone is not enough.
+# The two halves, asked separately: the remediation for a missing package and
+# the remediation for a missing service record are independent, and a single
+# "is avahi ok" answer made declining one gate away the other.
+ih_avahi_daemon_present() { [[ -f "${IH_ROOT}/etc/avahi/avahi-daemon.conf" ]]; }
+ih_avahi_record_present() { [[ -f "${IH_ROOT}/etc/avahi/services/bellasreef.service" ]]; }
+
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
-    local svc="${IH_ROOT}/etc/avahi/services/bellasreef.service"
     local rc=0
 
-    if [[ ! -f "$conf" ]]; then
+    if ! ih_avahi_daemon_present; then
         ih_fail "avahi-daemon is not installed"
         return 1
     fi
@@ -291,11 +289,18 @@ ih_check_avahi() {
     if grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$conf"; then
         ih_pass "avahi allow-interfaces is set"
     else
+        # Nothing in this script edits avahi-daemon.conf, so this line is the
+        # whole remedy. The path and the line are printed as instructions —
+        # they are text for a human, not a path this script touches, which is
+        # why they carry no $IH_ROOT.
         ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
+        printf '      Add to /etc/avahi/avahi-daemon.conf, under [server]:\n'
+        printf '        allow-interfaces=eth0,wlan0\n'
+        printf '      Adjust to your LAN interfaces, then restart avahi-daemon.\n'
         rc=1
     fi
 
-    if [[ -f "$svc" ]]; then
+    if ih_avahi_record_present; then
         ih_pass "_bellasreef._tcp service record installed"
     else
         ih_fail "_bellasreef._tcp service record missing; the app cannot find this hub"
@@ -411,17 +416,24 @@ ih_phase2_requirements() {
         fi
     fi
 
-    if ! ih_check_quietly ih_check_avahi; then
-        # ih_offer_install's own return gates the record install, the same
-        # way the clock branch above gates enabling units on its offer's
-        # result: declining the avahi-daemon package must not leave the
-        # script trying to cp a record into a services/ directory that was
-        # never created, or reload a daemon that was never installed.
+    if (( ! IH_CHECK_ONLY )) && ! ih_check_quietly ih_check_avahi; then
+        # Two independent remediations, because ih_check_avahi fails for two
+        # independent reasons. Offering the package to a machine that already
+        # has avahi is noise, and — worse — declining that offer used to gate
+        # away the service-record offer, which was the only thing actually
+        # missing. So: the package is offered only when the daemon is absent,
+        # and the record only when the daemon is present and the record is
+        # not. The daemon check is re-asked after the install rather than
+        # assumed, so a declined or failed package install cannot leave this
+        # script cp-ing a record into a services/ directory that was never
+        # created, or reloading a daemon that is not there.
         #
-        # The prompt only promises the service record — nothing in this
-        # branch ever edits avahi-daemon.conf's allow-interfaces, so it must
-        # never claim to.
-        if (( ! IH_CHECK_ONLY )) && ih_offer_install "avahi-daemon" avahi-daemon; then
+        # Neither prompt ever touches avahi-daemon.conf's allow-interfaces —
+        # ih_check_avahi prints that remedy for the operator to apply.
+        if ! ih_avahi_daemon_present; then
+            ih_offer_install "avahi-daemon" avahi-daemon
+        fi
+        if ih_avahi_daemon_present && ! ih_avahi_record_present; then
             if ih_confirm "install the _bellasreef._tcp service record?"; then
                 ih_run "installing the _bellasreef._tcp record" \
                     sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
@@ -488,10 +500,34 @@ ih_phase3_hardware() {
     local board
     board="$(ih_detect_board)"
 
-    local i2c_ok=0 w1_ok=0 pwm_ok=0
-    compgen -G "${IH_ROOT}/dev/i2c-*" >/dev/null 2>&1 && i2c_ok=1
+    # /dev/i2c-1 specifically, not a glob over /dev/i2c-*. The reference Pi has
+    # /dev/i2c-13 and /dev/i2c-14 — the HDMI DDC buses — present with i2c_arm
+    # off, so a glob announces I2C as enabled on a machine where nothing can
+    # reach a PCA9685. i2c-1 is the bus hardware-io opens.
+    local i2c_ok=0 w1_ok=0 pwm_ok=0 pwm_mux=""
+    [[ -e "${IH_ROOT}/dev/i2c-1" ]] && i2c_ok=1
     [[ -d "${IH_ROOT}/sys/bus/w1/devices" ]] && w1_ok=1
     compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1 && pwm_ok=1
+
+    # A channel that exports in sysfs while its pin reads `none` is the
+    # standing trap (CLAUDE.md, verified host facts): the chip is there, the
+    # header pin carries nothing, and a PWM inventory built on the sysfs
+    # directory alone says everything is fine. pinctrl is what proves the mux,
+    # and it is the same evidence hardware-io's discovery uses. Without it the
+    # honest answer is that the mux was not checked.
+    if (( pwm_ok )) && command -v pinctrl >/dev/null 2>&1; then
+        local muxed
+        muxed="$(pinctrl get 12,13,18,19 2>/dev/null | grep -c 'PWM')"
+        [[ "$muxed" =~ ^[0-9]+$ ]] || muxed=0
+        if (( muxed > 0 )); then
+            pwm_mux="${muxed} of 4 header pins muxed to PWM"
+        else
+            # Not a pass. The overlay is missing or wrong, which is precisely
+            # what the config.txt guidance below fixes.
+            pwm_ok=0
+            pwm_mux="no header pin is muxed to PWM"
+        fi
+    fi
 
     if (( i2c_ok )); then
         ih_pass "I2C          enabled       PCA9685 and other I2C devices available"
@@ -506,7 +542,9 @@ ih_phase3_hardware() {
     fi
 
     if (( pwm_ok )); then
-        ih_pass "SoC PWM      enabled       direct PWM channels available"
+        ih_pass "SoC PWM      enabled       ${pwm_mux:-sysfs PWM chips present; pin mux not verified}"
+    elif [[ -n "$pwm_mux" ]]; then
+        ih_warn "SoC PWM      not usable    sysfs PWM chips present but ${pwm_mux}"
     else
         ih_warn "SoC PWM      not enabled   a PCA9685 still works over I2C"
     fi
@@ -580,7 +618,13 @@ ih_phase4_configure() {
     local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
     local example="${REPO_DIR}/deploy/.env.example"
 
-    if [[ -f "$envfile" ]]; then
+    # -s, not -f: an existing but EMPTY deploy/.env is not a configuration, it
+    # is a file somebody touched (or a write that died before its first byte),
+    # and treating it as one leaves the stack with no password, no GIDs and no
+    # tag — every one of which compose interpolates as ${VAR:?} and refuses to
+    # start on. Overwriting an empty file loses nothing; the invariant that
+    # matters is that a file with content in it is never touched.
+    if [[ -s "$envfile" ]]; then
         ih_pass "deploy/.env already exists; leaving it untouched"
         return 0
     fi
@@ -612,6 +656,40 @@ ih_phase4_configure() {
         return 1
     fi
 
+    # The images come from the registry; the compose file, the migrations and
+    # the contracts come from this checkout. BELLASREEF_TAG is the only thing
+    # holding those two halves to the same commit, and `latest` does not hold
+    # them at all — it resolves to whatever CI pushed most recently, so a hub
+    # ends up running migrations from one commit against images built from
+    # another. The tag is this checkout's commit: the same thing CI publishes
+    # and the same thing deploy-pi.sh pins to.
+    if ! command -v git >/dev/null 2>&1; then
+        ih_fail "git is not installed; the image tag is this checkout's commit and cannot be derived without it"
+        return 1
+    fi
+    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
+        ih_fail "this checkout has uncommitted changes; no image is published for what is on disk"
+        return 1
+    fi
+    # Unknown is not the same as wrong. A clone with no remote, or one that has
+    # never fetched, cannot answer whether this commit was ever published — so
+    # it is recorded as unverified rather than guessed either way.
+    if ! git -C "$REPO_DIR" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+        ih_unverified "origin/main is unknown here; cannot confirm images were published for this commit"
+        return 1
+    fi
+    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD origin/main; then
+        ih_fail "HEAD is not on origin/main; CI publishes images only for commits that landed there"
+        return 1
+    fi
+    local commit
+    commit="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+        ih_fail "could not read this checkout's commit; the image tag would be a guess"
+        return 1
+    fi
+    ih_pass "image tag ${commit:0:12} (this checkout's commit)"
+
     # Checked, not assumed. /dev/urandom missing, a busybox tr without -dc, a
     # locale that makes the class match nothing: each of those yields a short
     # or empty password, and the PASS line below would still claim 32 chars.
@@ -626,7 +704,7 @@ ih_phase4_configure() {
     ih_pass "generated a Postgres password (32 chars, not shown)"
 
     if (( IH_DRY_RUN )); then
-        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>}"
+        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${commit:0:12}"
         return 0
     fi
 
@@ -664,11 +742,26 @@ ih_phase4_configure() {
         -e "s|^BELLASREEF_DATABASE_URL=.*|BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:${password}@postgres:5432/bellasreef|" \
         -e "s|^I2C_GID=.*|I2C_GID=${i2c_gid}|" \
         -e "s|^GPIO_GID=.*|GPIO_GID=${gpio_gid}|" \
+        -e "s|^BELLASREEF_TAG=.*|BELLASREEF_TAG=${commit}|" \
         "$example" > "$tmpfile"; then
         rm -f "$tmpfile"
         ih_fail "could not generate deploy/.env from deploy/.env.example"
         return 1
     fi
+
+    # The substitutions are only as good as the example file they ran against.
+    # A key renamed or dropped in deploy/.env.example leaves sed with nothing
+    # to match and no error to report, and compose interpolates all five as
+    # ${VAR:?} — which refuses to start the entire stack, phases later, with a
+    # message that names a variable rather than a cause.
+    local key
+    for key in POSTGRES_PASSWORD BELLASREEF_DATABASE_URL I2C_GID GPIO_GID BELLASREEF_TAG; do
+        if ! grep -qE "^${key}=." "$tmpfile"; then
+            rm -f "$tmpfile"
+            ih_fail "the generated deploy/.env has no ${key} value; deploy/.env.example may have changed"
+            return 1
+        fi
+    done
 
     if ! mv "$tmpfile" "$envfile"; then
         rm -f "$tmpfile"
@@ -704,6 +797,10 @@ ih_phase5_deploy() {
         return 0
     fi
 
+    # Said before it happens, not after. On a Pi this is three multi-hundred-
+    # megabyte images over whatever the tank shelf's wifi manages, and a
+    # silent terminal for several minutes is indistinguishable from a hang.
+    ih_step "pulling images — this takes a few minutes on a Pi"
     local pull_output
     if ! pull_output="$(ih_compose pull 2>&1)"; then
         # Registry auth is temporary scaffolding: the images are private today
@@ -715,6 +812,11 @@ ih_phase5_deploy() {
             printf '      using a token with the read:packages scope, then re-run.\n'
         else
             ih_fail "docker compose pull failed"
+            # The tag is this checkout's commit, so the other likely answer is
+            # that the images for it do not exist yet. "manifest unknown" names
+            # a tag that is perfectly correct and simply not published.
+            printf '      The image for this commit may not be published yet (CI still\n'
+            printf '      running?) — check out a commit on origin/main whose CI has finished.\n'
             printf '%s\n' "$pull_output" | sed 's/^/      /'
         fi
         return 1
