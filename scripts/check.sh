@@ -73,8 +73,10 @@ run "pytest"              uv run pytest
 # Invoked indirectly as `run "..." spec_drift` below; shellcheck's
 # reachability analysis for SC2329 does not trace a function name passed as a
 # bare argument, and (confirmed in isolation) loses track of it entirely once
-# the script's trailing top-level `exit` is added.
-# shellcheck disable=SC2329
+# the script's trailing top-level `exit` is added. Older shellcheck (0.9,
+# what ubuntu-latest ships) reports the same thing per line as SC2317
+# instead of per function as SC2329, so both codes are named.
+# shellcheck disable=SC2329,SC2317
 spec_drift() {
     local tmp rc=0 file
     tmp="$(mktemp -d)" || return 1
@@ -119,7 +121,7 @@ run "openapi spec drift" spec_drift
 # hand and that path has no renderer in it.
 # Invoked indirectly as `run "..." avahi_contracts` below; see the note on
 # spec_drift above.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 avahi_contracts() {
     local record declared expected
     record="deploy/avahi/bellasreef.service"
@@ -145,7 +147,7 @@ run "avahi contracts version" avahi_contracts
 # Postgres-backed test.
 # Invoked indirectly as `run "..." alembic_offline` below (guarded by
 # --quick); see the note on spec_drift above.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 alembic_offline() {
     ( cd db && BELLASREEF_DATABASE_URL="postgresql+asyncpg://offline/offline" \
         uv run alembic upgrade head --sql )
