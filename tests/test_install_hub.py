@@ -69,6 +69,12 @@ HIDDEN_FROM_PATH = frozenset(
         "usermod",
         "cp",
         "install",
+        # Phase 6's two probes. journalctl is the avahi evidence and curl is
+        # the API probe: on a Linux runner the machine's own journalctl
+        # answers for a service the fixture never installed, and either
+        # answer — a stray match or a real "no entries" — is the runner
+        # talking, not the script.
+        "journalctl",
     }
 )
 
@@ -323,6 +329,35 @@ def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
     return markers
 
 
+def systemctl_stub(marker: Path, log: Path | None = None) -> str:
+    """A systemctl stub that remembers whether the boot unit was enabled.
+
+    Phase 1 asks `is-enabled` before anything has happened and phase 6 asks
+    the same question after phase 5 has run `enable` — so one stub has to
+    give two different answers, and the difference has to come from what
+    phase 5 actually did. A stub that answered `enabled` unconditionally
+    would let phase 6 pass against a phase 5 that never enabled anything,
+    which is the entire point of the check.
+    """
+    record = f'echo "systemctl $1" >> "{log}"; ' if log is not None else ""
+    return "\n".join(
+        [
+            'case "$1" in',
+            f"    daemon-reload) {record}exit 0 ;;",
+            f'    enable) {record}touch "{marker}"; exit 0 ;;',
+            f'    is-enabled) if [[ -f "{marker}" ]]; then echo enabled; exit 0; fi;'
+            " echo disabled; exit 1 ;;",
+            "    *) exit 1 ;;",
+            "esac",
+        ]
+    )
+
+
+def boot_unit_marker(tmp_path: Path) -> Path:
+    """Where systemctl_stub records that `systemctl enable` was run."""
+    return tmp_path / "boot-unit-enabled"
+
+
 def write_phase5_stubs(stubs: Path) -> None:
     """Make phase 5's mutations inert, for tests that are not about phase 5.
 
@@ -331,12 +366,57 @@ def write_phase5_stubs(stubs: Path) -> None:
     stack. Without these stubs an earlier phase's test reaches the real
     `sudo`, which fails on a password prompt for a reason that has nothing to
     do with what the test is checking. Call this after make_stubs — it
-    replaces the phase-1 systemctl stub with one that still reports the boot
-    unit as not-enabled but accepts the two subcommands phase 5 runs.
+    replaces the phase-1 systemctl stub with one that reports the boot unit
+    as not-enabled until phase 5 enables it, and accepts the two subcommands
+    phase 5 runs.
+
+    The stubs directory is always tmp_path/"bin", so the marker file lands
+    beside it under the test's own tmp_path rather than needing a second
+    argument at every call site.
     """
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "install", "exit 0")
-    write_stub(stubs, "systemctl", 'case "$1" in daemon-reload|enable) exit 0 ;; *) exit 1 ;; esac')
+    write_stub(stubs, "systemctl", systemctl_stub(boot_unit_marker(stubs.parent)))
+    # Phase 6 runs off the end of phase 5 for exactly the same reason, and
+    # reaches two more tools. A test that is not about phase 6 still has to
+    # get past it.
+    write_phase6_stubs(stubs, stubs.parent)
+
+
+# What avahi-daemon actually logs when it publishes a static service file.
+# The journal is the evidence phase 6 reads: avahi-browse is not installed
+# by the daemon, and host-setup.md records that browsing from the hub itself
+# does not reliably reflect what the daemon published.
+AVAHI_JOURNAL_LINE = (
+    'Service "bellasreef" (/etc/avahi/services/bellasreef.service) successfully established.'
+)
+
+
+def write_phase6_stubs(
+    stubs: Path,
+    tmp_path: Path,
+    *,
+    setup_mode: str = "true",
+    avahi_ok: bool = True,
+) -> dict[str, Path]:
+    """Stub phase 6's two probes: the API's /info and the avahi journal.
+
+    Both append to a log rather than merely exiting 0. --dry-run has to be
+    provably able to run neither, and the /info check polls — a test that
+    cares whether it retried has to count calls, not assume.
+    """
+    curl_log = tmp_path / "curl.log"
+    journal_log = tmp_path / "journalctl.log"
+    write_stub(
+        stubs,
+        "curl",
+        f'echo "$*" >> "{curl_log}"\n'
+        f'printf \'{{"contracts_version":"3.7.0","setup_mode":{setup_mode}}}\'\n'
+        "exit 0",
+    )
+    line = AVAHI_JOURNAL_LINE if avahi_ok else "Starting Avahi mDNS/DNS-SD Stack..."
+    write_stub(stubs, "journalctl", f"echo ran >> \"{journal_log}\"\necho '{line}'\nexit 0")
+    return {"curl": curl_log, "journalctl": journal_log}
 
 
 def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
@@ -594,21 +674,25 @@ def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> Non
     (stubs / "docker").unlink()
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "usermod", "exit 0")
+    # The docker the convenience script "installs" has to answer compose
+    # subcommands too, not just `compose version`: this run continues through
+    # phases 5 and 6, and a docker that echoes its version banner at
+    # `compose ps` reads to phase 6 as a container that is not running.
     write_stub(
         stubs,
         "sh",
         f'''
 cat > "{stubs}/docker" <<'DOCKER_STUB'
 #!/usr/bin/env bash
-if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; else echo ""; fi
-exit 0
+{inert_compose_docker()}
 DOCKER_STUB
 chmod +x "{stubs}/docker"
 exit 0
 ''',
     )
-    # This run goes all the way through phase 5, which is not what the test
-    # is about: stub its mutations rather than letting them reach real sudo.
+    # This run goes all the way through phases 5 and 6, which is not what the
+    # test is about: stub the mutations rather than letting them reach real
+    # sudo.
     write_phase5_stubs(stubs)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
@@ -847,9 +931,9 @@ def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
     # failure, so the script could have written nonsense — or nothing — and
     # the suite would have stayed green. This is the file the whole stack
     # then runs on, so assert its actual contents, not that a PASS printed.
-    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
-    # A successful phase 4 now falls through into phase 5. This test is about
-    # the file phase 4 writes, so phase 5's mutations are stubbed inert.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    # A successful phase 4 now falls through into phases 5 and 6. This test is
+    # about the file phase 4 writes, so the tail is stubbed inert and green.
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
@@ -999,6 +1083,21 @@ def docker_stub(**subcommands: str) -> str:
     return "\n".join(body)
 
 
+def inert_compose_docker(
+    setup_code: str = "7KF2-9QMD", ps_line: str = "bellasreef-api-1 running"
+) -> str:
+    """A docker stub whose compose subcommands all succeed and say nothing
+    interesting — for tests that have to get through phases 5 and 6 to reach
+    (or to have already reached) what they are actually about."""
+    return docker_stub(
+        pull="exit 0",
+        run="exit 0",
+        up="exit 0",
+        ps=f'echo "{ps_line}"; exit 0',
+        **{"exec": f'echo "{setup_code}"; exit 0'},
+    )
+
+
 def phase5_root(tmp_path: Path) -> Path:
     """A fixture root that reaches phase 5: every phase-1/2/3 gate clear, and
     deploy/ staged so phase 4 can write the .env phase 5 then reads."""
@@ -1087,19 +1186,22 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
         tmp_path,
         {
             "getent": GOOD_GETENT,
+            # ps and exec belong to phase 6, which this run now falls into.
+            # They are given non-logging bodies so the ordering assertion
+            # below stays about phase 5's four steps.
             "docker": docker_stub(
                 pull=f'echo pull >> "{log}"; exit 0',
                 run=f'echo migrate >> "{log}"; exit 0',
                 up=f'echo up >> "{log}"; exit 0',
+                ps='echo "bellasreef-api-1 running"; exit 0',
+                **{"exec": 'echo "7KF2-9QMD"; exit 0'},
             ),
-            "systemctl": (
-                f'case "$1" in daemon-reload|enable) echo "systemctl $1" >> "{log}"; exit 0 ;; '
-                "*) exit 1 ;; esac"
-            ),
+            "systemctl": systemctl_stub(boot_unit_marker(tmp_path), log),
         },
     )
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "install", f'echo install-unit >> "{log}"; exit 0')
+    write_phase6_stubs(stubs, tmp_path)
     root = phase5_root(tmp_path)
     real_envfile = REPO_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
@@ -1153,3 +1255,218 @@ def test_phase5_does_not_start_the_stack_on_a_failed_migration(tmp_path: Path) -
         "the migration failure hid alembic's output:\n" + result.stdout
     )
     assert not started.exists(), "the stack was started against an unmigrated schema"
+
+
+# ------------------------------------------------------------------ phase 6
+
+# Phase 6's /info probe polls, because `compose up -d` returns before uvicorn
+# has accepted its first connection. The deadline is a test seam (see
+# IH_API_DEADLINE_SECS in the script) so the failure tests below spend four
+# seconds proving the retry rather than thirty proving nothing extra.
+FAST_POLL = {"IH_API_DEADLINE_SECS": "4"}
+
+
+def phase6_stubs(
+    tmp_path: Path,
+    *,
+    setup_mode: str = "true",
+    avahi_ok: bool = True,
+    setup_code: str = "7KF2-9QMD",
+    ps_line: str = "bellasreef-api-1 running",
+) -> tuple[Path, dict[str, Path]]:
+    """A stub set that clears phases 1-5 and hands phase 6 a healthy hub.
+
+    Returns the stubs directory and the marker/log files phase 6's own
+    commands write to: curl (the /info probe), journalctl (the avahi
+    evidence) and the compose `exec` that mints the setup code.
+    """
+    exec_log = tmp_path / "compose-exec.log"
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull="exit 0",
+                run="exit 0",
+                up="exit 0",
+                ps=f'echo "{ps_line}"; exit 0',
+                **{"exec": f'echo "$*" >> "{exec_log}"; echo "{setup_code}"; exit 0'},
+            ),
+        },
+    )
+    write_phase5_stubs(stubs)
+    markers = write_phase6_stubs(stubs, tmp_path, setup_mode=setup_mode, avahi_ok=avahi_ok)
+    markers["exec"] = exec_log
+    return stubs, markers
+
+
+def test_phase6_verifies_a_healthy_hub_and_hands_off(tmp_path: Path) -> None:
+    # The success path, end to end: every check green, the hub still in setup
+    # mode, and the code the owner has to type printed where they can see it.
+    # An install that finishes without ever showing the code has finished
+    # nothing the owner can use.
+    stubs, markers = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, "the run never reached phase 6:\n" + combined
+    assert result.returncode == 0, combined
+    assert "7KF2-9QMD" in result.stdout, combined
+    assert "Pair your phone" in result.stdout
+    assert "setup-code" in markers["exec"].read_text()
+    # The boot-unit check is answered by what phase 5 actually did, not by a
+    # stub that says "enabled" no matter what.
+    assert boot_unit_marker(tmp_path).exists(), "phase 5 never enabled the boot unit"
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase6_polls_the_api_rather_than_asking_once(tmp_path: Path) -> None:
+    # `compose up -d` returns as soon as the containers are created, which is
+    # before uvicorn is listening. Asking once and failing would make a
+    # perfectly good install report a dead API, so the probe retries until a
+    # deadline — the same shape deploy-pi.sh uses.
+    stubs, markers = phase6_stubs(tmp_path)
+    curl_log = markers["curl"]
+    write_stub(
+        stubs,
+        "curl",
+        f'echo "$*" >> "{curl_log}"\n'
+        f'if (( $(grep -c . "{curl_log}") < 3 )); then exit 7; fi\n'
+        'printf \'{"contracts_version":"3.7.0","setup_mode":true}\'\n'
+        "exit 0",
+    )
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert len(curl_log.read_text().splitlines()) >= 3, "the API probe did not retry"
+    assert "7KF2-9QMD" in result.stdout, combined
+
+
+def test_phase6_fails_when_the_api_never_answers(tmp_path: Path) -> None:
+    # A hub whose front door never opens is not installed, however many
+    # containers are up: no client can pair with it or read a single reading.
+    # And there is no point asking it for a setup code — the FAIL is already
+    # recorded, and a second failure line about the code would name a symptom
+    # rather than the cause.
+    stubs, markers = phase6_stubs(tmp_path)
+    curl_log = markers["curl"]
+    write_stub(stubs, "curl", f'echo "$*" >> "{curl_log}"\nexit 7')
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert result.returncode != 0, combined
+    assert "API not answering" in result.stdout, combined
+    assert len(curl_log.read_text().splitlines()) >= 2, "the failing probe never retried"
+    assert not markers["exec"].exists(), "asked a dead API's container for a setup code"
+
+
+def test_phase6_shows_no_setup_code_on_an_already_paired_hub(tmp_path: Path) -> None:
+    # `bellasreef setup-code` rotates rather than reprints: running it on a
+    # hub that is already paired would mint a code nobody asked for. The
+    # /info body says which state the hub is in, so read it rather than
+    # assuming a fresh install is always unpaired.
+    stubs, markers = phase6_stubs(tmp_path, setup_mode="false")
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "already paired" in result.stdout.lower(), combined
+    assert "Pair your phone" not in result.stdout
+    assert not markers["exec"].exists(), "rotated the setup code on a paired hub"
+
+
+def test_phase6_fails_when_the_boot_unit_is_not_enabled(tmp_path: Path) -> None:
+    # Separate from the container check on purpose. Everything else in phase 6
+    # proves the hub works now; only this proves it comes back after a power
+    # cut, which for a tank controller is the failure found at the worst
+    # possible time — and the message has to say so, or "not enabled" reads
+    # like a tidiness complaint.
+    stubs, _ = phase6_stubs(tmp_path)
+    # Phase 5's enable succeeds but records nothing, so is-enabled answers
+    # honestly that the unit is not enabled.
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in daemon-reload|enable) exit 0 ;; is-enabled) echo disabled; exit 1 ;; '
+        "*) exit 1 ;; esac",
+    )
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert result.returncode != 0, combined
+    assert "enabled" in combined.lower()
+    assert "power" in combined.lower(), "the reason the check exists is not explained"
+
+
+def test_phase6_is_unverified_when_avahi_cannot_be_confirmed(tmp_path: Path) -> None:
+    # An unconfirmed mDNS record is not a confirmed one. The app finds the hub
+    # by that record, so "could not tell" has to be visible and non-green —
+    # the same rule conftest.py applies to a skipped test.
+    stubs, _ = phase6_stubs(tmp_path, avahi_ok=False)
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "UNVERIFIED" in result.stdout, combined
+    assert "avahi" in result.stdout.lower()
+    assert result.returncode != 0, "an unverified check must not exit green"
+
+
+def test_phase6_fails_when_a_container_is_not_running(tmp_path: Path) -> None:
+    stubs, _ = phase6_stubs(tmp_path, ps_line="bellasreef-hardware-io-1 exited")
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "bellasreef-hardware-io-1" in result.stdout, "the failing service was not named"
+
+
+def test_phase6_fails_when_compose_reports_no_containers_at_all(tmp_path: Path) -> None:
+    # The trap in "grep for anything not running": an empty listing has
+    # nothing that is not running, so a stack that started zero containers
+    # reads as a stack that is entirely healthy.
+    stubs, _ = phase6_stubs(tmp_path, ps_line="")
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "FAIL" in result.stdout, combined
+
+
+def test_phase6_fails_when_the_setup_code_is_empty(tmp_path: Path) -> None:
+    # The hub says it is in setup mode and then the CLI hands back nothing.
+    # Printing an empty code block would send the owner to type a code that
+    # does not exist; the honest answer is that the install did not finish.
+    stubs, _ = phase6_stubs(tmp_path, setup_code="")
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    assert "setup code" in result.stdout.lower(), combined
+
+
+def test_phase6_dry_run_probes_nothing(tmp_path: Path) -> None:
+    # --dry-run mutates nothing, and `bellasreef setup-code` mutates: it
+    # rotates the code. A dry run that "just verifies" would invalidate a
+    # paired hub's code as a side effect of being asked what it would do.
+    stubs, markers = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert "6. verify" in result.stdout, result.stdout + result.stderr
+    assert "would" in result.stdout.lower()
+    for name in ("curl", "journalctl", "exec"):
+        assert not markers[name].exists(), f"--dry-run ran {name}"

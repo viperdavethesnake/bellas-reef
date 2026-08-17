@@ -48,6 +48,12 @@ IH_UNVERIFIED=()
 IH_ACTION_FAILURES=()
 IH_ASSUME_NO_TTY="${IH_ASSUME_NO_TTY:-0}"
 
+# How long phase 6 waits for the API to answer. A seam of the same kind as
+# IH_ASSUME_NO_TTY above and equally absent from --help: the tests that prove
+# the probe retries would otherwise spend thirty seconds each proving nothing
+# the four-second version does not. Nobody installing a hub sets it.
+IH_API_DEADLINE_SECS="${IH_API_DEADLINE_SECS:-30}"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ------------------------------------------------------------------ output
@@ -726,6 +732,122 @@ ih_phase5_deploy() {
     return 0
 }
 
+
+# ------------------------------------------------------------------ phase 6
+
+IH_API_INFO_URL="http://127.0.0.1:8000/api/v1/info"
+
+# Polled, not asked once. `compose up -d` returns when the containers have
+# been created, which is well before uvicorn accepts a connection — api has
+# no compose healthcheck for `up` to wait on — so a single curl here would
+# report a dead API on a perfectly good install. Same deadline loop as
+# deploy-pi.sh's, and the body is kept because the setup-code step needs it.
+ih_api_info() {
+    local deadline body=""
+    deadline=$(( $(date +%s) + IH_API_DEADLINE_SECS ))
+    while :; do
+        body="$(curl -fsS --max-time 10 "$IH_API_INFO_URL" 2>/dev/null)"
+        [[ -n "$body" ]] && break
+        (( $(date +%s) >= deadline )) && break
+        sleep 2
+    done
+    printf '%s' "$body"
+}
+
+ih_phase6_verify() {
+    ih_step "6. verify"
+
+    # Returns before anything runs, not after each command is skipped: every
+    # step below either reads the machine or, in the setup-code case, changes
+    # it. `bellasreef setup-code` rotates the code rather than reprinting it,
+    # so a dry run that "only verifies" would invalidate a paired hub's code
+    # as a side effect of being asked what it would do.
+    if (( IH_DRY_RUN )); then
+        ih_would "verify services, boot unit, API, avahi; print the setup code"
+        return 0
+    fi
+
+    # An empty listing is checked separately from a listing with something
+    # broken in it. "Anything that is not running" finds nothing in an empty
+    # one, so a stack that started zero containers would otherwise read as a
+    # stack that is entirely healthy.
+    local ps_output
+    ps_output="$(ih_compose ps --format '{{.Name}} {{.State}}' 2>/dev/null)"
+    if [[ -z "$ps_output" ]]; then
+        ih_fail "no containers are running; the stack did not come up"
+    else
+        local unhealthy
+        unhealthy="$(grep -v 'running' <<<"$ps_output")"
+        if [[ -n "$unhealthy" ]]; then
+            ih_fail "not all services are running"
+            printf '%s\n' "$unhealthy" | sed 's/^/      /'
+        else
+            ih_pass "all services running"
+        fi
+    fi
+
+    # Separate from the container check on purpose. Every other check here
+    # proves the hub works now; only this one proves it comes back after a
+    # power cut, which for a tank controller is the failure you find at the
+    # worst possible time.
+    if [[ "$(systemctl is-enabled bellasreef.service 2>/dev/null)" == "enabled" ]]; then
+        ih_pass "bellasreef.service enabled; the stack survives a power cut"
+    else
+        ih_fail "bellasreef.service is NOT enabled; the stack will not return after a power cut"
+    fi
+
+    local info
+    info="$(ih_api_info)"
+    if [[ -n "$info" ]]; then
+        ih_pass "API answering"
+    else
+        ih_fail "API not answering on port 8000"
+    fi
+
+    # Not by browsing: avahi-browse is not installed by avahi-daemon, and
+    # host-setup.md §5 records that a local browse does not reliably reflect
+    # the daemon's own services. The journal is authoritative instead.
+    if journalctl -u avahi-daemon --no-pager -n 200 2>/dev/null \
+        | grep -q 'successfully established'; then
+        ih_pass "avahi published the _bellasreef._tcp record"
+    else
+        ih_unverified "could not confirm avahi published the service record"
+    fi
+
+    # Only in setup mode, and only if the API answered at all. `bellasreef
+    # setup-code` mints a new code rather than reprinting the current one, so
+    # running it on a hub somebody has already paired would silently break
+    # that pairing's successor. If /info never answered there is nothing to
+    # read the mode from and the FAIL above already says why — a second
+    # failure line about the code would name a symptom, not the cause.
+    #
+    # sed with [a-z]* rather than \(true\|false\): \| is a GNU extension and
+    # matches nothing on a BSD sed, which is the same trap deploy-pi.sh
+    # records having fallen into.
+    if [[ -n "$info" ]]; then
+        local setup_mode
+        setup_mode="$(sed -n 's/.*"setup_mode":\([a-z]*\).*/\1/p' <<<"$info")"
+        if [[ "$setup_mode" == "true" ]]; then
+            local code
+            code="$(ih_compose exec -T api bellasreef setup-code 2>/dev/null | tr -d '\r')"
+            if [[ -n "$code" ]]; then
+                printf '\n'
+                ih_step "Pair your phone"
+                printf '\n      Setup code:  \033[1m%s\033[0m\n\n' "$code"
+                printf '      Open the Bella'"'"'s Reef app, pick this hub, and enter it.\n'
+                printf '      Multicast is not something this script can test from here;\n'
+                printf '      the app finding the hub is the proof.\n\n'
+            else
+                ih_fail "could not read the setup code"
+            fi
+        else
+            ih_pass "hub already paired; no setup code to show"
+        fi
+    fi
+
+    (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -768,6 +890,18 @@ ih_main() {
     # every step past the pull is a mutation, and once one of them fails there
     # is nothing further to attempt on this machine.
     ih_phase5_deploy || exit 1
+    # Phase 6 changes nothing, so unlike phase 5 there is no reason to stop at
+    # the first bad answer — every check runs and the summary counts what came
+    # back, the same shape as the phase-2 and phase-4 gates. An UNVERIFIED is
+    # counted with the failures deliberately: a check that could not run has
+    # not shown the operator a working hub.
+    if ! ih_phase6_verify; then
+        printf '\n'
+        (( ${#IH_FAILURES[@]} > 0 ))   && ih_warn "${#IH_FAILURES[@]} check(s) failed"
+        (( ${#IH_UNVERIFIED[@]} > 0 )) && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+        ih_warn "the hub is not ready to hand over"
+        exit 1
+    fi
     return 0
 }
 
