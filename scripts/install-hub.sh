@@ -166,7 +166,26 @@ ih_phase1_already_deployed() {
 
 IH_MIN_KERNEL_MAJOR=6
 IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
-IH_MIN_DISK_KB=16000000      # 16 GB. Measured images are ~1.6 GB before data.
+
+# Disk is two-tier, from measurements on the reference Pi (2026-08-17).
+#
+# One generation of images is 1.69 GB — api 482, control-engine 353,
+# hardware-io 348, postgres 415, nats 38, victoria-metrics 52 MB — Docker
+# Engine itself is about 0.4 GB, and the data volumes start at roughly 60 MB.
+# So a shade over 2 GB has to land before a hub exists at all, which is what
+# the hard floor protects: below it the install cannot finish, and stopping is
+# the only honest answer.
+#
+# The 16 GB figure is a different claim. It is the practical minimum from
+# docs/hub-platform-requirements.md — room for VictoriaMetrics retention, a
+# Postgres that grows, and the second generation of images an upgrade pulls
+# before it drops the first. A machine between the two installs fine and will
+# run out later, so it is a WARN and the run continues.
+#
+# Both thresholds are round decimal GB, which is how the messages below say
+# them; the free-space figure is df's kB divided the binary way, as before.
+IH_MIN_DISK_KB=4000000            # 4 GB hard floor — below this nothing fits.
+IH_RECOMMENDED_DISK_KB=16000000   # 16 GB practical minimum — below this, warn.
 
 ih_check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
@@ -240,11 +259,19 @@ ih_check_disk() {
         ih_unverified "could not read free disk space"
         return 2
     fi
-    if (( kb >= IH_MIN_DISK_KB )); then
+    if (( kb >= IH_RECOMMENDED_DISK_KB )); then
         ih_pass "free disk $(( kb / 1024 / 1024 )) GB"
         return 0
     fi
-    ih_fail "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_MIN_DISK_KB / 1024 / 1024 )) GB floor"
+    if (( kb >= IH_MIN_DISK_KB )); then
+        # WARN, not UNVERIFIED. The check ran and gave an answer; the answer is
+        # that this machine is knowingly degraded. UNVERIFIED means the check
+        # could not run, and conflating the two would hide a measured fact
+        # behind a word that means "no measurement".
+        ih_warn "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_RECOMMENDED_DISK_KB / 1000 / 1000 )) GB practical minimum (docs/hub-platform-requirements.md); fine for a bench, not for a tank — retention and a second image generation will not fit"
+        return 0
+    fi
+    ih_fail "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the images alone are ~2 GB"
     return 1
 }
 

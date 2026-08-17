@@ -502,6 +502,44 @@ def test_phase2_fails_when_compose_v2_is_missing(tmp_path: Path) -> None:
     assert "compose" in result.stdout.lower()
 
 
+# The disk check is two-tier, and the two tiers mean different things. Below
+# the hard floor the images physically cannot land, so the run stops. Between
+# the floor and the practical minimum the install works and the machine is
+# known-degraded, which is a WARN — not an UNVERIFIED, because the check ran
+# and gave an answer. FULL_STUBS' df reports 100000000 kB (95 GB), the
+# comfortable case, so both tiers need their own stub.
+
+
+def test_phase2_warns_between_the_disk_floor_and_the_practical_minimum(
+    tmp_path: Path,
+) -> None:
+    # 5000000 kB is 4.7 GB: above the 4 GB hard floor, below the 16 GB
+    # practical minimum. The images fit, a second generation of them plus
+    # retention does not — so the operator is told, and the run continues.
+    stubs = make_stubs(tmp_path, {"df": 'echo "5000000"'})
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "WARN" in result.stdout, result.stdout
+    assert "practical minimum" in result.stdout, result.stdout
+    assert "not for a tank" in result.stdout, result.stdout
+    assert "UNVERIFIED" not in result.stdout, "a checked, degraded disk is not an unverified one"
+    assert "3. hardware inventory" in result.stdout, "the warn tier stopped the run"
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_phase2_fails_below_the_disk_hard_floor(tmp_path: Path) -> None:
+    # 3000000 kB is 2.9 GB. One generation of images is ~1.7 GB and Docker
+    # Engine itself is ~0.4 GB, so this machine cannot complete an install at
+    # all — that is a hard stop, and the gate must fire before phase 3.
+    stubs = make_stubs(tmp_path, {"df": 'echo "3000000"'})
+    root = full_root(tmp_path)
+    result = run_script(root=root, stubs=stubs)
+    assert "FAIL" in result.stdout, result.stdout
+    assert "hard floor" in result.stdout, result.stdout
+    assert result.returncode != 0
+    assert "3. hardware inventory" not in result.stdout, "the gate did not stop the run"
+
+
 def test_phase2_unverified_when_clock_state_is_unknown(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path, {"timedatectl": "exit 1"})
     result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
