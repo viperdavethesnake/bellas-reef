@@ -3,9 +3,11 @@
 """PCA9685 driver, against a fake bus.
 
 Nothing here has driven a real light, and no test in this file claims
-otherwise. What these do is pin the decisions that a bench session will *check*
-— the polarity, the prescaler, the duty mapping — so that when the lamp
+otherwise. What these do is pin the decisions the bench *checked* on 2026-08-15
+— the polarity, the prescaler, the duty mapping — so that when the meter
 disagrees, exactly one constant changes and the test that has to move says so.
+The polarity and oscillator assertions below are now measured values rather
+than expectations; Stage 2, the same points through the stack, is still open.
 
 The fake models the two chip behaviours that actually bite:
 
@@ -27,6 +29,7 @@ from bellasreef_hardware_io.drivers.dimming import MIN_USABLE_DUTY
 from bellasreef_hardware_io.drivers.pca9685 import (
     INVRT_ON,
     OPEN_DRAIN,
+    PCA9685_OSC_HZ,
     PCA9685_PRE_SCALE,
     Pca9685Channel,
     Pca9685Device,
@@ -180,31 +183,53 @@ def test_a_prescaler_that_does_not_stick_is_an_error_not_a_shrug() -> None:
         run(scenario)
 
 
-def test_the_prescaler_is_five_hundred_hertz_not_the_chip_default() -> None:
+def test_the_prescaler_is_five_hundred_hertz_on_the_measured_oscillator() -> None:
     """30 (≈196.9 Hz) is inside the XLG window but was never a chosen value.
 
-    11 gives ≈508.6 Hz on the internal 25 MHz oscillator: mid-window, clear of
-    the flicker floor and clear of the >2 kHz spurious-triggering region.
+    The pinned frequency is 500 Hz: mid-window, clear of the flicker floor and
+    clear of the >2 kHz spurious-triggering region. The prescaler that gets
+    there is computed from the *measured* oscillator, not the datasheet's.
     """
-    assert PCA9685_PRE_SCALE == 11
-    actual_hz = 25_000_000 / (4096 * (PCA9685_PRE_SCALE + 1))
-    assert 100 < actual_hz < 2000
-    assert round(actual_hz) == 509
+    assert PCA9685_PRE_SCALE == 12
+    actual_hz = PCA9685_OSC_HZ / (4096 * (PCA9685_PRE_SCALE + 1))
+    assert 100 < actual_hz < 2000, "outside the usable XLG-AB dimming window"
+    assert abs(actual_hz - 500) / 500 < 0.02, f"{actual_hz:.1f} Hz is not ~500 Hz"
+
+
+def test_the_datasheet_oscillator_is_why_eleven_was_wrong() -> None:
+    """Why this constant moved from 11 to 12, as arithmetic rather than prose.
+
+    The datasheet's 25 MHz makes 11 look correct — ≈508.6 Hz, comfortably
+    mid-window. The chip on this bench measured 544.7/544.8 Hz at that same
+    prescaler on 2026-08-15, and 1307 Hz at PRE_SCALE 4: a constant ratio,
+    ~7.1 % fast, implying ≈26.77 MHz. Asking a 25 MHz formula for 500 Hz on
+    this chip silently returns 545.
+    """
+    assert round(PCA9685_OSC_HZ / 25_000_000, 3) == 1.071
+
+    datasheet_at_eleven = 25_000_000 / (4096 * 12)
+    measured_at_eleven = PCA9685_OSC_HZ / (4096 * 12)
+    assert round(datasheet_at_eleven, 1) == 508.6
+    assert round(measured_at_eleven) == 545, "the bench read 544.7/544.8 Hz here"
 
 
 # ------------------------------------------------------- polarity, the bench knob
 
 
-def test_output_is_totem_pole_driving_the_fet_gate_with_inversion() -> None:
-    """The output-stage ruling of 2026-08-11, asserted as register bits.
+def test_output_is_totem_pole_with_inversion_off_as_measured() -> None:
+    """MODE2 ``0x04`` — OUTDRV set, INVRT clear — as measured on 2026-08-15.
 
-    Totem-pole because the PCA9685 drives an external N-FET gate; the 10 V dim
-    line lives on the FET drain, not on LEDn. Recorded as ruled — this test
-    checks the registers match the decision and does not argue the electronics.
+    Totem-pole is the 2026-08-11 ruling: the PCA9685 drives an external N-FET
+    gate and the 10 V dim line lives on the FET drain, not on LEDn. Recorded as
+    ruled — this test checks the registers match the decision and does not argue
+    the electronics.
 
-    INVRT is an **expectation pending Stage-1 measurement**, not a conclusion.
-    If the meter at the FET drain says duty 0.0 is bright, INVRT_ON flips and
-    this assertion flips with it. One constant, one test, one place.
+    INVRT clear is Stage 1, not an expectation: with MODE2 ``0x04`` the meter at
+    the LEDn pin read 0 V at duty 0 and 3.307 V at duty 1.0, linear between. The
+    earlier ``INVRT_ON = True`` would have driven this channel to full output on
+    its declared safe state. If a later output stage measures inverted, one
+    constant flips and this assertion flips with it. One constant, one test, one
+    place.
 
     Supersedes an open-drain configuration written for a withdrawn bench design
     that put a 10 V pull-up on LEDn directly, which is out of spec at a 5.5 V
@@ -221,8 +246,9 @@ def test_output_is_totem_pole_driving_the_fet_gate_with_inversion() -> None:
 
     assert OPEN_DRAIN is False
     assert mode2 & _OUTDRV, "OUTDRV clear — the chip is open-drain, not driving a gate"
-    assert INVRT_ON is True
-    assert mode2 & _INVRT, "INVRT clear — duty 0.0 would not land on the dark side"
+    assert INVRT_ON is False
+    assert not mode2 & _INVRT, "INVRT set — duty 0.0 would drive the channel to full output"
+    assert mode2 == _OUTDRV, f"MODE2 is {mode2:#04x}, the bench configured 0x04"
 
 
 def test_every_channel_is_driven_off_before_the_frequency_changes() -> None:

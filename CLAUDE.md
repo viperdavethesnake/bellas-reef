@@ -510,6 +510,17 @@ changed yet, because whether this is the final output stage is David's ruling.
 Whichever stage ships, the constant must match a measurement rather than an
 expectation.
 
+- RESOLVED (2026-08-17, David's ruling: these CLI measurements are final and
+  the driver's constants must match them). `INVRT_ON` is now `False` in
+  `services/hardware_io/bellasreef_hardware_io/drivers/pca9685.py`, and the
+  prescaler is computed from the measured oscillator rather than the
+  datasheet's: `PCA9685_OSC_HZ = 26_770_000`, `PCA9685_PRE_SCALE =
+  round(PCA9685_OSC_HZ / (4096 * 500)) - 1` = **12** (≈502.7 Hz actual, versus
+  11's measured ≈545 Hz). Tests assert the measured values and record why 11
+  was wrong. History above is kept. PR pending; not yet deployed. A FET stage
+  inserted later gets measured, not reasoned about — the constant flips on a
+  meter reading and nothing else.
+
 **2. The internal oscillator runs ~7.1 % fast, and the error is a constant
 ratio.** Two prescaler values, both measured:
 

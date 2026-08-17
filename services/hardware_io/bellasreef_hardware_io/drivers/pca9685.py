@@ -2,10 +2,18 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """PCA9685 16-channel PWM over I²C — LED dimming (PRD R10a).
 
-**BENCH-UNVERIFIED.** Everything here runs against a fake bus and nothing here
-has driven a real light. Two assertions are outstanding, both David's to make:
+**STAGE 1 MEASURED, STAGE 2 PENDING.** On 2026-08-15 the chip at ``0x40`` was
+driven from raw ``i2cset``/``i2cget`` — no Bella's Reef code in the loop — with
+David's DMM at the **LEDn pin**, no FET stage in the measured chain. Those
+readings set two constants in this file, :data:`INVRT_ON` and
+:data:`PCA9685_OSC_HZ`. The record is CLAUDE.md, "Stage 1 (PCA9685), CH0 —
+PASSED on hardware 2026-08-15".
 
-1. **duty 0.0 measures dark**, on the DMM at the FET drain.
+Two assertions remain outstanding, both David's to make:
+
+1. **Stage 2** — the same duty points through hardware-io and the spine, on the
+   same channel and the same probe point, with the meter agreeing to the Stage-1
+   numbers. Any divergence is a driver bug by definition.
 2. **The fail-safe drills** (process kill, container kill, NATS outage, power
    pull) against a real actuator.
 
@@ -20,8 +28,12 @@ and the measurements it is waiting on; it does not argue the electronics.
   drain to the dim line and its 10 V pull-up, source to common ground).
 * The PCA9685 stays **totem-pole**, driving the FET gate. See
   :data:`OPEN_DRAIN`.
-* The stage is expected to invert, so :data:`INVRT_ON` compensates — **as an
-  expectation, set for real by Stage-1 measurement**, not as a derivation.
+* Polarity is whatever the meter last said, and nothing else — see
+  :data:`INVRT_ON`. The 2026-08-11 design *expected* the FET stage to invert;
+  that is history, not the governing statement. Stage 1 measured the chip
+  directly at the LEDn pin on 2026-08-15 and found no inversion needed, so
+  :data:`INVRT_ON` is ``False``. A FET stage inserted later gets **measured**,
+  not reasoned about.
 
 Correction trail
 ----------------
@@ -29,7 +41,9 @@ An earlier revision of this driver configured the outputs **open-drain**, for a
 bench design in which a 10 V pull-up sat directly on the LEDn pin. That design
 was withdrawn on 2026-08-11: LEDn absolute maximum is 5.5 V and the outputs are
 5.5 V-only tolerant, so a 10 V pull-up was out of spec. The FET stage above
-replaces it, and the DMM now goes on the **FET drain, never the LEDn pin**.
+replaces it, and when that stage is on the bench the DMM goes on the **FET
+drain, never the LEDn pin**. The 2026-08-15 Stage 1 had no FET stage in the
+chain and was therefore probed at the LEDn pin itself.
 
 Left in the file deliberately. The withdrawn design is the reason this driver's
 polarity handling exists at all, and a reader who does not know it was wrong
@@ -51,6 +65,7 @@ log = get_logger(__name__)
 __all__ = [
     "INVRT_ON",
     "OPEN_DRAIN",
+    "PCA9685_OSC_HZ",
     "PCA9685_PRE_SCALE",
     "I2CBus",
     "Pca9685Channel",
@@ -102,32 +117,63 @@ _COUNTS: Final = 4096
 #: flag reads "are we in open-drain", and totem-pole is OUTDRV **set**.
 OPEN_DRAIN: Final = False
 
-#: Output logic inversion. **Set by Stage-1 measurement, not by argument.**
+#: Output logic inversion. **Set by measurement, never by argument.**
 #:
-#: The expectation is that the FET stage inverts, so INVRT compensates and duty
-#: 0.0 leaves the dim line where "dark" is. That expectation is David's, from
-#: the bench design; this file does not re-derive it and must not.
+#: ``False`` — MODE2 INVRT stays clear. Measured 2026-08-15 (CLAUDE.md, "Stage 1
+#: (PCA9685), CH0 — PASSED on hardware 2026-08-15"): raw ``i2cset``/``i2cget``,
+#: MODE2 ``0x04``, DMM at the LEDn pin with no FET stage in the chain. David's
+#: readings, recorded as given:
 #:
-#: What decides it is the meter. Stage 1 drives full-off, full-on and 50% with
-#: ``i2cset`` alone, David reads volts at the FET drain, and those three numbers
-#: fix this constant. If they say the opposite, this flips and nothing else in
-#: the driver changes — which is why the polarity lives in one named place.
+#:   0 % -> 0 V · 8.008 % -> 265 mV · 25 % -> 828 mV · 50 % -> 1.654 V ·
+#:   75 % -> 2.481 V · 100 % -> 3.307 V, linear within 0.04 percentage points.
+#:
+#: So duty 0.0 is already dark with INVRT clear. Setting INVRT would put 3.307 V
+#: on this channel when it is commanded to its declared safe state — the code
+#: had assumed inversion and the bench found none.
+#:
+#: **The meter decides.** This constant flips on a new measurement of the stage
+#: that actually ships, and on nothing else. If the external FET stage of the
+#: 2026-08-11 design is inserted later, that chain gets measured at the FET
+#: drain and this constant follows the reading; it is not derived, argued or
+#: inherited. One constant, one place, one number from a DMM.
 #:
 #: The stake: the contract declares ``PwmLevel(duty=0.0)`` the safe state,
 #: meaning dark. Get this wrong and the declared safe state is the dangerous
 #: one, and every fail-safe drill passes in software over a lit tank.
-INVRT_ON: Final = True
+INVRT_ON: Final = False
 
-#: PRE_SCALE for ~500 Hz on the internal 25 MHz oscillator:
-#: 25e6 / (4096 x (11+1)) ≈ 508.6 Hz.
+#: The chip's internal oscillator, **measured, not taken from the datasheet**.
 #:
-#: Pinned from bench findings (CLAUDE.md): the XLG-AB dimming window is
-#: 100 Hz–3 kHz, with documented spurious triggering above 2 kHz at 10–15% duty,
-#: so the usable window is 100 Hz–2 kHz. 500 Hz sits mid-window, clear of both
-#: the flicker floor and the spurious region. The chip's own default of 30
+#: The datasheet says 25 MHz. This chip says otherwise, at two prescalers
+#: (CLAUDE.md, Stage 1 PCA9685 item 2, measured 2026-08-15):
+#:
+#:   PRE_SCALE 11 -> 544.7/544.8 Hz, implying 26 773 094 Hz
+#:   PRE_SCALE 4  -> 1307 Hz,        implying 26 767 360 Hz
+#:
+#: A constant ratio, ~7.1 % fast, stable across a 2.4x frequency span — so one
+#: calibration number per chip is enough. Dividing a requested frequency by a
+#: hardcoded 25 MHz is how you ask for 500 Hz and silently get 545.
+PCA9685_OSC_HZ: Final = 26_770_000
+
+#: PRE_SCALE for the pinned 500 Hz, computed from the measured oscillator:
+#: ``round(26_770_000 / (4096 x 500)) - 1`` = 12, which lands at ≈502.7 Hz.
+#:
+#: 500 Hz is pinned from bench findings (CLAUDE.md): the XLG-AB dimming window
+#: is 100 Hz–3 kHz, with documented spurious triggering above 2 kHz at 10–15%
+#: duty, so the usable window is 100 Hz–2 kHz. 500 Hz sits mid-window, clear of
+#: both the flicker floor and the spurious region. The chip's own default of 30
 #: (≈196.9 Hz) is inside the window but only ~2x above its floor, and it was
 #: never a chosen value — just what the silicon powers up with.
-PCA9685_PRE_SCALE: Final = 11
+#:
+#: This was 11, which is the right prescaler for a chip whose oscillator runs at
+#: the datasheet's 25 MHz (≈508.6 Hz) and the wrong one for this chip, where it
+#: measured ≈545 Hz.
+#:
+#: Both numbers above belong to **the one chip on this bench**. The (unapproved)
+#: spec ``docs/superpowers/specs/2026-08-15-driver-hardware-config.md`` moves
+#: ``osc_hz`` / ``pwm_hz`` / ``invert`` into per-device configuration; until it
+#: lands, these are the measured constants for that chip.
+PCA9685_PRE_SCALE: Final = round(PCA9685_OSC_HZ / (4096 * 500)) - 1
 
 
 class I2CBus(Protocol):
