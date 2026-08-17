@@ -361,6 +361,11 @@ drain, not by reasoning about the datasheet.
 
 `25 MHz / (4096 × (11+1)) ≈ 508.6 Hz` on the internal oscillator.
 
+Superseded 2026-08-17: the oscillator on this chip measured 26.77 MHz, so
+`PRE_SCALE = 11` gave 545 Hz, not 508; the driver now computes `PRE_SCALE = 12`
+(≈503 Hz) from the measured value — see "Stage 1 (PCA9685)" item 1 below. The
+500 Hz pin itself is unchanged.
+
 The chip default `PRE_SCALE = 0x1e` (30) is ≈196.9 Hz. That is *inside* the
 window but only about 2× above its floor — low margin, and it was never a chosen
 value, just what the chip powers up with. 500 Hz sits comfortably mid-window,

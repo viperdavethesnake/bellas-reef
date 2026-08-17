@@ -251,6 +251,29 @@ def test_output_is_totem_pole_with_inversion_off_as_measured() -> None:
     assert mode2 == _OUTDRV, f"MODE2 is {mode2:#04x}, the bench configured 0x04"
 
 
+def test_a_chip_left_inverted_by_the_old_driver_comes_back_to_the_measured_state() -> None:
+    """The upgrade path this constant flip creates.
+
+    A hub that ran the earlier ``INVRT_ON = True`` driver leaves the chip at
+    MODE2 ``0x14`` (OUTDRV | INVRT). The next start must clear INVRT, not just
+    leave a clear bit clear: the power-on fake above never has it set, so this
+    is the one case that proves ``initialise()`` actively writes the measured
+    polarity rather than inheriting whatever the silicon was left with.
+    """
+
+    async def scenario() -> FakeBus:
+        bus = FakeBus()
+        bus.registers[_MODE2] = _OUTDRV | _INVRT  # 0x14, as the old driver left it
+        device = Pca9685Device(bus)
+        await device.initialise()
+        return bus
+
+    bus = run(scenario)
+    mode2 = bus.registers[_MODE2]
+    assert not mode2 & _INVRT, "INVRT survived from the previous driver — duty 0.0 is full output"
+    assert mode2 == _OUTDRV, f"MODE2 is {mode2:#04x}, expected 0x04"
+
+
 def test_every_channel_is_driven_off_before_the_frequency_changes() -> None:
     """Initialise runs against a chip whose previous state is unknown.
 
