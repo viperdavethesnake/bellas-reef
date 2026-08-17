@@ -84,6 +84,11 @@ HIDDEN_FROM_PATH = frozenset(
         # a runner's own systemd-analyze answering here would make that path
         # untestable and the tool's presence a property of the machine.
         "systemd-analyze",
+        # Phase 2 asks whether this user is in the docker group before it
+        # offers to do anything about an unreachable daemon. On a CI runner
+        # the real `id` says yes and on a laptop it says no, which would make
+        # the offered remediation a property of the machine running the suite.
+        "id",
         # Phase 2's avahi remedy names this machine's own interfaces, read
         # from `ip -br link`. A runner's real `ip` would make the suggested
         # allow-interfaces line a property of the machine running the suite.
@@ -326,6 +331,39 @@ IP_BR_LINK = "\n".join(
     ]
 )
 
+
+def id_stub(*groups: str) -> str:
+    """An `id` stub answering `-un` (the login name) and `-nG` (its groups).
+
+    The script asks `id -nG <user>` — the group database, not this session's
+    groups — because after a usermod the two disagree, and that disagreement
+    is exactly the state the remediation has to tell apart from "never added".
+    """
+    return "\n".join(
+        [
+            'case "$1" in',
+            '    -un) echo "${USER:-tester}" ;;',
+            f'    -nG) echo "{" ".join(groups)}" ;;',
+            "    *) exit 1 ;;",
+            "esac",
+        ]
+    )
+
+
+ID_NOT_IN_DOCKER_GROUP = id_stub("users", "sudo")
+ID_IN_DOCKER_GROUP = id_stub("users", "sudo", "docker")
+
+# A docker that is installed with Compose v2 but whose daemon this user cannot
+# reach. `docker ps` (phase 1) still answers, so phase 1 is unaffected.
+DOCKER_UNREACHABLE = "\n".join(
+    [
+        'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; exit 0; fi',
+        'if [[ "$1" == "info" ]]; then exit 1; fi',
+        'echo ""',
+        "exit 0",
+    ]
+)
+
 FULL_STUBS = {
     "docker": (
         'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; '
@@ -342,6 +380,8 @@ FULL_STUBS = {
     # M64's; wlan0 is down but is still a LAN interface; docker0 is the bridge
     # the allowlist exists to keep avahi off; lo is never a LAN interface.
     "ip": IP_BR_LINK,
+    # Not in the docker group — the ordinary case before an install.
+    "id": ID_NOT_IN_DOCKER_GROUP,
 }
 
 
@@ -986,6 +1026,76 @@ def test_phase2_fails_when_the_daemon_is_unreachable(tmp_path: Path) -> None:
     assert result.returncode != 0, result.stdout + result.stderr
     assert "cannot reach the daemon" in result.stdout, result.stdout
     assert "usermod -aG docker" in result.stdout
+
+
+def test_an_unreachable_daemon_offers_the_group_not_a_reinstall(tmp_path: Path) -> None:
+    # The M64, 2026-08-17: docker installed, Compose v2 present, the user not
+    # yet in the docker group. ih_check_docker fails at the `docker info`
+    # probe, and phase 2 offered to install Docker — so --yes re-ran
+    # get.docker.com for five minutes to install a Docker that was already
+    # there, then usermod'd a user for the second time. The failing probe
+    # names the group; the remediation has to act on the same reading.
+    stubs = make_stubs(
+        tmp_path,
+        {"docker": DOCKER_UNREACHABLE, "id": ID_NOT_IN_DOCKER_GROUP},
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "docker group" in result.stdout, result.stdout
+    assert "convenience script" not in result.stdout, "reinstalled an installed Docker"
+    assert markers["usermod"].exists(), "the group add never ran"
+    assert not markers["curl"].exists(), "re-ran the Docker convenience installer"
+    assert not markers["sh"].exists(), "re-ran the Docker convenience installer"
+    # The group does not apply to the session that granted it, so this run
+    # stops the same way the fresh-install path does.
+    assert "log out and back in" in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
+def test_an_unreachable_daemon_offers_nothing_when_already_in_the_group(
+    tmp_path: Path,
+) -> None:
+    # Third state. The user is in the docker group and still cannot reach the
+    # daemon, so there is nothing left to install: either dockerd is not
+    # running or this login predates the group being granted. Offering an
+    # install here is how the reinstall loop starts.
+    stubs = make_stubs(
+        tmp_path,
+        {"docker": DOCKER_UNREACHABLE, "id": ID_IN_DOCKER_GROUP},
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "convenience script" not in result.stdout, result.stdout
+    assert "add" not in result.stdout.lower().split("docker group")[0][-60:], result.stdout
+    assert "systemctl status docker" in result.stdout, result.stdout
+    for name in ("curl", "sh", "usermod"):
+        assert not markers[name].exists(), f"already in the group and still ran {name}"
+    assert result.returncode != 0
+
+
+def test_a_missing_docker_still_offers_the_convenience_script(tmp_path: Path) -> None:
+    # The state that has not changed: no docker at all is still the one case
+    # the convenience installer answers.
+    stubs = make_stubs(tmp_path, {"id": ID_NOT_IN_DOCKER_GROUP})
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "convenience script" in result.stdout, result.stdout
+    assert markers["sh"].exists(), "the convenience installer never ran"
+    assert markers["usermod"].exists(), "the group add never ran"
+    assert result.returncode != 0
 
 
 def test_action_failure_is_not_erased_by_the_verification_pass(tmp_path: Path) -> None:

@@ -56,7 +56,7 @@ declines to fix stops the run.
 
 | Check | Fix offered |
 |---|---|
-| Docker present, Compose v2 available | install |
+| Docker present, Compose v2 available, daemon reachable | install, or add to the docker group — see below |
 | Architecture is arm64 or amd64 | none, report and stop |
 | Kernel 6.x or newer | none, report and stop |
 | RAM at or above floor | none, report and warn |
@@ -68,6 +68,21 @@ declines to fix stops the run.
 
 Each install is offered individually and the user accepts or declines. Nothing
 is installed silently.
+
+Docker is unusable for three different reasons and only one of them is fixed by
+installing Docker. Absent, or present without Compose v2, is the incomplete
+install the convenience script answers. Present and complete but with the daemon
+refusing this user, who is not in the `docker` group, is a `usermod` and a
+re-login — no download. Present, in the group, and still refused is neither:
+either `dockerd` is not running or the login predates the group being granted,
+and there is nothing to offer. The M64 sat in the second state on 2026-08-17 and
+was offered the first one's remedy, so `--yes` re-ran `get.docker.com` for five
+minutes against a Docker that was already installed.
+
+Group membership is read from the group database (`id -nG <user>`) rather than
+from the current session. After a `usermod` the two disagree, and that
+disagreement is exactly the third state — reading the session's groups would
+call it the second and offer the `usermod` again.
 
 The avahi work is two separate things and both are required.
 

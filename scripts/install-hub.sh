@@ -187,12 +187,27 @@ IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
 IH_MIN_DISK_KB=4000000            # 4 GB hard floor — below this nothing fits.
 IH_RECOMMENDED_DISK_KB=16000000   # 16 GB practical minimum — below this, warn.
 
+# Docker is unusable for three different reasons and only one of them is
+# fixed by installing Docker. Asked separately here so the check's message and
+# phase 2's remediation both branch on the same three readings.
+ih_docker_present()    { command -v docker >/dev/null 2>&1; }
+ih_docker_compose_v2() { docker compose version >/dev/null 2>&1; }
+ih_docker_reachable()  { docker info >/dev/null 2>&1; }
+
+# The group database, deliberately, not this session's groups. After a usermod
+# the two disagree — the database has the user in the group and the login does
+# not — and that disagreement is precisely the state that must not be read as
+# "never added", because the answer to it is a re-login, not another usermod.
+ih_in_docker_group() {
+    id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx docker
+}
+
 ih_check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
+    if ! ih_docker_present; then
         ih_fail "docker is not installed"
         return 1
     fi
-    if ! docker compose version >/dev/null 2>&1; then
+    if ! ih_docker_compose_v2; then
         ih_fail "docker is installed but Compose v2 is not available"
         return 1
     fi
@@ -202,8 +217,17 @@ ih_check_docker() {
     # denial at the pull, three phases later, in a step with no idea what
     # caused it — and the fix is a group membership plus a re-login, which is
     # not guessable from "pull failed".
-    if ! docker info >/dev/null 2>&1; then
-        ih_fail "docker is installed but this user cannot reach the daemon; add yourself to the docker group (sudo usermod -aG docker \$USER), log out and back in"
+    if ! ih_docker_reachable; then
+        local docker_user
+        docker_user="${USER:-$(id -un)}"
+        if ih_in_docker_group "$docker_user"; then
+            # Already in the group and still refused. Nothing is left to
+            # install, so saying "add yourself to the docker group" here sends
+            # the operator to do again the thing they have already done.
+            ih_fail "docker is installed and ${docker_user} is already in the docker group, but the daemon is still unreachable; either it is not running (check: systemctl status docker) or this login predates the group being granted — log out and back in"
+        else
+            ih_fail "docker is installed but this user cannot reach the daemon; add yourself to the docker group (sudo usermod -aG docker \$USER), log out and back in"
+        fi
         return 1
     fi
     ih_pass "docker with Compose v2"
@@ -443,21 +467,47 @@ ih_phase2_requirements() {
     # never turns into a prompt or an action. `(( ! IH_CHECK_ONLY )) && ...`
     # short-circuits before ih_confirm/ih_offer_install run at all, so
     # --check-only --yes cannot install anything either.
+    # Three states, and each gets the one remediation that answers it.
+    #
+    # Observed on the Banana Pi M64, 2026-08-17: docker was installed with
+    # Compose v2, the user was not yet in the docker group for that login, and
+    # ih_check_docker failed at the `docker info` probe. Phase 2 offered the
+    # convenience script — so --yes spent five minutes re-running
+    # get.docker.com to install a Docker that was already there, then
+    # usermod'd a user for the second time. The check knew which of the three
+    # things was wrong; the remediation did not ask.
+    #
+    #   (a) no docker, or no Compose v2 — the install is absent or
+    #       incomplete, which is the one case the convenience script answers.
+    #   (b) installed and complete, daemon unreachable, user not in the
+    #       group — a usermod and a re-login, no download.
+    #   (c) installed, in the group, daemon still unreachable — nothing to
+    #       install. Either dockerd is down or the login predates the group,
+    #       and ih_check_docker's own message says both. No offer at all;
+    #       offering one here is how the reinstall loop starts.
     if ! ih_check_quietly ih_check_docker; then
-        if (( ! IH_CHECK_ONLY )) && ih_confirm "install Docker with the official convenience script?"; then
-            local target_user
-            target_user="${USER:-$(id -un)}"
-            ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
-            ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
-            # Stop here, and do not run the rest of phase 2 or any phase after
-            # it. The group membership does not apply to the session that
-            # granted it, so this process still cannot reach the daemon — and
-            # every remaining phase talks to it. Continuing means pulling
-            # images as a user who is not yet in the group: a guaranteed
-            # failure, several phases later, that reads as a broken install
-            # rather than as the log-out the operator actually owes.
-            ih_warn "log out and back in for the docker group to take effect, then re-run this script"
-            return 1
+        local target_user
+        target_user="${USER:-$(id -un)}"
+        # Stopping after either accepted remediation, not continuing: the
+        # group membership does not apply to the session that granted it, so
+        # this process still cannot reach the daemon — and every remaining
+        # phase talks to it. Continuing means pulling images as a user who is
+        # not yet in the group: a guaranteed failure, several phases later,
+        # that reads as a broken install rather than as the log-out the
+        # operator actually owes.
+        if ! ih_docker_present || ! ih_docker_compose_v2; then
+            if (( ! IH_CHECK_ONLY )) && ih_confirm "install Docker with the official convenience script?"; then
+                ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
+                ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
+                ih_warn "log out and back in for the docker group to take effect, then re-run this script"
+                return 1
+            fi
+        elif ! ih_docker_reachable && ! ih_in_docker_group "$target_user"; then
+            if (( ! IH_CHECK_ONLY )) && ih_confirm "add ${target_user} to the docker group?"; then
+                ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
+                ih_warn "log out and back in for the docker group to take effect, then re-run this script"
+                return 1
+            fi
         fi
     fi
 
