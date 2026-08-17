@@ -16,14 +16,124 @@ import os
 import pty
 import re
 import select
+import shutil
 import stat
 import subprocess
+import tempfile
 import termios
 import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "install-hub.sh"
+
+
+# Names this harness owns. Nothing on the machine's real PATH may answer for
+# any of them: a test that stubs one has to see its stub, and a test that
+# deletes one has to see "not installed" — on a developer laptop with no
+# docker and on a CI runner with /usr/bin/docker alike.
+#
+# This is not hypothetical tidiness. Seven tests model "docker is not
+# installed" by unlinking the docker stub, which on the dev Mac genuinely
+# leaves no docker anywhere on PATH. On the GitHub Actions runner
+# /usr/bin/docker sits further down the same PATH, `command -v docker` finds
+# it, phase 2 passes, and the two tests that assert on phase-2 remediation
+# fail for a reason that has nothing to do with the script. The leak runs
+# both ways: a machine missing some tool the script needs would fail tests
+# that a machine having it passes.
+#
+# It is a hidden set rather than an allowlist because the script and the
+# tests' own helpers reach for far more of the system than they stub —
+# bash, sed, grep, tr, awk, head, tail, cut, mktemp, mv, chmod, rm, id and
+# the rest have to keep working. sed and tr are stubbed by individual tests
+# but deliberately NOT hidden: the stubs directory comes first on PATH, so an
+# override already wins, and hiding them would break every test that does not
+# stub them.
+HIDDEN_FROM_PATH = frozenset(
+    {
+        # FULL_STUBS — the phase-1/2 machine survey.
+        "docker",
+        "systemctl",
+        "uname",
+        "free",
+        "df",
+        "timedatectl",
+        "getent",
+        # Phase-2 remediation and phase-5 deployment: every command that
+        # mutates a real machine. Hidden so a test that forgets to stub one
+        # gets "command not found" instead of touching the developer's box.
+        "sudo",
+        "sh",
+        "curl",
+        "apt-get",
+        "usermod",
+        "cp",
+        "install",
+    }
+)
+
+_real_bin_dir: Path | None = None
+
+
+def real_bin_dir() -> Path:
+    """A directory of symlinks to every executable on the inherited PATH
+    except the names in HIDDEN_FROM_PATH.
+
+    Built once per test session and cached: /usr/bin alone holds a thousand
+    entries, and this runs for every subprocess the suite launches. Earlier
+    PATH entries win, the same shadowing rule the real PATH search uses.
+    """
+    global _real_bin_dir
+    if _real_bin_dir is not None:
+        return _real_bin_dir
+
+    farm = Path(tempfile.mkdtemp(prefix="ih-real-bin-"))
+    seen: set[str] = set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            names = os.listdir(entry)
+        except OSError:
+            continue
+        for name in names:
+            if name in seen or name in HIDDEN_FROM_PATH:
+                continue
+            source = Path(entry) / name
+            # An entry that cannot even be stat'd (macOS keeps a few of those
+            # under /usr/sbin) is not something the script could have run
+            # either, so skipping it changes nothing but the traceback.
+            try:
+                if source.is_dir() or not os.access(source, os.X_OK):
+                    continue
+                (farm / name).symlink_to(source)
+            except OSError:
+                continue
+            seen.add(name)
+    _real_bin_dir = farm
+    return farm
+
+
+def script_env(
+    root: Path,
+    stubs: Path | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment install-hub.sh runs under: fixture root, isolated PATH.
+
+    PATH is the stubs directory (when there is one) followed by the symlink
+    farm — never the inherited PATH — so what the script can find is exactly
+    what a test decided it should find. IH_TEST_REAL_BIN points at the farm
+    for the one stub that needs to reach a real tool it is shadowing.
+    """
+    environ = dict(os.environ)
+    farm = real_bin_dir()
+    environ["IH_ROOT"] = str(root)
+    environ["PATH"] = f"{stubs}{os.pathsep}{farm}" if stubs is not None else str(farm)
+    environ["IH_TEST_REAL_BIN"] = str(farm)
+    if extra:
+        environ.update(extra)
+    return environ
 
 
 def run_script(
@@ -33,19 +143,36 @@ def run_script(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run install-hub.sh against a fixture root."""
-    environ = dict(os.environ)
-    environ["IH_ROOT"] = str(root)
-    if stubs is not None:
-        environ["PATH"] = f"{stubs}:{environ['PATH']}"
-    if env:
-        environ.update(env)
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         capture_output=True,
         text=True,
-        env=environ,
+        env=script_env(root, stubs, env),
         timeout=60,
     )
+
+
+def test_the_isolated_path_hides_the_machines_own_tools(tmp_path: Path) -> None:
+    # The harness's own contract, and the reason it exists: a deleted stub has
+    # to mean "not installed" everywhere, not only on a laptop that happens
+    # not to have docker. Asserting on the PATH script_env hands out is what
+    # makes this machine-independent — a run of the suite on a runner with
+    # /usr/bin/docker used to pass phase 2 in tests whose docker stub had been
+    # unlinked, and nothing in the suite noticed.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    path = script_env(tmp_path / "root", stubs)["PATH"]
+    # An unlinked stub resolves nowhere, whatever the machine has installed.
+    assert shutil.which("docker", path=path) is None, "the machine's own docker leaked in"
+    # The same for every other name the harness manages: only a stub may
+    # answer, so the farm holds none of them.
+    farm = str(real_bin_dir())
+    for hidden in sorted(HIDDEN_FROM_PATH):
+        assert shutil.which(hidden, path=farm) is None, f"{hidden} leaked in from the real PATH"
+    # And the tools nobody stubs are still reachable, or the script cannot run
+    # at all.
+    for needed in ("bash", "sed", "grep", "tr", "awk", "head", "mktemp", "mv", "chmod"):
+        assert shutil.which(needed, path=path) is not None, f"{needed} is missing from the farm"
 
 
 def test_script_exists_and_is_executable() -> None:
@@ -300,11 +427,7 @@ def test_yes_accepts_offers_without_prompting(tmp_path: Path) -> None:
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "IH_ROOT": str(root),
-            "PATH": f"{stubs}:{os.environ['PATH']}",
-        },
+        env=script_env(root, stubs),
         timeout=60,
     )
     assert result.returncode in (0, 1)
@@ -327,11 +450,7 @@ def test_confirm_prompt_is_visible_on_a_real_tty(tmp_path: Path) -> None:
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
 
-    env = {
-        **os.environ,
-        "IH_ROOT": str(root),
-        "PATH": f"{stubs}:{os.environ['PATH']}",
-    }
+    env = script_env(root, stubs)
 
     # subprocess.Popen with stdin/stdout/stderr pointed at a pty's slave fd
     # does NOT by itself make that pty the child's controlling terminal (the
@@ -410,12 +529,7 @@ def test_no_tty_declines_and_leaves_the_failure_standing(tmp_path: Path) -> None
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "IH_ROOT": str(tmp_path / "root"),
-            "IH_ASSUME_NO_TTY": "1",
-            "PATH": f"{stubs}:{os.environ['PATH']}",
-        },
+        env=script_env(tmp_path / "root", stubs, {"IH_ASSUME_NO_TTY": "1"}),
         timeout=60,
     )
     assert result.returncode != 0
@@ -508,11 +622,7 @@ exit 0
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "IH_ROOT": str(root),
-            "PATH": f"{stubs}:{os.environ['PATH']}",
-        },
+        env=script_env(root, stubs),
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -554,11 +664,7 @@ exit 0
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        env={
-            **os.environ,
-            "IH_ROOT": str(root),
-            "PATH": f"{stubs}:{os.environ['PATH']}",
-        },
+        env=script_env(root, stubs),
         timeout=60,
     )
     assert result.returncode != 0, result.stdout + result.stderr
@@ -826,7 +932,15 @@ def test_phase4_rejects_a_password_that_is_not_32_chars(tmp_path: Path) -> None:
         tmp_path,
         {
             "getent": GOOD_GETENT,
-            "tr": 'case "$1" in -dc) printf short ;; *) exec /usr/bin/tr "$@" ;; esac',
+            # The stub runs under the same isolated PATH as the script, so a
+            # bare `tr` here would find the stub again and recurse.
+            # IH_TEST_REAL_BIN is the symlink farm of real tools, which is
+            # where the genuine tr lives — a hardcoded /usr/bin/tr would be a
+            # guess about the machine, which is the thing this harness is
+            # meant to stop making.
+            "tr": (
+                'case "$1" in -dc) printf short ;; *) exec "${IH_TEST_REAL_BIN}/tr" "$@" ;; esac'
+            ),
         },
     )
     root = full_root(tmp_path)
