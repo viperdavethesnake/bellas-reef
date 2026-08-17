@@ -568,6 +568,17 @@ ih_phase4_configure() {
         ih_fail "no gpio group on this machine; compose requires GPIO_GID and will refuse to start"
     fi
 
+    # Nothing is written past a failed check. This phase used to fall through
+    # and write deploy/.env with an empty GID before ih_main's gate exited 1 —
+    # and phase 1 reads a non-empty deploy/.env as "already a hub", so one
+    # failed run (gpio package not installed yet, say) left a file the
+    # operator was never told about and made every later run stop at phase 1
+    # for an install that never happened. A configure that fails leaves the
+    # machine exactly as it found it, so the rerun reaches this point again.
+    if [[ -z "$i2c_gid" || -z "$gpio_gid" ]]; then
+        return 1
+    fi
+
     local password
     password="$(ih_generate_password)"
     ih_pass "generated a Postgres password (32 chars, not shown)"

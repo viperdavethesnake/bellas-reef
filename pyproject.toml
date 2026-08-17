@@ -88,6 +88,10 @@ ignore_missing_imports = true
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
 testpaths = [
+    # Repo-root tests: the environment-boundary guard and the install-hub
+    # black-box suite. Not listing this directory meant both only ran when
+    # someone named them by hand — CI never collected either.
+    "tests",
     "contracts/python/tests",
     "db/tests",
     "services/shared/tests",

@@ -131,8 +131,16 @@ def test_phase1_stops_when_deploy_env_exists(tmp_path: Path) -> None:
     assert "deploy/.env" in result.stdout
 
 
+# The reference Pi's groups: i2c 988, gpio 986 (CLAUDE.md, verified host facts).
+GOOD_GETENT = (
+    'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'
+)
+
 FULL_STUBS = {
-    "docker": 'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; else echo ""; fi; exit 0',
+    "docker": (
+        'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; '
+        'else echo ""; fi; exit 0'
+    ),
     "systemctl": "exit 1",
     "uname": 'case "$1" in -m) echo aarch64 ;; -r) echo 6.18.39 ;; *) echo Linux ;; esac',
     "free": 'echo "Mem: 8000000"',
@@ -449,7 +457,7 @@ def test_accepted_remediation_clears_the_recorded_failure(tmp_path: Path) -> Non
     # an unrelated FAIL and mask what this test is actually about.
     stubs = make_stubs(
         tmp_path,
-        {"getent": 'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'},
+        {"getent": GOOD_GETENT},
     )
     (stubs / "docker").unlink()
     write_stub(stubs, "sudo", '"$@"')
@@ -585,9 +593,7 @@ def full_root(tmp_path: Path) -> Path:
 def test_phase4_reads_gids_off_the_machine(tmp_path: Path) -> None:
     stubs = make_stubs(
         tmp_path,
-        {
-            "getent": 'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac',
-        },
+        {"getent": GOOD_GETENT},
     )
     root = full_root(tmp_path)
     result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
@@ -623,6 +629,39 @@ def test_phase4_gate_stops_the_run_when_a_group_is_missing(tmp_path: Path) -> No
     assert result.returncode != 0, "a missing gpio group must not exit 0"
     assert "gpio" in result.stdout.lower()
     assert "108" in result.stdout
+
+
+def test_phase4_failed_run_leaves_no_env_behind_and_can_be_rerun(tmp_path: Path) -> None:
+    # The poison: phase 4 used to ih_fail on a missing group and then write
+    # deploy/.env anyway, with an empty GID, before the gate exited 1. Phase 1
+    # treats a non-empty deploy/.env as "this machine already looks like a
+    # hub" and refuses to run. So one failed run — say, the gpio package not
+    # yet installed — left a file the operator was never told about, and every
+    # later run stopped at phase 1 with a message about an existing install
+    # that had never happened. A failed configure must write nothing, and the
+    # next run must reach phase 4 again exactly like the first.
+    stubs = make_stubs(
+        tmp_path, {"getent": 'case "$2" in i2c) echo "i2c:x:108:" ;; *) exit 2 ;; esac'}
+    )
+    root = full_root(tmp_path)
+    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    # The directory exists on a real machine (it is the repo's deploy/), and
+    # without it here `cp` simply fails and the poison never lands — which is
+    # how the first version of this test passed against the unfixed script.
+    envfile.parent.mkdir(parents=True, exist_ok=True)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    first = run_script("--yes", root=root, stubs=stubs)
+    assert first.returncode != 0
+    assert not envfile.exists(), "a failed configure wrote deploy/.env: " + (
+        envfile.read_text() if envfile.exists() else ""
+    )
+
+    second = run_script("--yes", root=root, stubs=stubs)
+    assert "already looks like a hub" not in second.stdout, second.stdout
+    assert "4. configuration" in second.stdout, "the rerun never reached phase 4"
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
 
 
 def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
