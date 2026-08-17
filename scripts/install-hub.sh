@@ -646,6 +646,78 @@ ih_phase4_configure() {
     return 0
 }
 
+# ------------------------------------------------------------------ phase 5
+
+# compose.yaml is a tracked repo file — read-only, and required for the script
+# to work at all — so it is read bare, the same rule as deploy/.env.example.
+# The env file is the one phase 4 wrote, which lives under $IH_ROOT: it is a
+# real path on the machine being installed, and a bare path here would mean
+# any test reaching this phase hands docker the developer's own checkout.
+IH_COMPOSE="${REPO_DIR}/deploy/compose.yaml"
+IH_ENVFILE="${IH_ROOT}${REPO_DIR}/deploy/.env"
+
+ih_compose() {
+    docker compose -f "$IH_COMPOSE" --env-file "$IH_ENVFILE" "$@"
+}
+
+ih_phase5_deploy() {
+    ih_step "5. deploy"
+
+    if (( IH_DRY_RUN )); then
+        ih_would "docker compose pull"
+        ih_would "docker compose run --rm api alembic upgrade head"
+        ih_would "install and enable bellasreef.service"
+        ih_would "docker compose up -d"
+        return 0
+    fi
+
+    local pull_output
+    if ! pull_output="$(ih_compose pull 2>&1)"; then
+        # Registry auth is temporary scaffolding: the images are private today
+        # and this whole branch is deleted when they go public. The script does
+        # not manage credentials, so it names the one command that fixes it.
+        if grep -qiE 'denied|unauthorized|401' <<<"$pull_output"; then
+            ih_fail "the registry refused the pull; these images are private"
+            printf '      Fix with:\n        docker login ghcr.io -u <github-username>\n'
+            printf '      using a token with the read:packages scope, then re-run.\n'
+        else
+            ih_fail "docker compose pull failed"
+            printf '%s\n' "$pull_output" | sed 's/^/      /'
+        fi
+        return 1
+    fi
+    ih_pass "images pulled"
+
+    if ! ih_compose run --rm api sh -c 'cd /app/db && alembic upgrade head' >/dev/null 2>&1; then
+        ih_fail "migrations failed; not starting services against an unmigrated schema"
+        return 1
+    fi
+    ih_pass "migrations applied"
+
+    # deploy/systemd/*.service, matching how deploy-pi.sh installs it. The glob
+    # is today one file; the app units it once sat beside are deleted.
+    ih_run "installing the boot unit" \
+        sudo install -m 0644 "${REPO_DIR}"/deploy/systemd/*.service \
+                             "${IH_ROOT}/etc/systemd/system/" || return 1
+    ih_run "reloading systemd" sudo systemctl daemon-reload || return 1
+    ih_run "enabling bellasreef.service" sudo systemctl enable bellasreef.service || return 1
+
+    # compose.yaml requires Pi-5 device nodes and a gpio group. On a machine
+    # lacking either, compose fails with an error that does not name the cause.
+    local up_output
+    if ! up_output="$(ih_compose up -d 2>&1)"; then
+        ih_fail "the stack did not start"
+        if grep -qiE 'gpiomem|1f00098000|required variable|is not set' <<<"$up_output"; then
+            printf '      This machine is missing hardware compose.yaml requires\n'
+            printf '      (Pi 5 device nodes, or a gpio group). It cannot run the stack.\n'
+        fi
+        printf '%s\n' "$up_output" | sed 's/^/      /'
+        return 1
+    fi
+    ih_pass "stack started"
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -682,6 +754,12 @@ ih_main() {
         (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
         exit 1
     fi
+    # Phase 5 records its own failures through ih_fail/ih_action_fail, so the
+    # arrays are already non-empty by the time it returns non-zero — but it
+    # exits on its own return code rather than through another array gate:
+    # every step past the pull is a mutation, and once one of them fails there
+    # is nothing further to attempt on this machine.
+    ih_phase5_deploy || exit 1
     return 0
 }
 

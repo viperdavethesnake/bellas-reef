@@ -196,6 +196,22 @@ def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
     return markers
 
 
+def write_phase5_stubs(stubs: Path) -> None:
+    """Make phase 5's mutations inert, for tests that are not about phase 5.
+
+    A full `--yes` run does not stop after writing deploy/.env any more: it
+    goes on to pull images, migrate, install the boot unit and start the
+    stack. Without these stubs an earlier phase's test reaches the real
+    `sudo`, which fails on a password prompt for a reason that has nothing to
+    do with what the test is checking. Call this after make_stubs — it
+    replaces the phase-1 systemctl stub with one that still reports the boot
+    unit as not-enabled but accepts the two subcommands phase 5 runs.
+    """
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", "exit 0")
+    write_stub(stubs, "systemctl", 'case "$1" in daemon-reload|enable) exit 0 ;; *) exit 1 ;; esac')
+
+
 def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
@@ -477,6 +493,9 @@ chmod +x "{stubs}/docker"
 exit 0
 ''',
     )
+    # This run goes all the way through phase 5, which is not what the test
+    # is about: stub its mutations rather than letting them reach real sudo.
+    write_phase5_stubs(stubs)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
     # Phase 4 runs for real here, so it needs a deploy/ directory to write
@@ -723,6 +742,9 @@ def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
     # the suite would have stayed green. This is the file the whole stack
     # then runs on, so assert its actual contents, not that a PASS printed.
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
+    # A successful phase 4 now falls through into phase 5. This test is about
+    # the file phase 4 writes, so phase 5's mutations are stubbed inert.
+    write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
     real_envfile = REPO_ROOT / "deploy" / ".env"
@@ -827,3 +849,184 @@ def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
     (root / "proc/device-tree/model").write_text("Some Other Board\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "not a raspberry pi" in result.stdout.lower()
+
+
+# install-hub calls compose as `docker compose -f <file> --env-file <file>
+# <subcommand> ...`, so a stub that reads "$2" sees `-f` and never matches the
+# subcommand it meant to intercept — it falls through to a success exit and
+# the test passes against a script that did nothing. Skip the flags and their
+# values to find the real subcommand.
+_DOCKER_SUBCOMMAND = """
+sub=""
+if [[ "${1:-}" == "compose" ]]; then
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--env-file) shift 2 ;;
+            -*) shift ;;
+            *) sub="$1"; break ;;
+        esac
+    done
+fi
+"""
+
+
+def docker_stub(**subcommands: str) -> str:
+    """A docker stub that answers what phases 1 and 2 ask (`docker ps`,
+    `docker compose version`) and runs the given body for each named compose
+    subcommand. Without the compose-version answer, phase 2 fails and the run
+    never reaches phase 5 at all."""
+    body = [_DOCKER_SUBCOMMAND, 'case "$sub" in']
+    body.append('    version) echo "Docker Compose version v2.29.0"; exit 0 ;;')
+    for name, action in subcommands.items():
+        body.append(f"    {name}) {action} ;;")
+    body.append("esac")
+    body.append("exit 0")
+    return "\n".join(body)
+
+
+def phase5_root(tmp_path: Path) -> Path:
+    """A fixture root that reaches phase 5: every phase-1/2/3 gate clear, and
+    deploy/ staged so phase 4 can write the .env phase 5 then reads."""
+    root = full_root(tmp_path)
+    staged_env_path(root)
+    return root
+
+
+def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
+    # The images are private today, so a pull with no credentials is the most
+    # likely way a first install stops. A bare "pull failed" leaves the
+    # operator nowhere; the script has to name the one command that fixes it.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull='echo "denied: requested access to the resource is denied" >&2; exit 1'
+            ),
+        },
+    )
+    # Never legitimately reached: the pull fails first. Stubbed anyway so a
+    # regression that runs on past the failure cannot invoke the real sudo.
+    write_stub(stubs, "sudo", "exit 1")
+    root = phase5_root(tmp_path)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    combined = result.stdout + result.stderr
+    assert "5. deploy" in result.stdout, "the run never reached phase 5:\n" + combined
+    assert "docker login ghcr.io" in combined
+    assert result.returncode != 0
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase5_dry_run_pulls_nothing(tmp_path: Path) -> None:
+    # --dry-run mutates nothing, and phase 5 is the phase with the most to
+    # mutate: it pulls images, migrates a database and installs a boot unit.
+    pulled = tmp_path / "pulled"
+    migrated = tmp_path / "migrated"
+    started = tmp_path / "started"
+    unit_installed = tmp_path / "unit-installed"
+    unit_enabled = tmp_path / "unit-enabled"
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull=f'touch "{pulled}"; exit 0',
+                run=f'touch "{migrated}"; exit 0',
+                up=f'touch "{started}"; exit 0',
+            ),
+            "systemctl": (
+                f'case "$1" in daemon-reload|enable) touch "{unit_enabled}"; exit 0 ;; '
+                "*) exit 1 ;; esac"
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", f'touch "{unit_installed}"; exit 0')
+    root = phase5_root(tmp_path)
+
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
+    assert "5. deploy" in result.stdout, result.stdout + result.stderr
+    assert "would" in result.stdout.lower()
+    for name, marker in (
+        ("compose pull", pulled),
+        ("the migrations", migrated),
+        ("compose up", started),
+        ("the boot unit install", unit_installed),
+        ("systemctl", unit_enabled),
+    ):
+        assert not marker.exists(), f"--dry-run ran {name}"
+
+
+def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
+    # The order is the safety property: migrations run before anything starts
+    # (no service meets a schema it was not built for), and the boot unit is
+    # installed before `up`, so a machine that loses power mid-install comes
+    # back to a supervised stack rather than an unsupervised one. Every
+    # failure-path test above passes just as well against a phase 5 that
+    # stops after the pull, so the success path needs its own test.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull=f'echo pull >> "{log}"; exit 0',
+                run=f'echo migrate >> "{log}"; exit 0',
+                up=f'echo up >> "{log}"; exit 0',
+            ),
+            "systemctl": (
+                f'case "$1" in daemon-reload|enable) echo "systemctl $1" >> "{log}"; exit 0 ;; '
+                "*) exit 1 ;; esac"
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", f'echo install-unit >> "{log}"; exit 0')
+    root = phase5_root(tmp_path)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "5. deploy" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().split() == [
+        "pull",
+        "migrate",
+        "install-unit",
+        "systemctl",
+        "daemon-reload",
+        "systemctl",
+        "enable",
+        "up",
+    ], log.read_text()
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase5_does_not_start_the_stack_on_a_failed_migration(tmp_path: Path) -> None:
+    # A service that meets a schema it was not built for is worse than one
+    # that never started: it runs, answers, and is wrong. The `up` must not
+    # happen, and the run must not report success.
+    started = tmp_path / "started"
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "docker": docker_stub(
+                pull="exit 0",
+                run='echo "alembic: target database is not up to date" >&2; exit 1',
+                up=f'touch "{started}"; exit 0',
+            ),
+        },
+    )
+    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "5. deploy" in result.stdout
+    assert result.returncode != 0
+    assert "migration" in result.stdout.lower()
+    assert not started.exists(), "the stack was started against an unmigrated schema"
