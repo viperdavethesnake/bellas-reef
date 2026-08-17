@@ -84,6 +84,10 @@ HIDDEN_FROM_PATH = frozenset(
         # a runner's own systemd-analyze answering here would make that path
         # untestable and the tool's presence a property of the machine.
         "systemd-analyze",
+        # Phase 2's avahi remedy names this machine's own interfaces, read
+        # from `ip -br link`. A runner's real `ip` would make the suggested
+        # allow-interfaces line a property of the machine running the suite.
+        "ip",
         # Phase 6's two probes. journalctl is the avahi evidence and curl is
         # the API probe: on a Linux runner the machine's own journalctl
         # answers for a service the fixture never installed, and either
@@ -307,6 +311,21 @@ GOOD_GIT = "\n".join(
     ]
 )
 
+# What `ip -br link` prints. Columns are name, operstate, address, flags; a
+# veth carries an @ifN suffix on the name, which is why the script strips it.
+IP_BR_LINK = "\n".join(
+    [
+        "cat <<'EOF'",
+        "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>",
+        "end0             UP             aa:bb:cc:dd:ee:01 <BROADCAST,MULTICAST,UP,LOWER_UP>",
+        "wlan0            DOWN           aa:bb:cc:dd:ee:02 <BROADCAST,MULTICAST>",
+        "docker0          DOWN           02:42:aa:bb:cc:dd <NO-CARRIER,BROADCAST,MULTICAST,UP>",
+        "veth9f21c3a@if7  UP             06:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>",
+        "br-1a2b3c4d5e6f  DOWN           02:42:11:22:33:44 <NO-CARRIER,BROADCAST,MULTICAST,UP>",
+        "EOF",
+    ]
+)
+
 FULL_STUBS = {
     "docker": (
         'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; '
@@ -319,6 +338,10 @@ FULL_STUBS = {
     "timedatectl": "echo yes",
     "getent": "exit 2",
     "git": GOOD_GIT,
+    # `ip -br link` on a board with a predictably-named wired NIC. end0 is the
+    # M64's; wlan0 is down but is still a LAN interface; docker0 is the bridge
+    # the allowlist exists to keep avahi off; lo is never a LAN interface.
+    "ip": IP_BR_LINK,
 }
 
 
@@ -560,7 +583,43 @@ def test_phase2_flags_avahi_advertising_docker_bridges(tmp_path: Path) -> None:
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces" in result.stdout
     assert "/etc/avahi/avahi-daemon.conf" in result.stdout, result.stdout
+    # The line names this machine's interfaces — see the test below.
+    assert "allow-interfaces=end0,wlan0" in result.stdout, result.stdout
+
+
+def test_phase2_avahi_remedy_names_this_machines_interfaces(tmp_path: Path) -> None:
+    # eth0,wlan0 is Raspberry Pi OS's naming and nobody else's. The M64's
+    # wired NIC is end0, and pasting the literal line there produced a valid
+    # config allowlisting two interfaces that do not exist — avahi then
+    # advertised on nothing, which is worse than the misconfiguration it was
+    # meant to fix, because the file now looks correct.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "allow-interfaces=end0,wlan0" in result.stdout, result.stdout
+    # Everything the allowlist exists to exclude stays out of the suggestion:
+    # Docker's bridge, its per-network bridges, its veth pairs, and loopback.
+    suggested = next(line for line in result.stdout.splitlines() if "allow-interfaces=" in line)
+    for excluded in ("lo", "docker0", "veth", "br-"):
+        assert excluded not in suggested.split("=", 1)[1], suggested
+
+
+def test_phase2_avahi_remedy_falls_back_when_interfaces_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    # No `ip`, or an `ip` that answers with nothing. A guessed interface list
+    # presented as this machine's would be worse than the generic one, so the
+    # fallback says plainly that it could not look.
+    stubs = make_stubs(tmp_path)
+    (stubs / "ip").unlink()
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces=eth0,wlan0" in result.stdout, result.stdout
+    assert "could not read your interfaces" in result.stdout, result.stdout
 
 
 def test_phase2_offers_only_the_record_when_avahi_is_installed(tmp_path: Path) -> None:

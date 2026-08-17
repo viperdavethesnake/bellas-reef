@@ -304,6 +304,37 @@ ih_check_clock() {
 ih_avahi_daemon_present() { [[ -f "${IH_ROOT}/etc/avahi/avahi-daemon.conf" ]]; }
 ih_avahi_record_present() { [[ -f "${IH_ROOT}/etc/avahi/services/bellasreef.service" ]]; }
 
+# This machine's LAN interfaces, comma-joined, for the allow-interfaces line
+# the check below prints.
+#
+# eth0,wlan0 is Raspberry Pi OS's naming and nobody else's. Debian and Armbian
+# use predictable names — end0, enX0, enp1s0, wlp3s0 — and the M64's wired NIC
+# is end0. Pasting the literal eth0,wlan0 there on 2026-08-17 produced a
+# perfectly valid config file allowlisting two interfaces that do not exist,
+# and avahi advertised on nothing. That is worse than the misconfiguration it
+# was meant to fix, because the file now looks right.
+#
+# Excluded: lo, and everything Docker creates — docker0, the per-network br-*
+# bridges, and veth pairs. Keeping avahi off those is the entire reason the
+# allowlist exists. Interface state is not consulted: a wlan0 that is down
+# today is still the interface somebody wants the hub reachable on tomorrow.
+#
+# Returns non-zero when there is nothing to say. A guessed list presented as
+# this machine's would be worse than the generic one.
+ih_lan_interfaces() {
+    command -v ip >/dev/null 2>&1 || return 1
+    local names
+    # $1 carries an @ifN suffix on a veth peer, so it is stripped before the
+    # name is matched or printed.
+    names="$(ip -br link 2>/dev/null \
+        | awk '{ sub(/@.*/, "", $1); print $1 }' \
+        | grep -vE '^(lo|docker[0-9]*|br-.*|veth.*)$' \
+        | tr '\n' ',' \
+        | sed 's/,$//')"
+    [[ -n "$names" ]] || return 1
+    printf '%s' "$names"
+}
+
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
     local rc=0
@@ -321,9 +352,16 @@ ih_check_avahi() {
         # they are text for a human, not a path this script touches, which is
         # why they carry no $IH_ROOT.
         ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
+        local lan
         printf '      Add to /etc/avahi/avahi-daemon.conf, under [server]:\n'
-        printf '        allow-interfaces=eth0,wlan0\n'
-        printf '      Adjust to your LAN interfaces, then restart avahi-daemon.\n'
+        if lan="$(ih_lan_interfaces)"; then
+            printf '        allow-interfaces=%s\n' "$lan"
+            printf '      Adjust to your LAN interfaces, then restart avahi-daemon.\n'
+        else
+            printf '        allow-interfaces=eth0,wlan0\n'
+            printf '      (could not read your interfaces) Adjust to your LAN\n'
+            printf '      interfaces, then restart avahi-daemon.\n'
+        fi
         rc=1
     fi
 
