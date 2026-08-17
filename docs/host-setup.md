@@ -12,9 +12,13 @@ Values below are the measured state of the reference host as of 2026-08-09; see
 
 This file is the procedure for the **Raspberry Pi 5 specifically**, and the
 reference for what each host change is for. For a first install, run
-`scripts/install-hub.sh` on the hub instead: it performs the checks below,
-offers to install what is missing, and reports the boot-config changes it will
-not make for you. For what any machine has to provide before either is worth
+`scripts/install-hub.sh` on the hub instead: it checks the requirements, takes
+an inventory of the hardware, writes `deploy/.env`, deploys the stack and
+verifies it came up — offering to install what is missing, and reporting the
+boot-config changes it will not make for you. While the images are private, a
+`docker login ghcr.io` (§1c below) is still a manual prerequisite: the script
+names the command when the pull is refused, but it does not manage
+credentials. For what any machine has to provide before either is worth
 running, see `docs/hub-platform-requirements.md`.
 
 ---

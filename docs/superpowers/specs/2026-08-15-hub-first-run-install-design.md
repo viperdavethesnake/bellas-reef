@@ -131,14 +131,18 @@ Two values are carved out:
   comment saying so. A default password in a public repo means every hub shares
   one credential and most owners never change it.
 
-`BELLASREEF_TAG` defaults to the GA release. Tracking `latest` is possible and
-unsupported.
+**`BELLASREEF_TAG` is the checkout's own commit** — `git rev-parse HEAD` —
+until there is a first tagged release for it to default to instead. Tracking
+`latest` is possible and unsupported.
 
-Because the tag is a release, the checkout should be on the same release. The
-script compares the checkout against `BELLASREEF_TAG` and warns loudly if they
-disagree: the compose file, migrations and contracts come from the clone while
-the images come from the registry, and a mismatch surfaces as migrations from
-one commit running against images built from another.
+That is what makes the two halves of an install the same commit: the compose
+file, the migrations and the contracts come from the clone while the images
+come from the registry, and any gap between them surfaces as migrations from
+one commit running against images built from another. So the script refuses to
+write a tag it cannot stand behind — a dirty working tree, or a HEAD that is
+not an ancestor of `origin/main`, stops phase 4 rather than pinning a tag no
+image was ever built for. If `origin/main` is unknown to the clone, that is
+recorded as unverified rather than assumed either way.
 
 `deploy/.env` is never overwritten if it exists.
 
