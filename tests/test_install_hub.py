@@ -777,6 +777,49 @@ def test_check_only_never_remediates_even_with_yes(tmp_path: Path) -> None:
         assert not marker.exists(), f"--check-only --yes ran {name}"
 
 
+def test_check_only_reports_the_inventory_even_when_phase2_fails(tmp_path: Path) -> None:
+    # The Banana Pi M64, exactly: no docker, no avahi. The hardware inventory
+    # is the reason anyone runs --check-only on a candidate board, and the
+    # post-phase-2 gate used to exit before phase 3 ever ran — so the one
+    # question the flag exists to answer went unanswered on precisely the
+    # machines it was being asked about. Nothing is mutated either way, so
+    # there is nothing to protect by stopping early.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "docker is not installed" in result.stdout, result.stdout
+    assert "3. hardware inventory" in result.stdout, result.stdout
+    # Reported is not the same as passed: the failures still set the exit code.
+    assert "requirement(s) failed" in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
+def test_check_only_on_a_clean_machine_still_exits_zero(tmp_path: Path) -> None:
+    # The other half of the same change: running phase 3 unconditionally must
+    # not cost --check-only its green path.
+    stubs = make_stubs(tmp_path)
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "3. hardware inventory" in result.stdout, result.stdout
+    assert "checks complete (--check-only); nothing was changed" in result.stdout, result.stdout
+    assert "requirement(s) failed" not in result.stdout, result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_failed_phase2_still_stops_before_phase3_without_check_only(tmp_path: Path) -> None:
+    # Unchanged behaviour for a real install: phases 4 to 6 are pointless on a
+    # machine that failed a hard requirement, so the gate stops the run where
+    # it always did. Only --check-only, which mutates nothing, carries on.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    write_mutation_guard_stubs(stubs, tmp_path)
+    result = run_script(root=tmp_path / "root", stubs=stubs, env={"IH_ASSUME_NO_TTY": "1"})
+    assert "docker is not installed" in result.stdout, result.stdout
+    assert "3. hardware inventory" not in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
 def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
     # ih_check_clock returns 2 (UNVERIFIED) when timedatectl itself can't be
     # read, which is not evidence the clock is wrong. Remediation must only

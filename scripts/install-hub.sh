@@ -1106,6 +1106,15 @@ ih_phase6_verify() {
     (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))
 }
 
+# The three counts a gate reports, printed the same way wherever a gate fires.
+ih_gate_summary() {
+    printf '\n'
+    (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
+    (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+    (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -1119,15 +1128,36 @@ ih_main() {
     # adding to any of the three arrays.
     local phase2_rc=0
     ih_phase2_requirements || phase2_rc=$?
+    local phase2_bad=0
     if (( phase2_rc != 0 || ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
-        printf '\n'
-        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
-        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
-        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+        phase2_bad=1
+    fi
+
+    # The gate stops a real install here, and deliberately does not stop a
+    # --check-only one.
+    #
+    # For an install the reasoning is unchanged: phases 4 to 6 configure,
+    # pull, migrate and start, and none of that is worth attempting on a
+    # machine that just failed a hard requirement.
+    #
+    # --check-only mutates nothing, and phase 3 — the hardware inventory — is
+    # the reason anybody runs it. Exiting here meant a candidate board that
+    # fails phase 2 never printed the one thing the flag exists to produce,
+    # which is exactly the machine somebody is inspecting. The M64 (no docker,
+    # no avahi) hit that: every run stopped one phase short of its answer.
+    # The failures are still counted, below, and still set the exit code.
+    if (( phase2_bad && ! IH_CHECK_ONLY )); then
+        ih_gate_summary
         exit 1
     fi
     ih_phase3_hardware
     if (( IH_CHECK_ONLY )); then
+        # Reported is not passed. The inventory printed either way; the
+        # phase-2 result is what decides whether this run was green.
+        if (( phase2_bad )); then
+            ih_gate_summary
+            exit 1
+        fi
         printf '\n'
         ih_pass "checks complete (--check-only); nothing was changed"
         exit 0
@@ -1142,10 +1172,7 @@ ih_main() {
     # exists) would proceed to pull images and run migrations on a machine
     # this phase already proved cannot come up.
     if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
-        printf '\n'
-        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
-        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
-        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+        ih_gate_summary
         exit 1
     fi
     # Phase 5 records its own failures through ih_fail/ih_action_fail, so the
