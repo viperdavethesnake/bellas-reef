@@ -19,7 +19,7 @@
 #         ./scripts/check.sh --quick    # skip the slow ones
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 QUICK=0
 [[ "${1:-}" == "--quick" ]] && QUICK=1
@@ -41,6 +41,14 @@ run() {
 
 run "ruff check"          uv run ruff check .
 run "ruff format --check" uv run ruff format --check .
+
+# Shell is gated like Python is. install-hub.sh runs on a stranger's hardware
+# as the first thing this project ever does for them, and an unquoted variable
+# there is not a style opinion.
+#
+# Not skipped when shellcheck is absent: a check that silently did not run is
+# the same failure conftest.py exists to prevent, one directory over.
+run "shellcheck" shellcheck scripts/*.sh
 run "mypy --strict"       uv run mypy contracts/python db services
 run "pytest"              uv run pytest
 
@@ -62,6 +70,13 @@ run "pytest"              uv run pytest
 #
 # Never behind --quick. Drift is silent by nature; a check you can skip on the
 # way out the door is the check that was not running when it mattered.
+# Invoked indirectly as `run "..." spec_drift` below; shellcheck's
+# reachability analysis for SC2329 does not trace a function name passed as a
+# bare argument, and (confirmed in isolation) loses track of it entirely once
+# the script's trailing top-level `exit` is added. Older shellcheck (0.9,
+# what ubuntu-latest ships) reports the same thing per line as SC2317
+# instead of per function as SC2329, so both codes are named.
+# shellcheck disable=SC2329,SC2317
 spec_drift() {
     local tmp rc=0 file
     tmp="$(mktemp -d)" || return 1
@@ -104,6 +119,9 @@ run "openapi spec drift" spec_drift
 # record, so the hub advertises the truth. This check keeps the committed file
 # honest as well, because docs/host-setup.md tells an operator to `cp` it by
 # hand and that path has no renderer in it.
+# Invoked indirectly as `run "..." avahi_contracts` below; see the note on
+# spec_drift above.
+# shellcheck disable=SC2329,SC2317
 avahi_contracts() {
     local record declared expected
     record="deploy/avahi/bellasreef.service"
@@ -127,6 +145,9 @@ run "avahi contracts version" avahi_contracts
 # Renders migrations to SQL with no database. Catches a broken revision without
 # needing Postgres; the schema-vs-migration drift check is a separate,
 # Postgres-backed test.
+# Invoked indirectly as `run "..." alembic_offline` below (guarded by
+# --quick); see the note on spec_drift above.
+# shellcheck disable=SC2329,SC2317
 alembic_offline() {
     ( cd db && BELLASREEF_DATABASE_URL="postgresql+asyncpg://offline/offline" \
         uv run alembic upgrade head --sql )
