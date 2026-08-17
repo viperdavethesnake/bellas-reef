@@ -60,7 +60,7 @@ declines to fix stops the run.
 | Architecture is arm64 or amd64 | none, report and stop |
 | Kernel 6.x or newer | none, report and stop |
 | RAM at or above floor | none, report and warn |
-| Free disk at or above the 4 GB hard floor | none, report and stop |
+| Free disk at or above the 2 GB hard floor | none, report and stop |
 | Free disk at or above the 16 GB practical minimum | none, report and warn |
 | Clock synchronised, `chrony` + `fake-hwclock` installed and enabled | install and enable |
 | `avahi-daemon` installed, running, and interface-allowlisted | install and configure |
@@ -298,8 +298,11 @@ of it.
    wrong in both directions: it refused machines that can complete an install,
    and it said nothing about the machines that complete one and fill up later.
 
-   Ruled two-tier. **4 GB is the hard floor** — a shade over 2 GB has to land
-   before a hub exists at all, so below it the run stops. **16 GB stays the
+   Ruled two-tier. **2 GB is the hard floor** — what the stack needs beyond its
+   images to start at all; a 4 GB floor, tried first, refused the M64's re-run
+   for the images it had just pulled (4.9 GB → 3.5 GB free), because free space
+   is not remaining need. Below 2 GB the run stops; a pull that runs out of
+   room fails in phase 5 with compose's own message. **16 GB stays the
    practical minimum** (docs/hub-platform-requirements.md) and between the two
    the run warns and continues: retention, a growing Postgres, and the second
    image generation an upgrade pulls before dropping the first will not fit.
@@ -310,7 +313,14 @@ of it.
    could never clear a hard 16 GB stop, so no run of the installer on that board
    ever got as far as the hardware inventory it was being used to collect.
 
-   The RAM floor is still not measured under load.
+   RAM, measured on the Banana Pi M64 (1.9 GiB, Armbian, 2026-08-17) with
+   five of six services up (api, control-engine, nats, postgres,
+   victoria-metrics — hardware-io cannot start on that board): container RSS
+   api 68, control-engine 51, postgres 72, nats 18, victoria-metrics 22 MiB,
+   about 230 MiB together; the host sat at 457 MB used, 1.5 GB available.
+   The 2 GB floor stands, and it has room in it. Not measured: hardware-io
+   itself (tens of MB on the Pi 5), and any of it under a full sensor load.
 3. **Whether the two-run reboot flow needs anything beyond a printed
-   instruction.** Idempotency means re-running works, but nobody has watched a
-   new owner do it.
+   instruction.** Watched once, on the M64, 2026-08-17: the docker-group stop
+   fired, a fresh login picked the group up, and the re-run continued. What
+   nobody has watched yet is a new owner doing it without the transcript.

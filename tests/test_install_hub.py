@@ -567,7 +567,7 @@ def test_phase2_fails_when_compose_v2_is_missing(tmp_path: Path) -> None:
 
 
 # The disk check is two-tier, and the two tiers mean different things. Below
-# the hard floor the images physically cannot land, so the run stops. Between
+# the hard floor the stack cannot even start, so the run stops. Between
 # the floor and the practical minimum the install works and the machine is
 # known-degraded, which is a WARN — not an UNVERIFIED, because the check ran
 # and gave an answer. FULL_STUBS' df reports 100000000 kB (95 GB), the
@@ -577,7 +577,7 @@ def test_phase2_fails_when_compose_v2_is_missing(tmp_path: Path) -> None:
 def test_phase2_warns_between_the_disk_floor_and_the_practical_minimum(
     tmp_path: Path,
 ) -> None:
-    # 5000000 kB is 4.7 GB: above the 4 GB hard floor, below the 16 GB
+    # 5000000 kB is 5 GB: above the 2 GB hard floor, below the 16 GB
     # practical minimum. The images fit, a second generation of them plus
     # retention does not — so the operator is told, and the run continues.
     stubs = make_stubs(tmp_path, {"df": 'echo "5000000"'})
@@ -592,10 +592,11 @@ def test_phase2_warns_between_the_disk_floor_and_the_practical_minimum(
 
 
 def test_phase2_fails_below_the_disk_hard_floor(tmp_path: Path) -> None:
-    # 3000000 kB is 2.9 GB. One generation of images is ~1.7 GB and Docker
-    # Engine itself is ~0.4 GB, so this machine cannot complete an install at
-    # all — that is a hard stop, and the gate must fire before phase 3.
-    stubs = make_stubs(tmp_path, {"df": 'echo "3000000"'})
+    # 1500000 kB is 1.5 GB. Below the 2 GB hard floor the stack cannot even
+    # start (Docker's own state, the data volumes, logs) — that is a hard
+    # stop, and the gate must fire before phase 3. Measured on the M64: 3.5 GB
+    # free after the images landed must NOT trip this (it did at 4 GB).
+    stubs = make_stubs(tmp_path, {"df": 'echo "1500000"'})
     root = full_root(tmp_path)
     result = run_script(root=root, stubs=stubs)
     assert "FAIL" in result.stdout, result.stdout
@@ -918,6 +919,29 @@ def test_a_failed_phase2_still_stops_before_phase3_without_check_only(tmp_path: 
     assert "docker is not installed" in result.stdout, result.stdout
     assert "3. hardware inventory" not in result.stdout, result.stdout
     assert result.returncode != 0
+
+
+def test_a_running_but_unsynced_time_daemon_is_a_wait_not_an_install(tmp_path: Path) -> None:
+    # Measured on the Banana Pi M64 within a minute of boot: chrony installed,
+    # active, not yet synchronised. The remedy is to wait, not to reinstall
+    # chrony — which is what --yes would have done on the old single message.
+    stubs = make_stubs(tmp_path, {"timedatectl": "echo no"})
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    # After the guard: it rewrites systemctl to a marker stub, and this test
+    # needs `is-active chrony` to answer "active" (everything else still 1).
+    write_stub(
+        stubs,
+        "systemctl",
+        f'if [[ "$1" == "is-active" && "$2" == "chrony" ]]; then echo active; exit 0; fi\n'
+        f'case "$1" in enable|reload) touch "{markers["systemctl"]}"; exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = full_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0
+    assert "give it a minute" in result.stdout, result.stdout
+    assert "chrony and fake-hwclock?" not in result.stdout, "offered to reinstall a running daemon"
+    for name in ("apt-get", "sh", "curl"):
+        assert not markers[name].exists(), f"{name} ran"
 
 
 def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
