@@ -313,7 +313,14 @@ of it.
    could never clear a hard 16 GB stop, so no run of the installer on that board
    ever got as far as the hardware inventory it was being used to collect.
 
-   The RAM floor is still not measured under load.
+   RAM, measured on the Banana Pi M64 (1.9 GiB, Armbian, 2026-08-17) with
+   five of six services up (api, control-engine, nats, postgres,
+   victoria-metrics — hardware-io cannot start on that board): container RSS
+   api 68, control-engine 51, postgres 72, nats 18, victoria-metrics 22 MiB,
+   about 230 MiB together; the host sat at 457 MB used, 1.5 GB available.
+   The 2 GB floor stands, and it has room in it. Not measured: hardware-io
+   itself (tens of MB on the Pi 5), and any of it under a full sensor load.
 3. **Whether the two-run reboot flow needs anything beyond a printed
-   instruction.** Idempotency means re-running works, but nobody has watched a
-   new owner do it.
+   instruction.** Watched once, on the M64, 2026-08-17: the docker-group stop
+   fired, a fresh login picked the group up, and the re-run continued. What
+   nobody has watched yet is a new owner doing it without the transcript.
