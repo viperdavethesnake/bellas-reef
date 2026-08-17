@@ -14,7 +14,9 @@ from __future__ import annotations
 import fcntl
 import os
 import pty
+import re
 import select
+import stat
 import subprocess
 import termios
 import time
@@ -477,6 +479,11 @@ exit 0
     )
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    # Phase 4 runs for real here, so it needs a deploy/ directory to write
+    # into — as a real machine has. Without one it used to "succeed" anyway:
+    # an unchecked cp let the run reach the PASS line with no file on disk.
+    # The write is checked now, so the fixture has to be honest.
+    staged_env_path(root)
     result = subprocess.run(
         ["bash", str(SCRIPT), "--yes"],
         stdin=subprocess.DEVNULL,
@@ -696,6 +703,120 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     assert envfile.read_text() == sentinel, "deploy/.env was modified"
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def staged_env_path(root: Path) -> Path:
+    """The path phase 4 writes to under a fixture root, with deploy/ created.
+
+    The directory exists on a real machine — it is the repo's own deploy/ —
+    so a fixture without it makes the write fail for a reason no operator
+    would ever hit, and a test built on that passes against a broken script.
+    """
+    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile.parent.mkdir(parents=True, exist_ok=True)
+    return envfile
+
+
+def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
+    # The success path had no test at all: every other phase-4 test drives a
+    # failure, so the script could have written nonsense — or nothing — and
+    # the suite would have stayed green. This is the file the whole stack
+    # then runs on, so assert its actual contents, not that a PASS printed.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+    assert envfile.exists(), "phase 4 reported success but wrote no deploy/.env"
+
+    # The file holds the Postgres password, so the mode is part of the
+    # contract, not housekeeping.
+    mode = stat.S_IMODE(envfile.stat().st_mode)
+    assert mode == 0o600, f"deploy/.env is mode {mode:04o}, not 0600"
+
+    text = envfile.read_text()
+    # The reference Pi's groups, read off the stub rather than defaulted.
+    assert "I2C_GID=988" in text, text
+    assert "GPIO_GID=986" in text, text
+
+    match = re.search(r"^POSTGRES_PASSWORD=([A-Za-z0-9]{32})$", text, re.MULTILINE)
+    assert match, "no 32-char alphanumeric POSTGRES_PASSWORD line:\n" + text
+    password = match.group(1)
+
+    # Same password in both places, or Alembic and the services authenticate
+    # with a credential Postgres was never given.
+    expected_url = (
+        f"BELLASREEF_DATABASE_URL=postgresql+asyncpg://"
+        f"bellasreef:{password}@postgres:5432/bellasreef"
+    )
+    assert expected_url in text, text
+
+    leftovers = sorted(p.name for p in envfile.parent.iterdir() if p.name != ".env")
+    assert leftovers == [], f"phase 4 left temporary files behind: {leftovers}"
+
+
+def test_phase4_a_failed_write_leaves_no_partial_env(tmp_path: Path) -> None:
+    # The other half of the poisoned-file problem. Gating the write on the
+    # GIDs stops a *failed check* from leaving a file behind; it does nothing
+    # about the write itself dying partway — sed killed, disk full, power cut
+    # between the copy and the substitution. Phase 1 reads any non-empty
+    # deploy/.env as "already a hub", so a truncated one blocks every later
+    # run just as thoroughly as an empty-GID one did.
+    #
+    # A sed stub that prints part of a line and then fails is the
+    # deterministic stand-in: sed is reached only in phase 4, so stubbing it
+    # cannot disturb the earlier phases.
+    stubs = make_stubs(
+        tmp_path,
+        {"getent": GOOD_GETENT, "sed": 'printf "POSTGRES_PASSW"; exit 1'},
+    )
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, "a failed write must not report success"
+    assert not envfile.exists(), "a partial deploy/.env was left behind:\n" + (
+        envfile.read_text() if envfile.exists() else ""
+    )
+    strays = sorted(p.name for p in envfile.parent.iterdir())
+    assert strays == [], f"a failed write left files behind: {strays}"
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
+
+
+def test_phase4_rejects_a_password_that_is_not_32_chars(tmp_path: Path) -> None:
+    # The PASS line claims "32 chars" on the strength of nothing: no /dev/
+    # urandom, a busybox tr without -dc, a locale that makes the character
+    # class match nothing — each yields a short or empty password and the
+    # claim stands unchallenged. An empty POSTGRES_PASSWORD is not a weak
+    # credential, it is a Postgres that refuses every connection, discovered
+    # several phases later by something with no idea what caused it.
+    #
+    # Only the generator passes tr `-dc`; phases 1-3 use `-d` and the plain
+    # two-set form, so the stub can shorten the password without disturbing
+    # them.
+    stubs = make_stubs(
+        tmp_path,
+        {
+            "getent": GOOD_GETENT,
+            "tr": 'case "$1" in -dc) printf short ;; *) exec /usr/bin/tr "$@" ;; esac',
+        },
+    )
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    real_envfile = REPO_ROOT / "deploy" / ".env"
+    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0, "a 5-char password must not be accepted"
+    assert "32 chars" not in result.stdout, "claimed 32 chars for a 5-char password"
+    assert not envfile.exists(), "a bad password was still written to deploy/.env"
+    assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
 
 
 def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:

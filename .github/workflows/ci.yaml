@@ -235,5 +235,26 @@ jobs:
         working-directory: deploy
         run: |
           cp .env.example .env
+          # Four values are deliberately blank in .env.example and are filled
+          # in per machine by scripts/install-hub.sh: the Postgres password is
+          # generated so no two hubs share a credential, and the two GIDs are
+          # read off the host because the OS allocates them at package-install
+          # time. compose interpolates all four as ${VAR:?}, which errors on
+          # empty exactly as it does on unset — so this job has to supply
+          # throwaway values or it would be checking a file no hub ever runs.
+          # Substituted in place rather than appended, so the job does not
+          # rest on which duplicate definition compose's env-file parser
+          # keeps.
+          #
+          # The GIDs are the reference Pi's (CLAUDE.md, verified host facts).
+          # The password is a dummy that never leaves this runner; nothing in
+          # `config --quiet` connects to anything.
+          pw=ci-dummy-not-a-real-password
+          sed -i \
+            -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${pw}|" \
+            -e "s|^BELLASREEF_DATABASE_URL=.*|BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:${pw}@postgres:5432/bellasreef|" \
+            -e "s|^I2C_GID=.*|I2C_GID=988|" \
+            -e "s|^GPIO_GID=.*|GPIO_GID=986|" \
+            .env
           docker compose --env-file .env config --quiet
           echo "compose config valid"

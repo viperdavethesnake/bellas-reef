@@ -579,8 +579,17 @@ ih_phase4_configure() {
         return 1
     fi
 
+    # Checked, not assumed. /dev/urandom missing, a busybox tr without -dc, a
+    # locale that makes the class match nothing: each of those yields a short
+    # or empty password, and the PASS line below would still claim 32 chars.
+    # An empty POSTGRES_PASSWORD is not a weak credential, it is a database
+    # that refuses every connection later, in a phase that has no idea why.
     local password
     password="$(ih_generate_password)"
+    if [[ ! "$password" =~ ^[A-Za-z0-9]{32}$ ]]; then
+        ih_fail "password generation produced ${#password} usable character(s), not 32; /dev/urandom or tr is not behaving"
+        return 1
+    fi
     ih_pass "generated a Postgres password (32 chars, not shown)"
 
     if (( IH_DRY_RUN )); then
@@ -588,15 +597,51 @@ ih_phase4_configure() {
         return 0
     fi
 
-    cp "$example" "$envfile"
-    sed -i.bak \
+    # Built beside deploy/.env under a temporary name and moved into place
+    # only once every step has succeeded. Two reasons, both about what is
+    # left behind when this goes wrong:
+    #
+    #   - phase 1 reads a non-empty deploy/.env as "this machine is already a
+    #     hub" and stops. A half-written file — sed killed partway, the box
+    #     losing power, a full disk — would therefore block every later run
+    #     for an install that never happened. mv within one directory is
+    #     atomic, so deploy/.env either does not exist or is complete.
+    #   - the file carries the Postgres password. mktemp creates at 0600
+    #     (umask 077 covers any implementation that does not), so the secret
+    #     is never written into a world-readable file and then narrowed
+    #     afterwards.
+    #
+    # Each step is checked. `set -e` is deliberately not in force in this
+    # script, so an unchecked cp/sed/chmod would fail silently and still
+    # reach the PASS line.
+    local tmpfile
+    tmpfile="$(umask 077; mktemp "${envfile}.XXXXXX")"
+    if [[ -z "$tmpfile" || ! -f "$tmpfile" ]]; then
+        ih_fail "could not create a temporary file next to deploy/.env"
+        return 1
+    fi
+    if ! chmod 600 "$tmpfile"; then
+        rm -f "$tmpfile"
+        ih_fail "could not restrict permissions on the new deploy/.env"
+        return 1
+    fi
+
+    if ! sed \
         -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${password}|" \
         -e "s|^BELLASREEF_DATABASE_URL=.*|BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:${password}@postgres:5432/bellasreef|" \
         -e "s|^I2C_GID=.*|I2C_GID=${i2c_gid}|" \
         -e "s|^GPIO_GID=.*|GPIO_GID=${gpio_gid}|" \
-        "$envfile"
-    rm -f "${envfile}.bak"
-    chmod 600 "$envfile"
+        "$example" > "$tmpfile"; then
+        rm -f "$tmpfile"
+        ih_fail "could not generate deploy/.env from deploy/.env.example"
+        return 1
+    fi
+
+    if ! mv "$tmpfile" "$envfile"; then
+        rm -f "$tmpfile"
+        ih_fail "could not move the generated file into place at deploy/.env"
+        return 1
+    fi
     ih_pass "wrote deploy/.env"
     return 0
 }
