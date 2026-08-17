@@ -1119,3 +1119,72 @@ def test_forget_audits_and_publishes_no_assignment(
     ]
     # Bound, then unbound: no third publish for the forget.
     assert len(RecordingPublisher.published) == 2
+
+
+# --------------------------------------------------- the order things arrive in
+
+
+class TestDeliveredOrder:
+    """The API is the ordering authority; clients render what arrives.
+
+    The iOS System tab listed a PCA9685's sixteen channels as 0, 1, 10, 11 …
+    15, 2, 3 — a text sort on a text column. `channel` has to stay text (a
+    1-Wire ROM is not a number), so the sort is where the fix belongs: digits
+    numerically, everything else lexically after them.
+    """
+
+    def test_capabilities_arrive_in_natural_channel_order(self) -> None:
+        async def scenario() -> list[tuple[str, str]]:
+            engine = await fresh_engine()
+            store = Store(engine)
+            # Announced in the order the broken text sort produced, so a pass
+            # here cannot be an accident of insertion order.
+            await store.replace_capabilities(
+                "pca9685",
+                [(str(n), {"bus": 1, "address": "0x40"}) for n in sorted(range(16), key=str)],
+            )
+            await store.replace_capabilities("w1-bus", [(ROM, {})])
+            c, headers = await client_for(engine)
+            try:
+                body: list[dict[str, Any]] = (
+                    await c.get("/api/v1/capabilities", headers=headers)
+                ).json()
+            finally:
+                await c.aclose()
+                await engine.dispose()
+            return [(r["source"], r["channel"]) for r in body]
+
+        delivered = run(scenario)
+        assert delivered == [("pca9685", str(n)) for n in range(16)] + [("w1-bus", ROM)], (
+            "sixteen channels counting up, then the ROM — not 0, 1, 10, 11, …"
+        )
+
+    def test_devices_arrive_in_natural_channel_order(self) -> None:
+        """Bound in one order, named in another, delivered by channel.
+
+        The operator names devices ("Light 0", "Other Light"), so `device_id`
+        is a slug that carries no order worth showing. Channel does.
+        """
+
+        async def scenario() -> tuple[list[str], list[str]]:
+            engine = await fresh_engine()
+            for channel in ("0", "1", "10"):
+                await announce(engine, "pi-pwm", channel)
+            c, headers = await client_for(engine)
+            try:
+                await bind_light(c, headers, "zeta-light", "0")
+                await bind_light(c, headers, "alpha-light", "10")
+                await bind_light(c, headers, "mid-light", "1")
+                body: list[dict[str, Any]] = (
+                    await c.get("/api/v1/devices", headers=headers)
+                ).json()
+            finally:
+                await c.aclose()
+                await engine.dispose()
+            return [d["channel"] for d in body], [d["device_id"] for d in body]
+
+        channels, device_ids = run(scenario)
+        assert channels == ["0", "1", "10"]
+        assert device_ids == ["zeta-light", "mid-light", "alpha-light"], (
+            "the slug is not what orders the list"
+        )
