@@ -1147,9 +1147,39 @@ def docker_stub(**subcommands: str) -> str:
     return "\n".join(body)
 
 
-def inert_compose_docker(
-    setup_code: str = "7KF2-9QMD", ps_line: str = "bellasreef-api-1 running"
-) -> str:
+# The services compose.yaml defines. Phase 6 derives what it expects from
+# `docker compose config --services` rather than trusting whatever `ps`
+# happens to list — an api that never started is invisible to "is anything
+# not running", because nothing is what it lists. A stub therefore has to
+# answer both, consistently.
+COMPOSE_SERVICES = (
+    "nats",
+    "postgres",
+    "victoria-metrics",
+    "hardware-io",
+    "control-engine",
+    "api",
+)
+
+
+def compose_services_stub() -> str:
+    return "printf '%s\\n' " + " ".join(COMPOSE_SERVICES) + "; exit 0"
+
+
+def running_ps_lines(*, missing: str = "", broken: str = "") -> str:
+    """`compose ps --format '{{.Name}} {{.State}}'` for a healthy stack.
+
+    `missing` drops a service entirely (it never started); `broken` lists it
+    in a state that is not running.
+    """
+    return "\n".join(
+        f"bellasreef-{svc}-1 {'exited' if svc == broken else 'running'}"
+        for svc in COMPOSE_SERVICES
+        if svc != missing
+    )
+
+
+def inert_compose_docker(setup_code: str = "7KF2-9QMD", ps_line: str | None = None) -> str:
     """A docker stub whose compose subcommands all succeed and say nothing
     interesting — for tests that have to get through phases 5 and 6 to reach
     (or to have already reached) what they are actually about."""
@@ -1157,7 +1187,8 @@ def inert_compose_docker(
         pull="exit 0",
         run="exit 0",
         up="exit 0",
-        ps=f'echo "{ps_line}"; exit 0',
+        config=compose_services_stub(),
+        ps=f'echo "{running_ps_lines() if ps_line is None else ps_line}"; exit 0',
         **{"exec": f'echo "{setup_code}"; exit 0'},
     )
 
@@ -1294,8 +1325,13 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
             "docker": docker_stub(
                 pull=f'echo pull >> "{log}"; exit 0',
                 run=f'echo migrate >> "{log}"; exit 0',
-                up=f'echo up >> "{log}"; exit 0',
-                ps='echo "bellasreef-api-1 running"; exit 0',
+                # `$*` here is the whole `up ...` invocation: --wait is the
+                # difference between "the containers were created" and "the
+                # stack is up", and it is what the boot unit and deploy-pi.sh
+                # both use.
+                up=f'echo "$*" >> "{log}"; exit 0',
+                config=compose_services_stub(),
+                ps=f'echo "{running_ps_lines()}"; exit 0',
                 **{"exec": 'echo "7KF2-9QMD"; exit 0'},
             ),
             "systemctl": systemctl_stub(boot_unit_marker(tmp_path), log),
@@ -1320,6 +1356,8 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
         "systemctl",
         "enable",
         "up",
+        "-d",
+        "--wait",
     ], log.read_text()
     assert not real_envfile.exists(), "the real repository's deploy/.env must never be touched"
 
@@ -1374,7 +1412,7 @@ def phase6_stubs(
     setup_mode: str = "true",
     avahi_ok: bool = True,
     setup_code: str = "7KF2-9QMD",
-    ps_line: str = "bellasreef-api-1 running",
+    ps_line: str | None = None,
 ) -> tuple[Path, dict[str, Path]]:
     """A stub set that clears phases 1-5 and hands phase 6 a healthy hub.
 
@@ -1391,7 +1429,8 @@ def phase6_stubs(
                 pull="exit 0",
                 run="exit 0",
                 up="exit 0",
-                ps=f'echo "{ps_line}"; exit 0',
+                config=compose_services_stub(),
+                ps=f'echo "{running_ps_lines() if ps_line is None else ps_line}"; exit 0',
                 **{"exec": f'echo "$*" >> "{exec_log}"; echo "{setup_code}"; exit 0'},
             ),
         },
@@ -1612,7 +1651,7 @@ def test_phase6_is_unverified_when_avahi_cannot_be_confirmed(tmp_path: Path) -> 
 
 
 def test_phase6_fails_when_a_container_is_not_running(tmp_path: Path) -> None:
-    stubs, _ = phase6_stubs(tmp_path, ps_line="bellasreef-hardware-io-1 exited")
+    stubs, _ = phase6_stubs(tmp_path, ps_line=running_ps_lines(broken="hardware-io"))
     root = phase5_root(tmp_path)
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
@@ -1620,6 +1659,23 @@ def test_phase6_fails_when_a_container_is_not_running(tmp_path: Path) -> None:
     assert "6. verify" in result.stdout, combined
     assert result.returncode != 0, combined
     assert "bellasreef-hardware-io-1" in result.stdout, "the failing service was not named"
+
+
+def test_phase6_fails_when_an_expected_service_never_started(tmp_path: Path) -> None:
+    # "Is anything in the list not running" cannot see a service that is not
+    # in the list. A stack whose api container was never created lists five
+    # healthy containers and reads as entirely healthy — while the hub has no
+    # front door at all. The expected set comes from compose itself, so a
+    # service added to compose.yaml is checked here without anyone
+    # remembering to update a hardcoded list.
+    stubs, _ = phase6_stubs(tmp_path, ps_line=running_ps_lines(missing="control-engine"))
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    combined = result.stdout + result.stderr
+    assert "6. verify" in result.stdout, combined
+    assert result.returncode != 0, combined
+    assert "control-engine" in result.stdout, "the missing service was not named"
 
 
 def test_phase6_fails_when_compose_reports_no_containers_at_all(tmp_path: Path) -> None:

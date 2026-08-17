@@ -768,8 +768,12 @@ ih_phase5_deploy() {
 
     # compose.yaml requires Pi-5 device nodes and a gpio group. On a machine
     # lacking either, compose fails with an error that does not name the cause.
+    # --wait, matching the boot unit and deploy-pi.sh: without it `up -d`
+    # returns when the containers have been created, which says nothing about
+    # whether any of them stayed up. Phase 6 would then be racing the stack it
+    # is meant to be verifying.
     local up_output
-    if ! up_output="$(ih_compose up -d 2>&1)"; then
+    if ! up_output="$(ih_compose up -d --wait 2>&1)"; then
         ih_fail "the stack did not start"
         if grep -qiE 'gpiomem|1f00098000|required variable|is not set' <<<"$up_output"; then
             printf '      This machine is missing hardware compose.yaml requires\n'
@@ -833,6 +837,32 @@ ih_phase6_verify() {
             printf '%s\n' "$unhealthy" | sed 's/^/      /'
         else
             ih_pass "all services running"
+        fi
+
+        # And every service compose defines has to be in that listing at all.
+        # "Anything that is not running" cannot see a container that was never
+        # created: a stack missing its api lists five healthy containers and
+        # reads as healthy, while the hub has no front door. The expected set
+        # is asked of compose rather than hardcoded, so a service added to
+        # compose.yaml is checked here without anyone remembering to.
+        local expected svc line state
+        expected="$(ih_compose config --services 2>/dev/null)"
+        if [[ -z "$expected" ]]; then
+            ih_unverified "could not read the service list from compose.yaml"
+        else
+            while read -r svc; do
+                [[ -z "$svc" ]] && continue
+                # Compose names containers <project>-<service>-<index>, so the
+                # service name is a token in the middle rather than the whole
+                # field.
+                line="$(grep -E "(^|-)${svc}-[0-9]+[[:space:]]" <<<"$ps_output" | head -1)"
+                if [[ -z "$line" ]]; then
+                    ih_fail "service ${svc} has no container; it never started"
+                    continue
+                fi
+                state="${line##* }"
+                [[ "$state" != "running" ]] && ih_fail "service ${svc} is ${state}, not running"
+            done <<<"$expected"
         fi
     fi
 
