@@ -9,6 +9,13 @@ dependencies = [
     "bellasreef-service",
     "nats-py>=2.9",
     "prometheus-client>=0.21",
+    # The PCA9685's only bus access. A real dependency, not an optional extra:
+    # capabilities.py probes for the chip at every startup, and without smbus2
+    # installed that probe raises ImportError, is swallowed as "cannot look",
+    # and the chip is silently never announced. Pure Python — it opens
+    # /dev/i2c-* and does ioctls, so it installs anywhere and only *works*
+    # where the bus exists.
+    "smbus2>=0.5",
     "sqlalchemy>=2.0.36",
 ]
 

@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Final
 from uuid import uuid4
@@ -27,6 +28,7 @@ from bellasreef_contracts import (
     ActuatorLevel,
     ActuatorRegistration,
     ActuatorState,
+    CapabilityAnnouncement,
     DeviceAssignment,
     Heartbeat,
     SensorReading,
@@ -40,7 +42,7 @@ from bellasreef_service.watchdog import LivenessGuard
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from pydantic import ValidationError
 
-from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
+from bellasreef_hardware_io.capabilities import discover_pca9685, discover_pwm, discover_w1
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.factory import build_from_assignments
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
@@ -263,10 +265,27 @@ class HardwareIO:
         """
         if self.spine is None:
             return
-        for announcement in (discover_pwm(), discover_w1()):
-            if announcement is None:
+        sources: tuple[tuple[str, Callable[[], CapabilityAnnouncement | None]], ...] = (
+            ("pi-pwm", discover_pwm),
+            ("w1-bus", discover_w1),
+            ("pca9685", lambda: discover_pca9685(self._open_i2c)),
+        )
+        for name, discover in sources:
+            # Each source is isolated. This runs before the metrics server and
+            # the liveness guard are up, so anything escaping one discovery
+            # takes the process down at startup and crash-loops under
+            # `restart: unless-stopped` — a hub that cannot see its I²C bus
+            # would stop reporting its temperature probe. Same ruling as the
+            # per-actuator catch in `_build_devices` below: one source failing
+            # is a source failing, not a service failing.
+            try:
+                announcement = discover()
+                if announcement is None:
+                    continue
+                await self.spine.publish_capabilities(announcement)
+            except Exception:
+                log.exception("capability discovery failed", extra={"hardware_source": name})
                 continue
-            await self.spine.publish_capabilities(announcement)
             log.info(
                 "capability announced",
                 extra={
@@ -277,11 +296,14 @@ class HardwareIO:
 
     @staticmethod
     def _open_i2c(bus: int) -> Any:
-        """Open a real I²C bus. Imported lazily so a Pi-only build still runs.
+        """Open a real I²C bus. Imported lazily, at the call site.
 
-        A hub with no PCA9685 declared never reaches this, and on a dev machine
-        `smbus2` may not be installed at all — which must not stop the tests or
-        a PWM-only hub from starting.
+        `smbus2` is a declared dependency of this service (2026-08-17): capability
+        discovery probes for the PCA9685 at every startup, so an absent import
+        would mean the chip is silently never announced — which is exactly how
+        this shipped as a no-op the first time. The import stays lazy so a
+        machine with no I²C bus still imports the module; the *bus* not existing
+        is what discovery handles, not the library not existing.
         """
         from smbus2 import SMBus
 

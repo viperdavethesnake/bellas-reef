@@ -12,10 +12,18 @@ tank. Discovery filters to pin-backed channels so the registry's meaning is
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal, cast
+from uuid import uuid4
 
+import pytest
+from bellasreef_contracts import CapabilityAnnouncement
+from bellasreef_hardware_io import app
 from bellasreef_hardware_io.capabilities import (
     PINCTRL,
+    discover_pca9685,
     discover_pwm,
     find_pwm_chip,
 )
@@ -167,3 +175,231 @@ class TestFindPwmChip:
 
     def test_a_missing_class_directory_finds_nothing(self, tmp_path: Path) -> None:
         assert find_pwm_chip(tmp_path / "absent") is None
+
+
+class FakeI2CBus:
+    """Records every transaction, so "one read, zero writes" is assertable.
+
+    Discovery's whole contract on the I²C bus is a presence check. A fake that
+    only returned a value would let a driver-shaped discovery — one that woke
+    the chip, or read six registers to be sure — pass silently.
+    """
+
+    def __init__(self, mode1: int | None = 0x11, *, close_fails: bool = False) -> None:
+        self._mode1 = mode1
+        self._close_fails = close_fails
+        self.reads: list[tuple[int, int]] = []
+        self.writes: list[tuple[int, int, object]] = []
+        self.closed = False
+
+    def read_byte_data(self, address: int, register: int) -> int:
+        self.reads.append((address, register))
+        if self._mode1 is None:
+            raise OSError(121, "Remote I/O error")
+        return self._mode1
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        self.writes.append((address, register, value))
+
+    def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
+        self.writes.append((address, register, data))
+
+    def close(self) -> None:
+        self.closed = True
+        if self._close_fails:
+            raise OSError(5, "Input/output error")
+
+
+def _dev(tmp_path: Path) -> Path:
+    node = tmp_path / "i2c-1"
+    node.write_bytes(b"")
+    return node
+
+
+class TestDiscoverPca9685:
+    """Announce the chip when it answers; announce empty when the bus is there
+    and nothing does; stay silent when the bus itself is absent.
+
+    Same three-way split as discover_pwm, for the same reason: known-empty is
+    how the registry prunes a chip that was unplugged, and unknown must leave
+    the last good answer standing.
+    """
+
+    def test_a_chip_that_answers_announces_sixteen_channels(self, tmp_path: Path) -> None:
+        bus = FakeI2CBus()
+        announcement = discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert announcement.hardware_source == "pca9685"
+        assert [c.channel for c in announcement.channels] == [str(n) for n in range(16)]
+        assert announcement.channels[0].detail == {
+            "bus": 1,
+            "address": "0x40",
+            "mode1": "0x11",
+        }
+
+    def test_the_presence_check_is_one_read_and_no_writes(self, tmp_path: Path) -> None:
+        """Discovery is read-only — 'an I²C transaction beyond a presence
+        check' is what this module forbids itself. A chip left asleep at
+        power-on must still be asleep afterwards."""
+        bus = FakeI2CBus()
+        discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert bus.reads == [(0x40, 0x00)]
+        assert bus.writes == []
+
+    def test_nothing_answering_announces_empty_not_silence(self, tmp_path: Path) -> None:
+        bus = FakeI2CBus(mode1=None)
+        announcement = discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert announcement.hardware_source == "pca9685"
+        assert announcement.channels == []
+
+    def test_a_missing_bus_node_announces_nothing_and_opens_nothing(self, tmp_path: Path) -> None:
+        opened: list[int] = []
+
+        def opener(bus: int) -> FakeI2CBus:
+            opened.append(bus)
+            return FakeI2CBus()
+
+        assert discover_pca9685(opener, dev=tmp_path / "absent") is None
+        assert opened == []
+
+    def test_an_opener_that_cannot_import_smbus2_announces_nothing(self, tmp_path: Path) -> None:
+        """A dev machine without smbus2 is not a hub whose chip vanished."""
+
+        def opener(bus: int) -> FakeI2CBus:
+            raise ImportError("No module named 'smbus2'")
+
+        assert discover_pca9685(opener, dev=_dev(tmp_path)) is None
+
+    def test_an_unopenable_bus_announces_nothing(self, tmp_path: Path) -> None:
+        def opener(bus: int) -> FakeI2CBus:
+            raise OSError(13, "Permission denied")
+
+        assert discover_pca9685(opener, dev=_dev(tmp_path)) is None
+
+    def test_the_bus_is_closed_afterwards(self, tmp_path: Path) -> None:
+        """Discovery runs at startup and must not leak the fd it opened."""
+        bus = FakeI2CBus()
+        discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert bus.closed is True
+
+    def test_the_bus_is_closed_even_when_nothing_answers(self, tmp_path: Path) -> None:
+        bus = FakeI2CBus(mode1=None)
+        discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert bus.closed is True
+
+    def test_a_failing_close_does_not_lose_the_answer(self, tmp_path: Path) -> None:
+        """The probe has already succeeded by the time the bus is closed.
+        Discovery runs at startup, before the liveness guard, so an exception
+        on the way out is a crash-loop — not a fault the service survives."""
+        bus = FakeI2CBus(close_fails=True)
+        announcement = discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert len(announcement.channels) == 16
+
+    def test_bus_and_address_are_overridable(self, tmp_path: Path) -> None:
+        bus = FakeI2CBus()
+        announcement = discover_pca9685(lambda _: bus, bus=3, address=0x41, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert announcement.channels[0].detail == {
+            "bus": 3,
+            "address": "0x41",
+            "mode1": "0x11",
+        }
+        assert bus.reads == [(0x41, 0x00)]
+
+
+class _RecordingSpine:
+    def __init__(self) -> None:
+        self.published: list[CapabilityAnnouncement] = []
+
+    async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
+        self.published.append(announcement)
+
+
+def _announcement(source: Literal["pi-pwm", "pca9685", "w1-bus"]) -> CapabilityAnnouncement:
+    return CapabilityAnnouncement(
+        message_id=uuid4(),
+        emitted_at=datetime.now(UTC),
+        source="hardware-io",
+        hardware_source=source,
+        channels=[],
+    )
+
+
+class TestAnnounceCapabilities:
+    """Every discovery the module offers has to reach the wire.
+
+    The PCA9685 was implemented end to end — driver, factory, API literal, iOS
+    adopt sheet — and stayed invisible for want of three words in this loop.
+    A test that counts the publishes is what makes the next source's omission
+    fail rather than merely not appear.
+    """
+
+    def test_all_three_sources_are_announced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(app, "discover_pwm", lambda: _announcement("pi-pwm"))
+        monkeypatch.setattr(app, "discover_w1", lambda: _announcement("w1-bus"))
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: _announcement("pca9685"))
+
+        hardware = app.HardwareIO()
+        spine = _RecordingSpine()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["pi-pwm", "w1-bus", "pca9685"]
+
+    def test_one_source_raising_does_not_silence_the_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This loop runs before httpd.start() and liveness.start(). An
+        exception escaping a discover_* would kill the process at startup and
+        crash-loop it under `restart: unless-stopped` — so a hub whose I²C bus
+        misbehaves would stop reporting its temperature probe too."""
+
+        def explode() -> CapabilityAnnouncement | None:
+            raise RuntimeError("the bus did something nobody planned for")
+
+        monkeypatch.setattr(app, "discover_pwm", lambda: _announcement("pi-pwm"))
+        monkeypatch.setattr(app, "discover_w1", explode)
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: _announcement("pca9685"))
+
+        hardware = app.HardwareIO()
+        spine = _RecordingSpine()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["pi-pwm", "pca9685"]
+
+    def test_a_publish_that_raises_does_not_silence_the_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same guard, the other half: the spine is inside the try too."""
+
+        class _FailsOnce(_RecordingSpine):
+            async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
+                if announcement.hardware_source == "pi-pwm":
+                    raise RuntimeError("publish failed")
+                await super().publish_capabilities(announcement)
+
+        monkeypatch.setattr(app, "discover_pwm", lambda: _announcement("pi-pwm"))
+        monkeypatch.setattr(app, "discover_w1", lambda: _announcement("w1-bus"))
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: _announcement("pca9685"))
+
+        hardware = app.HardwareIO()
+        spine = _FailsOnce()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["w1-bus", "pca9685"]
+
+    def test_a_source_that_knows_nothing_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(app, "discover_pwm", lambda: None)
+        monkeypatch.setattr(app, "discover_w1", lambda: _announcement("w1-bus"))
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: None)
+
+        hardware = app.HardwareIO()
+        spine = _RecordingSpine()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["w1-bus"]
