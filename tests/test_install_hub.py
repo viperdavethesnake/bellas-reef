@@ -44,8 +44,9 @@ SCRIPT = REPO_ROOT / "scripts" / "install-hub.sh"
 #
 # It is a hidden set rather than an allowlist because the script and the
 # tests' own helpers reach for far more of the system than they stub —
-# bash, sed, grep, tr, awk, head, tail, cut, mktemp, mv, chmod, rm, id and
-# the rest have to keep working. sed and tr are stubbed by individual tests
+# bash, sed, grep, tr, awk, head, tail, cut, mktemp, mv, chmod, rm and
+# the rest have to keep working (`id` is hidden and stubbed like the others).
+# sed and tr are stubbed by individual tests
 # but deliberately NOT hidden: the stubs directory comes first on PATH, so an
 # override already wins, and hiding them would break every test that does not
 # stub them.
@@ -1230,6 +1231,9 @@ def test_phase4_gate_stops_the_run_when_a_group_is_missing(tmp_path: Path) -> No
     assert result.returncode != 0, "a missing gpio group must not exit 0"
     assert "gpio" in result.stdout.lower()
     assert "108" in result.stdout
+    # Measured on the Banana Pi M64: Armbian ships no gpio group, and the
+    # FAIL alone left the operator nowhere to go.
+    assert "sudo groupadd gpio" in result.stdout
 
 
 def test_phase4_failed_run_leaves_no_env_behind_and_can_be_rerun(tmp_path: Path) -> None:

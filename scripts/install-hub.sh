@@ -284,7 +284,7 @@ ih_check_disk() {
         return 2
     fi
     if (( kb >= IH_RECOMMENDED_DISK_KB )); then
-        ih_pass "free disk $(( kb / 1024 / 1024 )) GB"
+        ih_pass "free disk $(( kb / 1000 / 1000 )) GB"
         return 0
     fi
     if (( kb >= IH_MIN_DISK_KB )); then
@@ -292,10 +292,10 @@ ih_check_disk() {
         # that this machine is knowingly degraded. UNVERIFIED means the check
         # could not run, and conflating the two would hide a measured fact
         # behind a word that means "no measurement".
-        ih_warn "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_RECOMMENDED_DISK_KB / 1000 / 1000 )) GB practical minimum (docs/hub-platform-requirements.md); fine for a bench, not for a tank — retention and a second image generation will not fit"
+        ih_warn "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_RECOMMENDED_DISK_KB / 1000 / 1000 )) GB practical minimum (docs/hub-platform-requirements.md); fine for a bench, not for a tank — retention and a second image generation will not fit"
         return 0
     fi
-    ih_fail "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the images alone are ~2 GB"
+    ih_fail "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the images alone are ~2 GB"
     return 1
 }
 
@@ -352,7 +352,7 @@ ih_lan_interfaces() {
     # name is matched or printed.
     names="$(ip -br link 2>/dev/null \
         | awk '{ sub(/@.*/, "", $1); print $1 }' \
-        | grep -vE '^(lo|docker[0-9]*|br-.*|veth.*)$' \
+        | grep -vE '^(lo|docker.*|br-.*|veth.*|virbr[0-9]*)$' \
         | tr '\n' ',' \
         | sed 's/,$//')"
     [[ -n "$names" ]] || return 1
