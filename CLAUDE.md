@@ -424,6 +424,9 @@ ground truth with no stack in the loop.
   `driver_type == "pca9685"` branch are complete, but nothing announces the
   capability, so no channel is adoptable. A `discover_pca9685()` is a
   prerequisite for the PCA9685 Stage 2, not for its Stage 1.
+  RESOLVED 2026-08-17: `discover_pca9685()` announces 16 channels when the chip
+  ACKs at 0x40 on bus 1; announced empty when the bus is present and nothing
+  answers.
 
 **Stage 1 (RP1 native PWM), CH0 and CH2 — PASSED on hardware 2026-08-15.**
 

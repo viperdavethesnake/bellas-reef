@@ -40,7 +40,7 @@ from bellasreef_service.watchdog import LivenessGuard
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from pydantic import ValidationError
 
-from bellasreef_hardware_io.capabilities import discover_pwm, discover_w1
+from bellasreef_hardware_io.capabilities import discover_pca9685, discover_pwm, discover_w1
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.factory import build_from_assignments
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
@@ -263,7 +263,7 @@ class HardwareIO:
         """
         if self.spine is None:
             return
-        for announcement in (discover_pwm(), discover_w1()):
+        for announcement in (discover_pwm(), discover_w1(), discover_pca9685(self._open_i2c)):
             if announcement is None:
                 continue
             await self.spine.publish_capabilities(announcement)

@@ -23,7 +23,7 @@ import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 from uuid import uuid4
 
 from bellasreef_contracts import CapabilityAnnouncement, CapabilityChannel
@@ -32,10 +32,13 @@ from bellasreef_service import get_logger
 log = get_logger(__name__)
 
 __all__ = [
+    "PCA9685_CHANNELS",
+    "PCA9685_MODE1",
     "PINCTRL",
     "RP1_PWM0_DEVICE",
     "RP1_PWM_COMPATIBLE",
     "W1_DEVICES",
+    "discover_pca9685",
     "discover_pwm",
     "discover_w1",
     "find_pwm_chip",
@@ -212,5 +215,92 @@ def discover_w1(root: Path = W1_DEVICES) -> CapabilityAnnouncement | None:
         emitted_at=datetime.now(UTC),
         source="hardware-io",
         hardware_source="w1-bus",
+        channels=channels,
+    )
+
+
+#: MODE1. Read once, as the presence check — never written here. Discovery
+#: that woke the chip would be a decision, and this module only reports facts.
+PCA9685_MODE1: Final = 0x00
+
+#: The chip has sixteen outputs. Fixed by the part, not probed.
+PCA9685_CHANNELS: Final = 16
+
+
+def discover_pca9685(
+    open_i2c: Callable[[int], Any],
+    *,
+    bus: int = 1,
+    address: int = 0x40,
+    dev: Path = Path("/dev/i2c-1"),
+) -> CapabilityAnnouncement | None:
+    """A PCA9685, if one answers at ``address`` on ``bus``.
+
+    The presence check is exactly one register read — MODE1 — and there is no
+    second transaction. A chip that powers up asleep (MODE1 0x11 on this
+    bench, CLAUDE.md) is still asleep when this returns; announcing what
+    exists must never change what it is doing.
+
+    The three answers this can give, and why they differ:
+
+    * **The chip ACKs** — announce its sixteen channels.
+    * **The bus is there and nothing ACKs** — announce an EMPTY list. That is
+      known-empty, and it is how the registry learns to prune a chip that was
+      unplugged, exactly as ``discover_pwm`` does for an unmuxed block.
+    * **The bus node is absent, or cannot be opened at all** (no ``/dev/i2c-1``,
+      no ``smbus2``, no permission) — say nothing (``None``). We did not learn
+      that the chip is gone, only that we could not look, and a dev machine
+      without an I²C bus must not erase a hub's registry entry.
+
+    ``0x70`` is never touched: it is this same chip's ALLCALL address, not a
+    second board (CLAUDE.md, verified 2026-08-09).
+    """
+    if not dev.exists():
+        log.info(
+            "no I²C bus node — pca9685 is not announced either way",
+            extra={"dev": str(dev)},
+        )
+        return None
+
+    try:
+        i2c = open_i2c(bus)
+    except (OSError, ImportError) as exc:
+        log.info(
+            "the I²C bus could not be opened — pca9685 is not announced either way",
+            extra={"bus": bus, "error": str(exc)},
+        )
+        return None
+
+    mode1: int | None
+    try:
+        mode1 = i2c.read_byte_data(address, PCA9685_MODE1)
+    except OSError as exc:
+        mode1 = None
+        log.warning(
+            "nothing answered at the pca9685 address — announcing an empty pca9685",
+            extra={"bus": bus, "address": f"0x{address:02x}", "error": str(exc)},
+        )
+    finally:
+        close = getattr(i2c, "close", None)
+        if callable(close):
+            close()
+
+    channels: list[CapabilityChannel] = []
+    if mode1 is not None:
+        detail: dict[str, str | int | float | bool] = {
+            "bus": str(bus),
+            "address": f"0x{address:02x}",
+            "mode1": f"0x{mode1:02x}",
+        }
+        channels = [
+            CapabilityChannel(channel=str(index), detail=dict(detail))
+            for index in range(PCA9685_CHANNELS)
+        ]
+
+    return CapabilityAnnouncement(
+        message_id=uuid4(),
+        emitted_at=datetime.now(UTC),
+        source="hardware-io",
+        hardware_source="pca9685",
         channels=channels,
     )
