@@ -410,3 +410,43 @@ def test_max_runtime_is_a_runaway_bound_not_a_photoperiod() -> None:
 
 async def _ignore(event: object) -> None:
     return None
+
+
+# --------------------------------------------------------------- lifecycle
+#
+# Found on the bench 2026-08-17, Stage 2: every voltage row matched the CLI
+# and the frequency did not — the chip was still on the PRE_SCALE Stage 1 had
+# left it with. ``initialise()`` existed, was tested, and had no production
+# caller. hardware-io opens actuators by duck-typing ``driver.open()``
+# (``app.py``), which the RP1 channel has and this one did not, so a
+# PCA9685 channel was driven on whatever the silicon happened to hold.
+
+
+def test_opening_a_channel_initialises_its_chip() -> None:
+    """``open()`` is the lifecycle hook the app calls; it must configure the chip."""
+
+    async def scenario() -> FakeBus:
+        device, bus = _device()
+        channel = Pca9685Channel(device, 0, "pca9685-0")
+        await channel.open()
+        return bus
+
+    bus = run(scenario)
+    assert bus.registers[_PRE_SCALE] == PCA9685_PRE_SCALE
+    assert not bus.registers[_MODE1] & _SLEEP
+    assert bus.discarded_prescale_writes == 0
+
+
+def test_sixteen_channels_share_one_chip_and_initialise_it_once() -> None:
+    """Sixteen ``open()`` calls on one chip must not sleep/restart it sixteen
+    times — the first channel up would be blacked out by every later one."""
+
+    async def scenario() -> FakeBus:
+        device, bus = _device()
+        for ch in range(16):
+            await Pca9685Channel(device, ch, f"pca9685-{ch}").open()
+        return bus
+
+    bus = run(scenario)
+    all_off_writes = [b for b in bus.blocks if b[0] == _ALL_LED_ON_L]
+    assert len(all_off_writes) == 1

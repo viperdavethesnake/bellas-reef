@@ -223,6 +223,20 @@ class Pca9685Device:
     def __init__(self, bus: I2CBus, address: int = 0x40) -> None:
         self._bus = bus
         self._address = address
+        self._initialised = False
+
+    async def ensure_initialised(self) -> None:
+        """:meth:`initialise` exactly once per chip, however many channels open.
+
+        Sixteen channels share one chip. Each one's ``open()`` lands here, and
+        only the first does the work: re-running the sleep/PRE_SCALE/restart
+        sequence for channel 7 would black out channels 0-6, which are already
+        up and possibly already driven.
+        """
+        if self._initialised:
+            return
+        await self.initialise()
+        self._initialised = True
 
     async def initialise(self) -> None:
         """Put the chip into the configuration this project has decided on.
@@ -336,6 +350,22 @@ class Pca9685Channel:
         supervisor's safe-state assertion included, believes this.
         """
         return PwmLevel(duty=0.0)
+
+    # ----------------------------------------------------------- lifecycle
+
+    async def open(self) -> None:
+        """Bring the channel up: make sure its chip is configured.
+
+        This is the hook hardware-io calls before registering an actuator
+        (``app.py`` duck-types ``driver.open()``, exactly as it does for the
+        RP1 channel). Without it the chip is driven on whatever registers it
+        powered up with or the last process left behind — which is how Stage 2
+        on 2026-08-17 measured every voltage correctly and the frequency at
+        Stage 1's leftover 545 Hz: ``initialise()`` was tested and never
+        called. The chip work is per-chip and idempotent; see
+        :meth:`Pca9685Device.ensure_initialised`.
+        """
+        await self._device.ensure_initialised()
 
     async def apply(self, level: ActuatorLevel) -> None:
         if not isinstance(level, PwmLevel):

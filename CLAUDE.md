@@ -522,7 +522,7 @@ expectation.
   datasheet's: `PCA9685_OSC_HZ = 26_770_000`, `PCA9685_PRE_SCALE =
   round(PCA9685_OSC_HZ / (4096 * 500)) - 1` = **12** (≈502.7 Hz actual, versus
   11's measured ≈545 Hz). Tests assert the measured values and record why 11
-  was wrong. History above is kept. PR pending; not yet deployed. A FET stage
+  was wrong. History above is kept. Merged as PR #39, deployed as 4fa2ba8. A FET stage
   inserted later gets measured, not reasoned about — the constant flips on a
   meter reading and nothing else.
 
@@ -591,6 +591,55 @@ so the stack is the only variable. For RP1 that means CH0 / pin 32 against the
 four rows above — not CH1, which would introduce a second variable. The 8 % row
 is the one that exercises `snap_duty`; commands below 8 % must measure 0 V, not
 265 mV, because the driver snaps them down before they reach the pin.
+
+**Stage 2 — PASSED on hardware 2026-08-17, both legs.** Holds set from the
+iOS app's Lighting tab (sim, paired client) → API → NATS → control-engine →
+hardware-io → pin. Meter at the same probe points as each leg's Stage 1. Every
+value below is David's meter reading, recorded as given. Engine publications
+confirmed in `docker logs bellasreef-control-engine-1` for each row.
+
+| Hold | RP1 CH0, pin 32 (`pi-pwm-0`, Light 0) | PCA9685 CH0, LED0 (`pca9685-0`, Light 1) |
+|---|---|---|
+| 0 % | **~0 V** | **0 V** |
+| 8 % | **265 mV** | **265 mV** |
+| 50 % | **1.654 V** | **1.654 V** |
+| 100 % | **3.308 V** | **3.308 V** |
+| 5 % | **0 V**, truth line reads 0 % | **0 V** |
+| Release | 0 V, engine published duty 0.0 | 0 V |
+
+Every row within 1 mV of that leg's Stage 1 CLI number. The 5 % row is
+`snap_duty` proven end-to-end on both silicons: the engine published 0.05x,
+hardware-io snapped it to 0 and reported 0 %. `INVRT_ON = False` is confirmed
+through the stack — the declared safe state is dark, commanded, not idle.
+
+Two things learned on the way, both load-bearing:
+
+1. **The PCA9685 driver never initialised the chip.** Voltages matched because
+   the counted-duty encoding is prescale-independent — but the frequency was
+   still Stage 1's leftover (PRE_SCALE `0x0b`, ≈545 Hz), and `i2cget` showed
+   MODE1/MODE2/PRE_SCALE untouched since 08-15. `Pca9685Device.initialise()`
+   was written, tested, and had **no production caller**: `app.py` brings
+   actuators up by duck-typing `driver.open()`, the RP1 channel has one, the
+   PCA channel did not. On a cold chip (MODE1 `0x11`, SLEEP set, oscillator
+   off) this would have meant every command landing on a chip generating no
+   PWM at all — dark, and silently so. Fixed the same day (`Pca9685Channel.
+   open()` → `Pca9685Device.ensure_initialised()`, once per chip). The
+   frequency row (~503 Hz at 50 %) is re-verified after that deploy and
+   recorded below when measured. Follow-up, not yet done: put `open()` in the
+   `ActuatorDriver` Protocol so a driver without a lifecycle hook fails
+   `mypy --strict` rather than passing quietly; and announce the chip's
+   read-back PRE_SCALE on the wire so the System tab can show it.
+2. **Adopting a channel restarts hardware-io** (`assignment_restart`: "exiting
+   to rebuild from registry"), and on the way down it logged `failed to
+   publish actuator state … reason=safe_state` for both pi-pwm channels — the
+   safe-state publish racing the NATS close. Not investigated yet.
+
+Bench notes: the engine slews at 1 %/s in 1 % steps, so 100 → 5 % takes ~95 s
+(the ramp-vs-snap design item, next round). David's meter was on CH1 from the
+end of Stage 1 when the PCA leg began; a CLI `i2cset` full-on to LED0 read 0 V
+until the probe was moved, then the register was written back to full-off and
+the leg re-run from the app. The stack's "Now" reads the last commanded duty
+and cannot see a CLI write — by design (`read_back()` is None).
 
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
