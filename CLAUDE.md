@@ -361,6 +361,11 @@ drain, not by reasoning about the datasheet.
 
 `25 MHz / (4096 × (11+1)) ≈ 508.6 Hz` on the internal oscillator.
 
+Superseded 2026-08-17: the oscillator on this chip measured 26.77 MHz, so
+`PRE_SCALE = 11` gave 545 Hz, not 508; the driver now computes `PRE_SCALE = 12`
+(≈503 Hz) from the measured value — see "Stage 1 (PCA9685)" item 1 below. The
+500 Hz pin itself is unchanged.
+
 The chip default `PRE_SCALE = 0x1e` (30) is ≈196.9 Hz. That is *inside* the
 window but only about 2× above its floor — low margin, and it was never a chosen
 value, just what the chip powers up with. 500 Hz sits comfortably mid-window,
@@ -509,6 +514,17 @@ opposite direction: the code assumed inversion, the bench found none. Not
 changed yet, because whether this is the final output stage is David's ruling.
 Whichever stage ships, the constant must match a measurement rather than an
 expectation.
+
+- RESOLVED (2026-08-17, David's ruling: these CLI measurements are final and
+  the driver's constants must match them). `INVRT_ON` is now `False` in
+  `services/hardware_io/bellasreef_hardware_io/drivers/pca9685.py`, and the
+  prescaler is computed from the measured oscillator rather than the
+  datasheet's: `PCA9685_OSC_HZ = 26_770_000`, `PCA9685_PRE_SCALE =
+  round(PCA9685_OSC_HZ / (4096 * 500)) - 1` = **12** (≈502.7 Hz actual, versus
+  11's measured ≈545 Hz). Tests assert the measured values and record why 11
+  was wrong. History above is kept. PR pending; not yet deployed. A FET stage
+  inserted later gets measured, not reasoned about — the constant flips on a
+  meter reading and nothing else.
 
 **2. The internal oscillator runs ~7.1 % fast, and the error is a constant
 ratio.** Two prescaler values, both measured:
