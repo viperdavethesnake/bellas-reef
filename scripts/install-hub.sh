@@ -166,14 +166,48 @@ ih_phase1_already_deployed() {
 
 IH_MIN_KERNEL_MAJOR=6
 IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
-IH_MIN_DISK_KB=16000000      # 16 GB. Measured images are ~1.6 GB before data.
+
+# Disk is two-tier, from measurements on the reference Pi (2026-08-17).
+#
+# One generation of images is 1.69 GB — api 482, control-engine 353,
+# hardware-io 348, postgres 415, nats 38, victoria-metrics 52 MB — Docker
+# Engine itself is about 0.4 GB, and the data volumes start at roughly 60 MB.
+# So a shade over 2 GB has to land before a hub exists at all, which is what
+# the hard floor protects: below it the install cannot finish, and stopping is
+# the only honest answer.
+#
+# The 16 GB figure is a different claim. It is the practical minimum from
+# docs/hub-platform-requirements.md — room for VictoriaMetrics retention, a
+# Postgres that grows, and the second generation of images an upgrade pulls
+# before it drops the first. A machine between the two installs fine and will
+# run out later, so it is a WARN and the run continues.
+#
+# Both thresholds are round decimal GB, which is how the messages below say
+# them; the free-space figure is df's kB divided the binary way, as before.
+IH_MIN_DISK_KB=4000000            # 4 GB hard floor — below this nothing fits.
+IH_RECOMMENDED_DISK_KB=16000000   # 16 GB practical minimum — below this, warn.
+
+# Docker is unusable for three different reasons and only one of them is
+# fixed by installing Docker. Asked separately here so the check's message and
+# phase 2's remediation both branch on the same three readings.
+ih_docker_present()    { command -v docker >/dev/null 2>&1; }
+ih_docker_compose_v2() { docker compose version >/dev/null 2>&1; }
+ih_docker_reachable()  { docker info >/dev/null 2>&1; }
+
+# The group database, deliberately, not this session's groups. After a usermod
+# the two disagree — the database has the user in the group and the login does
+# not — and that disagreement is precisely the state that must not be read as
+# "never added", because the answer to it is a re-login, not another usermod.
+ih_in_docker_group() {
+    id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx docker
+}
 
 ih_check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
+    if ! ih_docker_present; then
         ih_fail "docker is not installed"
         return 1
     fi
-    if ! docker compose version >/dev/null 2>&1; then
+    if ! ih_docker_compose_v2; then
         ih_fail "docker is installed but Compose v2 is not available"
         return 1
     fi
@@ -183,8 +217,17 @@ ih_check_docker() {
     # denial at the pull, three phases later, in a step with no idea what
     # caused it — and the fix is a group membership plus a re-login, which is
     # not guessable from "pull failed".
-    if ! docker info >/dev/null 2>&1; then
-        ih_fail "docker is installed but this user cannot reach the daemon; add yourself to the docker group (sudo usermod -aG docker \$USER), log out and back in"
+    if ! ih_docker_reachable; then
+        local docker_user
+        docker_user="${USER:-$(id -un)}"
+        if ih_in_docker_group "$docker_user"; then
+            # Already in the group and still refused. Nothing is left to
+            # install, so saying "add yourself to the docker group" here sends
+            # the operator to do again the thing they have already done.
+            ih_fail "docker is installed and ${docker_user} is already in the docker group, but the daemon is still unreachable; either it is not running (check: systemctl status docker) or this login predates the group being granted — log out and back in"
+        else
+            ih_fail "docker is installed but this user cannot reach the daemon; add yourself to the docker group (sudo usermod -aG docker \$USER), log out and back in"
+        fi
         return 1
     fi
     ih_pass "docker with Compose v2"
@@ -240,11 +283,19 @@ ih_check_disk() {
         ih_unverified "could not read free disk space"
         return 2
     fi
-    if (( kb >= IH_MIN_DISK_KB )); then
-        ih_pass "free disk $(( kb / 1024 / 1024 )) GB"
+    if (( kb >= IH_RECOMMENDED_DISK_KB )); then
+        ih_pass "free disk $(( kb / 1000 / 1000 )) GB"
         return 0
     fi
-    ih_fail "free disk $(( kb / 1024 / 1024 )) GB is below the $(( IH_MIN_DISK_KB / 1024 / 1024 )) GB floor"
+    if (( kb >= IH_MIN_DISK_KB )); then
+        # WARN, not UNVERIFIED. The check ran and gave an answer; the answer is
+        # that this machine is knowingly degraded. UNVERIFIED means the check
+        # could not run, and conflating the two would hide a measured fact
+        # behind a word that means "no measurement".
+        ih_warn "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_RECOMMENDED_DISK_KB / 1000 / 1000 )) GB practical minimum (docs/hub-platform-requirements.md); fine for a bench, not for a tank — retention and a second image generation will not fit"
+        return 0
+    fi
+    ih_fail "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the images alone are ~2 GB"
     return 1
 }
 
@@ -277,6 +328,37 @@ ih_check_clock() {
 ih_avahi_daemon_present() { [[ -f "${IH_ROOT}/etc/avahi/avahi-daemon.conf" ]]; }
 ih_avahi_record_present() { [[ -f "${IH_ROOT}/etc/avahi/services/bellasreef.service" ]]; }
 
+# This machine's LAN interfaces, comma-joined, for the allow-interfaces line
+# the check below prints.
+#
+# eth0,wlan0 is Raspberry Pi OS's naming and nobody else's. Debian and Armbian
+# use predictable names — end0, enX0, enp1s0, wlp3s0 — and the M64's wired NIC
+# is end0. Pasting the literal eth0,wlan0 there on 2026-08-17 produced a
+# perfectly valid config file allowlisting two interfaces that do not exist,
+# and avahi advertised on nothing. That is worse than the misconfiguration it
+# was meant to fix, because the file now looks right.
+#
+# Excluded: lo, and everything Docker creates — docker0, the per-network br-*
+# bridges, and veth pairs. Keeping avahi off those is the entire reason the
+# allowlist exists. Interface state is not consulted: a wlan0 that is down
+# today is still the interface somebody wants the hub reachable on tomorrow.
+#
+# Returns non-zero when there is nothing to say. A guessed list presented as
+# this machine's would be worse than the generic one.
+ih_lan_interfaces() {
+    command -v ip >/dev/null 2>&1 || return 1
+    local names
+    # $1 carries an @ifN suffix on a veth peer, so it is stripped before the
+    # name is matched or printed.
+    names="$(ip -br link 2>/dev/null \
+        | awk '{ sub(/@.*/, "", $1); print $1 }' \
+        | grep -vE '^(lo|docker.*|br-.*|veth.*|virbr[0-9]*)$' \
+        | tr '\n' ',' \
+        | sed 's/,$//')"
+    [[ -n "$names" ]] || return 1
+    printf '%s' "$names"
+}
+
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
     local rc=0
@@ -294,9 +376,16 @@ ih_check_avahi() {
         # they are text for a human, not a path this script touches, which is
         # why they carry no $IH_ROOT.
         ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
+        local lan
         printf '      Add to /etc/avahi/avahi-daemon.conf, under [server]:\n'
-        printf '        allow-interfaces=eth0,wlan0\n'
-        printf '      Adjust to your LAN interfaces, then restart avahi-daemon.\n'
+        if lan="$(ih_lan_interfaces)"; then
+            printf '        allow-interfaces=%s\n' "$lan"
+            printf '      Adjust to your LAN interfaces, then restart avahi-daemon.\n'
+        else
+            printf '        allow-interfaces=eth0,wlan0\n'
+            printf '      (could not read your interfaces) Adjust to your LAN\n'
+            printf '      interfaces, then restart avahi-daemon.\n'
+        fi
         rc=1
     fi
 
@@ -378,21 +467,47 @@ ih_phase2_requirements() {
     # never turns into a prompt or an action. `(( ! IH_CHECK_ONLY )) && ...`
     # short-circuits before ih_confirm/ih_offer_install run at all, so
     # --check-only --yes cannot install anything either.
+    # Three states, and each gets the one remediation that answers it.
+    #
+    # Observed on the Banana Pi M64, 2026-08-17: docker was installed with
+    # Compose v2, the user was not yet in the docker group for that login, and
+    # ih_check_docker failed at the `docker info` probe. Phase 2 offered the
+    # convenience script — so --yes spent five minutes re-running
+    # get.docker.com to install a Docker that was already there, then
+    # usermod'd a user for the second time. The check knew which of the three
+    # things was wrong; the remediation did not ask.
+    #
+    #   (a) no docker, or no Compose v2 — the install is absent or
+    #       incomplete, which is the one case the convenience script answers.
+    #   (b) installed and complete, daemon unreachable, user not in the
+    #       group — a usermod and a re-login, no download.
+    #   (c) installed, in the group, daemon still unreachable — nothing to
+    #       install. Either dockerd is down or the login predates the group,
+    #       and ih_check_docker's own message says both. No offer at all;
+    #       offering one here is how the reinstall loop starts.
     if ! ih_check_quietly ih_check_docker; then
-        if (( ! IH_CHECK_ONLY )) && ih_confirm "install Docker with the official convenience script?"; then
-            local target_user
-            target_user="${USER:-$(id -un)}"
-            ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
-            ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
-            # Stop here, and do not run the rest of phase 2 or any phase after
-            # it. The group membership does not apply to the session that
-            # granted it, so this process still cannot reach the daemon — and
-            # every remaining phase talks to it. Continuing means pulling
-            # images as a user who is not yet in the group: a guaranteed
-            # failure, several phases later, that reads as a broken install
-            # rather than as the log-out the operator actually owes.
-            ih_warn "log out and back in for the docker group to take effect, then re-run this script"
-            return 1
+        local target_user
+        target_user="${USER:-$(id -un)}"
+        # Stopping after either accepted remediation, not continuing: the
+        # group membership does not apply to the session that granted it, so
+        # this process still cannot reach the daemon — and every remaining
+        # phase talks to it. Continuing means pulling images as a user who is
+        # not yet in the group: a guaranteed failure, several phases later,
+        # that reads as a broken install rather than as the log-out the
+        # operator actually owes.
+        if ! ih_docker_present || ! ih_docker_compose_v2; then
+            if (( ! IH_CHECK_ONLY )) && ih_confirm "install Docker with the official convenience script?"; then
+                ih_run "installing Docker" sudo sh -c 'curl -fsSL https://get.docker.com | sh'
+                ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
+                ih_warn "log out and back in for the docker group to take effect, then re-run this script"
+                return 1
+            fi
+        elif ! ih_docker_reachable && ! ih_in_docker_group "$target_user"; then
+            if (( ! IH_CHECK_ONLY )) && ih_confirm "add ${target_user} to the docker group?"; then
+                ih_run "adding ${target_user} to the docker group" sudo usermod -aG docker "$target_user"
+                ih_warn "log out and back in for the docker group to take effect, then re-run this script"
+                return 1
+            fi
         fi
     fi
 
@@ -643,6 +758,11 @@ ih_phase4_configure() {
         ih_pass "gpio group GID ${gpio_gid}"
     else
         ih_fail "no gpio group on this machine; compose requires GPIO_GID and will refuse to start"
+        # A Pi gets the group from its OS packages. Other boards (the Banana Pi
+        # M64 on Armbian, measured 2026-08-17) have none, and compose only needs
+        # the GID for hardware-io's group_add, so an empty group is enough.
+        printf '      If this board has no gpio group, create one and re-run:\n'
+        printf '        sudo groupadd gpio\n'
     fi
 
     # Nothing is written past a failed check. This phase used to fall through
@@ -1079,6 +1199,15 @@ ih_phase6_verify() {
     (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))
 }
 
+# The three counts a gate reports, printed the same way wherever a gate fires.
+ih_gate_summary() {
+    printf '\n'
+    (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
+    (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
+    (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+    return 0
+}
+
 ih_main() {
     ih_parse_args "$@"
     ih_step "Bella's Reef first-run install"
@@ -1092,15 +1221,36 @@ ih_main() {
     # adding to any of the three arrays.
     local phase2_rc=0
     ih_phase2_requirements || phase2_rc=$?
+    local phase2_bad=0
     if (( phase2_rc != 0 || ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
-        printf '\n'
-        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
-        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
-        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+        phase2_bad=1
+    fi
+
+    # The gate stops a real install here, and deliberately does not stop a
+    # --check-only one.
+    #
+    # For an install the reasoning is unchanged: phases 4 to 6 configure,
+    # pull, migrate and start, and none of that is worth attempting on a
+    # machine that just failed a hard requirement.
+    #
+    # --check-only mutates nothing, and phase 3 — the hardware inventory — is
+    # the reason anybody runs it. Exiting here meant a candidate board that
+    # fails phase 2 never printed the one thing the flag exists to produce,
+    # which is exactly the machine somebody is inspecting. The M64 (no docker,
+    # no avahi) hit that: every run stopped one phase short of its answer.
+    # The failures are still counted, below, and still set the exit code.
+    if (( phase2_bad && ! IH_CHECK_ONLY )); then
+        ih_gate_summary
         exit 1
     fi
     ih_phase3_hardware
     if (( IH_CHECK_ONLY )); then
+        # Reported is not passed. The inventory printed either way; the
+        # phase-2 result is what decides whether this run was green.
+        if (( phase2_bad )); then
+            ih_gate_summary
+            exit 1
+        fi
         printf '\n'
         ih_pass "checks complete (--check-only); nothing was changed"
         exit 0
@@ -1115,10 +1265,7 @@ ih_main() {
     # exists) would proceed to pull images and run migrations on a machine
     # this phase already proved cannot come up.
     if (( ${#IH_FAILURES[@]} > 0 || ${#IH_UNVERIFIED[@]} > 0 || ${#IH_ACTION_FAILURES[@]} > 0 )); then
-        printf '\n'
-        (( ${#IH_FAILURES[@]} > 0 ))        && ih_warn "${#IH_FAILURES[@]} requirement(s) failed"
-        (( ${#IH_UNVERIFIED[@]} > 0 ))      && ih_warn "${#IH_UNVERIFIED[@]} check(s) could not be verified"
-        (( ${#IH_ACTION_FAILURES[@]} > 0 )) && ih_warn "${#IH_ACTION_FAILURES[@]} remediation action(s) failed"
+        ih_gate_summary
         exit 1
     fi
     # Phase 5 records its own failures through ih_fail/ih_action_fail, so the

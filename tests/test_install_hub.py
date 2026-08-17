@@ -44,8 +44,9 @@ SCRIPT = REPO_ROOT / "scripts" / "install-hub.sh"
 #
 # It is a hidden set rather than an allowlist because the script and the
 # tests' own helpers reach for far more of the system than they stub —
-# bash, sed, grep, tr, awk, head, tail, cut, mktemp, mv, chmod, rm, id and
-# the rest have to keep working. sed and tr are stubbed by individual tests
+# bash, sed, grep, tr, awk, head, tail, cut, mktemp, mv, chmod, rm and
+# the rest have to keep working (`id` is hidden and stubbed like the others).
+# sed and tr are stubbed by individual tests
 # but deliberately NOT hidden: the stubs directory comes first on PATH, so an
 # override already wins, and hiding them would break every test that does not
 # stub them.
@@ -84,6 +85,15 @@ HIDDEN_FROM_PATH = frozenset(
         # a runner's own systemd-analyze answering here would make that path
         # untestable and the tool's presence a property of the machine.
         "systemd-analyze",
+        # Phase 2 asks whether this user is in the docker group before it
+        # offers to do anything about an unreachable daemon. On a CI runner
+        # the real `id` says yes and on a laptop it says no, which would make
+        # the offered remediation a property of the machine running the suite.
+        "id",
+        # Phase 2's avahi remedy names this machine's own interfaces, read
+        # from `ip -br link`. A runner's real `ip` would make the suggested
+        # allow-interfaces line a property of the machine running the suite.
+        "ip",
         # Phase 6's two probes. journalctl is the avahi evidence and curl is
         # the API probe: on a Linux runner the machine's own journalctl
         # answers for a service the fixture never installed, and either
@@ -307,6 +317,54 @@ GOOD_GIT = "\n".join(
     ]
 )
 
+# What `ip -br link` prints. Columns are name, operstate, address, flags; a
+# veth carries an @ifN suffix on the name, which is why the script strips it.
+IP_BR_LINK = "\n".join(
+    [
+        "cat <<'EOF'",
+        "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>",
+        "end0             UP             aa:bb:cc:dd:ee:01 <BROADCAST,MULTICAST,UP,LOWER_UP>",
+        "wlan0            DOWN           aa:bb:cc:dd:ee:02 <BROADCAST,MULTICAST>",
+        "docker0          DOWN           02:42:aa:bb:cc:dd <NO-CARRIER,BROADCAST,MULTICAST,UP>",
+        "veth9f21c3a@if7  UP             06:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>",
+        "br-1a2b3c4d5e6f  DOWN           02:42:11:22:33:44 <NO-CARRIER,BROADCAST,MULTICAST,UP>",
+        "EOF",
+    ]
+)
+
+
+def id_stub(*groups: str) -> str:
+    """An `id` stub answering `-un` (the login name) and `-nG` (its groups).
+
+    The script asks `id -nG <user>` — the group database, not this session's
+    groups — because after a usermod the two disagree, and that disagreement
+    is exactly the state the remediation has to tell apart from "never added".
+    """
+    return "\n".join(
+        [
+            'case "$1" in',
+            '    -un) echo "${USER:-tester}" ;;',
+            f'    -nG) echo "{" ".join(groups)}" ;;',
+            "    *) exit 1 ;;",
+            "esac",
+        ]
+    )
+
+
+ID_NOT_IN_DOCKER_GROUP = id_stub("users", "sudo")
+ID_IN_DOCKER_GROUP = id_stub("users", "sudo", "docker")
+
+# A docker that is installed with Compose v2 but whose daemon this user cannot
+# reach. `docker ps` (phase 1) still answers, so phase 1 is unaffected.
+DOCKER_UNREACHABLE = "\n".join(
+    [
+        'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; exit 0; fi',
+        'if [[ "$1" == "info" ]]; then exit 1; fi',
+        'echo ""',
+        "exit 0",
+    ]
+)
+
 FULL_STUBS = {
     "docker": (
         'if [[ "$1" == "compose" ]]; then echo "Docker Compose version v2.29.0"; '
@@ -319,6 +377,12 @@ FULL_STUBS = {
     "timedatectl": "echo yes",
     "getent": "exit 2",
     "git": GOOD_GIT,
+    # `ip -br link` on a board with a predictably-named wired NIC. end0 is the
+    # M64's; wlan0 is down but is still a LAN interface; docker0 is the bridge
+    # the allowlist exists to keep avahi off; lo is never a LAN interface.
+    "ip": IP_BR_LINK,
+    # Not in the docker group — the ordinary case before an install.
+    "id": ID_NOT_IN_DOCKER_GROUP,
 }
 
 
@@ -502,6 +566,44 @@ def test_phase2_fails_when_compose_v2_is_missing(tmp_path: Path) -> None:
     assert "compose" in result.stdout.lower()
 
 
+# The disk check is two-tier, and the two tiers mean different things. Below
+# the hard floor the images physically cannot land, so the run stops. Between
+# the floor and the practical minimum the install works and the machine is
+# known-degraded, which is a WARN — not an UNVERIFIED, because the check ran
+# and gave an answer. FULL_STUBS' df reports 100000000 kB (95 GB), the
+# comfortable case, so both tiers need their own stub.
+
+
+def test_phase2_warns_between_the_disk_floor_and_the_practical_minimum(
+    tmp_path: Path,
+) -> None:
+    # 5000000 kB is 4.7 GB: above the 4 GB hard floor, below the 16 GB
+    # practical minimum. The images fit, a second generation of them plus
+    # retention does not — so the operator is told, and the run continues.
+    stubs = make_stubs(tmp_path, {"df": 'echo "5000000"'})
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "WARN" in result.stdout, result.stdout
+    assert "practical minimum" in result.stdout, result.stdout
+    assert "not for a tank" in result.stdout, result.stdout
+    assert "UNVERIFIED" not in result.stdout, "a checked, degraded disk is not an unverified one"
+    assert "3. hardware inventory" in result.stdout, "the warn tier stopped the run"
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_phase2_fails_below_the_disk_hard_floor(tmp_path: Path) -> None:
+    # 3000000 kB is 2.9 GB. One generation of images is ~1.7 GB and Docker
+    # Engine itself is ~0.4 GB, so this machine cannot complete an install at
+    # all — that is a hard stop, and the gate must fire before phase 3.
+    stubs = make_stubs(tmp_path, {"df": 'echo "3000000"'})
+    root = full_root(tmp_path)
+    result = run_script(root=root, stubs=stubs)
+    assert "FAIL" in result.stdout, result.stdout
+    assert "hard floor" in result.stdout, result.stdout
+    assert result.returncode != 0
+    assert "3. hardware inventory" not in result.stdout, "the gate did not stop the run"
+
+
 def test_phase2_unverified_when_clock_state_is_unknown(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path, {"timedatectl": "exit 1"})
     result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
@@ -522,7 +624,43 @@ def test_phase2_flags_avahi_advertising_docker_bridges(tmp_path: Path) -> None:
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces" in result.stdout
     assert "/etc/avahi/avahi-daemon.conf" in result.stdout, result.stdout
+    # The line names this machine's interfaces — see the test below.
+    assert "allow-interfaces=end0,wlan0" in result.stdout, result.stdout
+
+
+def test_phase2_avahi_remedy_names_this_machines_interfaces(tmp_path: Path) -> None:
+    # eth0,wlan0 is Raspberry Pi OS's naming and nobody else's. The M64's
+    # wired NIC is end0, and pasting the literal line there produced a valid
+    # config allowlisting two interfaces that do not exist — avahi then
+    # advertised on nothing, which is worse than the misconfiguration it was
+    # meant to fix, because the file now looks correct.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "allow-interfaces=end0,wlan0" in result.stdout, result.stdout
+    # Everything the allowlist exists to exclude stays out of the suggestion:
+    # Docker's bridge, its per-network bridges, its veth pairs, and loopback.
+    suggested = next(line for line in result.stdout.splitlines() if "allow-interfaces=" in line)
+    for excluded in ("lo", "docker0", "veth", "br-"):
+        assert excluded not in suggested.split("=", 1)[1], suggested
+
+
+def test_phase2_avahi_remedy_falls_back_when_interfaces_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    # No `ip`, or an `ip` that answers with nothing. A guessed interface list
+    # presented as this machine's would be worse than the generic one, so the
+    # fallback says plainly that it could not look.
+    stubs = make_stubs(tmp_path)
+    (stubs / "ip").unlink()
+    root = tmp_path / "root"
+    (root / "etc/avahi").mkdir(parents=True)
+    (root / "etc/avahi/avahi-daemon.conf").write_text("# no allow-interfaces here\n")
+    result = run_script("--check-only", root=root, stubs=stubs)
     assert "allow-interfaces=eth0,wlan0" in result.stdout, result.stdout
+    assert "could not read your interfaces" in result.stdout, result.stdout
 
 
 def test_phase2_offers_only_the_record_when_avahi_is_installed(tmp_path: Path) -> None:
@@ -739,6 +877,49 @@ def test_check_only_never_remediates_even_with_yes(tmp_path: Path) -> None:
         assert not marker.exists(), f"--check-only --yes ran {name}"
 
 
+def test_check_only_reports_the_inventory_even_when_phase2_fails(tmp_path: Path) -> None:
+    # The Banana Pi M64, exactly: no docker, no avahi. The hardware inventory
+    # is the reason anyone runs --check-only on a candidate board, and the
+    # post-phase-2 gate used to exit before phase 3 ever ran — so the one
+    # question the flag exists to answer went unanswered on precisely the
+    # machines it was being asked about. Nothing is mutated either way, so
+    # there is nothing to protect by stopping early.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    result = run_script("--check-only", root=tmp_path / "root", stubs=stubs)
+    assert "docker is not installed" in result.stdout, result.stdout
+    assert "3. hardware inventory" in result.stdout, result.stdout
+    # Reported is not the same as passed: the failures still set the exit code.
+    assert "requirement(s) failed" in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
+def test_check_only_on_a_clean_machine_still_exits_zero(tmp_path: Path) -> None:
+    # The other half of the same change: running phase 3 unconditionally must
+    # not cost --check-only its green path.
+    stubs = make_stubs(tmp_path)
+    root = full_root(tmp_path)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "3. hardware inventory" in result.stdout, result.stdout
+    assert "checks complete (--check-only); nothing was changed" in result.stdout, result.stdout
+    assert "requirement(s) failed" not in result.stdout, result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_failed_phase2_still_stops_before_phase3_without_check_only(tmp_path: Path) -> None:
+    # Unchanged behaviour for a real install: phases 4 to 6 are pointless on a
+    # machine that failed a hard requirement, so the gate stops the run where
+    # it always did. Only --check-only, which mutates nothing, carries on.
+    stubs = make_stubs(tmp_path)
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    write_mutation_guard_stubs(stubs, tmp_path)
+    result = run_script(root=tmp_path / "root", stubs=stubs, env={"IH_ASSUME_NO_TTY": "1"})
+    assert "docker is not installed" in result.stdout, result.stdout
+    assert "3. hardware inventory" not in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
 def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
     # ih_check_clock returns 2 (UNVERIFIED) when timedatectl itself can't be
     # read, which is not evidence the clock is wrong. Remediation must only
@@ -846,6 +1027,76 @@ def test_phase2_fails_when_the_daemon_is_unreachable(tmp_path: Path) -> None:
     assert result.returncode != 0, result.stdout + result.stderr
     assert "cannot reach the daemon" in result.stdout, result.stdout
     assert "usermod -aG docker" in result.stdout
+
+
+def test_an_unreachable_daemon_offers_the_group_not_a_reinstall(tmp_path: Path) -> None:
+    # The M64, 2026-08-17: docker installed, Compose v2 present, the user not
+    # yet in the docker group. ih_check_docker fails at the `docker info`
+    # probe, and phase 2 offered to install Docker — so --yes re-ran
+    # get.docker.com for five minutes to install a Docker that was already
+    # there, then usermod'd a user for the second time. The failing probe
+    # names the group; the remediation has to act on the same reading.
+    stubs = make_stubs(
+        tmp_path,
+        {"docker": DOCKER_UNREACHABLE, "id": ID_NOT_IN_DOCKER_GROUP},
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "docker group" in result.stdout, result.stdout
+    assert "convenience script" not in result.stdout, "reinstalled an installed Docker"
+    assert markers["usermod"].exists(), "the group add never ran"
+    assert not markers["curl"].exists(), "re-ran the Docker convenience installer"
+    assert not markers["sh"].exists(), "re-ran the Docker convenience installer"
+    # The group does not apply to the session that granted it, so this run
+    # stops the same way the fresh-install path does.
+    assert "log out and back in" in result.stdout, result.stdout
+    assert result.returncode != 0
+
+
+def test_an_unreachable_daemon_offers_nothing_when_already_in_the_group(
+    tmp_path: Path,
+) -> None:
+    # Third state. The user is in the docker group and still cannot reach the
+    # daemon, so there is nothing left to install: either dockerd is not
+    # running or this login predates the group being granted. Offering an
+    # install here is how the reinstall loop starts.
+    stubs = make_stubs(
+        tmp_path,
+        {"docker": DOCKER_UNREACHABLE, "id": ID_IN_DOCKER_GROUP},
+    )
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "convenience script" not in result.stdout, result.stdout
+    assert "add" not in result.stdout.lower().split("docker group")[0][-60:], result.stdout
+    assert "systemctl status docker" in result.stdout, result.stdout
+    for name in ("curl", "sh", "usermod"):
+        assert not markers[name].exists(), f"already in the group and still ran {name}"
+    assert result.returncode != 0
+
+
+def test_a_missing_docker_still_offers_the_convenience_script(tmp_path: Path) -> None:
+    # The state that has not changed: no docker at all is still the one case
+    # the convenience installer answers.
+    stubs = make_stubs(tmp_path, {"id": ID_NOT_IN_DOCKER_GROUP})
+    (stubs / "docker").unlink()
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "convenience script" in result.stdout, result.stdout
+    assert markers["sh"].exists(), "the convenience installer never ran"
+    assert markers["usermod"].exists(), "the group add never ran"
+    assert result.returncode != 0
 
 
 def test_action_failure_is_not_erased_by_the_verification_pass(tmp_path: Path) -> None:
@@ -980,6 +1231,9 @@ def test_phase4_gate_stops_the_run_when_a_group_is_missing(tmp_path: Path) -> No
     assert result.returncode != 0, "a missing gpio group must not exit 0"
     assert "gpio" in result.stdout.lower()
     assert "108" in result.stdout
+    # Measured on the Banana Pi M64: Armbian ships no gpio group, and the
+    # FAIL alone left the operator nowhere to go.
+    assert "sudo groupadd gpio" in result.stdout
 
 
 def test_phase4_failed_run_leaves_no_env_behind_and_can_be_rerun(tmp_path: Path) -> None:

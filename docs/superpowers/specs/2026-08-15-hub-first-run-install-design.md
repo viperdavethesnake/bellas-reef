@@ -56,17 +56,33 @@ declines to fix stops the run.
 
 | Check | Fix offered |
 |---|---|
-| Docker present, Compose v2 available | install |
+| Docker present, Compose v2 available, daemon reachable | install, or add to the docker group — see below |
 | Architecture is arm64 or amd64 | none, report and stop |
 | Kernel 6.x or newer | none, report and stop |
 | RAM at or above floor | none, report and warn |
-| Free disk at or above floor | none, report and stop |
+| Free disk at or above the 4 GB hard floor | none, report and stop |
+| Free disk at or above the 16 GB practical minimum | none, report and warn |
 | Clock synchronised, `chrony` + `fake-hwclock` installed and enabled | install and enable |
 | `avahi-daemon` installed, running, and interface-allowlisted | install and configure |
 | the `_bellasreef._tcp` service record installed | install |
 
 Each install is offered individually and the user accepts or declines. Nothing
 is installed silently.
+
+Docker is unusable for three different reasons and only one of them is fixed by
+installing Docker. Absent, or present without Compose v2, is the incomplete
+install the convenience script answers. Present and complete but with the daemon
+refusing this user, who is not in the `docker` group, is a `usermod` and a
+re-login — no download. Present, in the group, and still refused is neither:
+either `dockerd` is not running or the login predates the group being granted,
+and there is nothing to offer. The M64 sat in the second state on 2026-08-17 and
+was offered the first one's remedy, so `--yes` re-ran `get.docker.com` for five
+minutes against a Docker that was already installed.
+
+Group membership is read from the group database (`id -nG <user>`) rather than
+from the current session. After a `usermod` the two disagree, and that
+disagreement is exactly the third state — reading the session's groups would
+call it the second and offer the `usermod` again.
 
 The avahi work is two separate things and both are required.
 
@@ -273,10 +289,28 @@ of it.
 
 1. **The images must go public before anyone outside this project can install.**
    Not a blocker for development, and recorded as a launch item.
-2. **RAM and disk floors need real numbers.** The requirements document proposes
-   2 GB and 16 GB. Measured image sizes are 482, 353 and 348 MB for our three
-   plus the spine, so the disk floor is defensible; the RAM floor is not yet
-   measured under load.
+2. **RAM and disk floors need real numbers.** Disk is settled; RAM is not.
+
+   Measured on the reference Pi 2026-08-17: one generation of images is 1.69 GB
+   (api 482, control-engine 353, hardware-io 348, postgres 415, nats 38,
+   victoria-metrics 52 MB), Docker Engine itself is about 0.4 GB, and the data
+   volumes start at roughly 60 MB. A single hard 16 GB stop was therefore
+   wrong in both directions: it refused machines that can complete an install,
+   and it said nothing about the machines that complete one and fill up later.
+
+   Ruled two-tier. **4 GB is the hard floor** — a shade over 2 GB has to land
+   before a hub exists at all, so below it the run stops. **16 GB stays the
+   practical minimum** (docs/hub-platform-requirements.md) and between the two
+   the run warns and continues: retention, a growing Postgres, and the second
+   image generation an upgrade pulls before dropping the first will not fit.
+   The warn is a WARN and not an UNVERIFIED — the check ran and the machine is
+   knowingly degraded, which is not the same as a measurement nobody took.
+
+   This is what made the Banana Pi M64 evaluation reachable at all: 4.9 GB free
+   could never clear a hard 16 GB stop, so no run of the installer on that board
+   ever got as far as the hardware inventory it was being used to collect.
+
+   The RAM floor is still not measured under load.
 3. **Whether the two-run reboot flow needs anything beyond a printed
    instruction.** Idempotency means re-running works, but nobody has watched a
    new owner do it.
