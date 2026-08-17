@@ -921,6 +921,29 @@ def test_a_failed_phase2_still_stops_before_phase3_without_check_only(tmp_path: 
     assert result.returncode != 0
 
 
+def test_a_running_but_unsynced_time_daemon_is_a_wait_not_an_install(tmp_path: Path) -> None:
+    # Measured on the Banana Pi M64 within a minute of boot: chrony installed,
+    # active, not yet synchronised. The remedy is to wait, not to reinstall
+    # chrony — which is what --yes would have done on the old single message.
+    stubs = make_stubs(tmp_path, {"timedatectl": "echo no"})
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    # After the guard: it rewrites systemctl to a marker stub, and this test
+    # needs `is-active chrony` to answer "active" (everything else still 1).
+    write_stub(
+        stubs,
+        "systemctl",
+        f'if [[ "$1" == "is-active" && "$2" == "chrony" ]]; then echo active; exit 0; fi\n'
+        f'case "$1" in enable|reload) touch "{markers["systemctl"]}"; exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = full_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert result.returncode != 0
+    assert "give it a minute" in result.stdout, result.stdout
+    assert "chrony and fake-hwclock?" not in result.stdout, "offered to reinstall a running daemon"
+    for name in ("apt-get", "sh", "curl"):
+        assert not markers[name].exists(), f"{name} ran"
+
+
 def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
     # ih_check_clock returns 2 (UNVERIFIED) when timedatectl itself can't be
     # read, which is not evidence the clock is wrong. Remediation must only

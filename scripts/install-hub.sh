@@ -318,6 +318,19 @@ ih_check_clock() {
         ih_pass "clock synchronised"
         return 0
     fi
+    # Two different failures. Measured on the Banana Pi M64 (2026-08-17): a
+    # run within a minute of boot found chrony installed, active, and not yet
+    # synchronised — and the old single message told the operator to install
+    # it, which under --yes would have reinstalled a working daemon. A daemon
+    # that is running but has not converged is a wait, not an install; it is
+    # still a FAIL, because nothing may schedule against an untrusted clock.
+    local daemon
+    for daemon in chrony chronyd systemd-timesyncd; do
+        if [[ "$(systemctl is-active "$daemon" 2>/dev/null)" == "active" ]]; then
+            ih_fail "clock is not synchronised yet; ${daemon} is running (just booted?) — give it a minute and re-run"
+            return 3
+        fi
+    done
     ih_fail "clock is not synchronised; install and enable chrony"
     return 1
 }
@@ -521,12 +534,12 @@ ih_phase2_requirements() {
     ih_check_quietly ih_check_memory
     ih_check_quietly ih_check_disk
 
-    # ih_check_clock can return 2 (UNVERIFIED — timedatectl unreadable) as
-    # well as 1 (FAIL — genuinely unsynchronised). Those are not the same
-    # thing: a check that could not run is not evidence the clock is wrong,
-    # so only a real FAIL offers to install chrony. `if !` on the bare
-    # return code would treat both as "failed" and install on the strength
-    # of a check that never ran.
+    # ih_check_clock can return 2 (UNVERIFIED — timedatectl unreadable) or
+    # 3 (FAIL — a time daemon is running but has not converged yet) as well
+    # as 1 (FAIL — no daemon at all). Only 1 is an install problem: a check
+    # that could not run is not evidence the clock is wrong, and a daemon
+    # that merely needs another minute is not one to reinstall. `if !` on
+    # the bare return code would treat all three as "install chrony".
     local clock_rc=0
     ih_check_quietly ih_check_clock || clock_rc=$?
     if (( clock_rc == 1 )); then
