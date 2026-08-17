@@ -172,9 +172,14 @@ IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
 # One generation of images is 1.69 GB — api 482, control-engine 353,
 # hardware-io 348, postgres 415, nats 38, victoria-metrics 52 MB — Docker
 # Engine itself is about 0.4 GB, and the data volumes start at roughly 60 MB.
-# So a shade over 2 GB has to land before a hub exists at all, which is what
-# the hard floor protects: below it the install cannot finish, and stopping is
-# the only honest answer.
+# So a shade over 2 GB has to land before a hub exists at all. The hard floor
+# is deliberately NOT that whole figure: measured on the Banana Pi M64
+# (2026-08-17), a 4.9 GB disk pulled the images and was left with 3.5 GB, and a
+# 4 GB floor then refused the re-run for the very images it had just pulled.
+# Free space is not remaining need. The floor is what the stack needs beyond
+# its images to start at all — Docker's own state, the data volumes, logs — and
+# a pull that runs out of room fails in phase 5 with compose's own ENOSPC
+# message, which is a clearer answer than a guess made here.
 #
 # The 16 GB figure is a different claim. It is the practical minimum from
 # docs/hub-platform-requirements.md — room for VictoriaMetrics retention, a
@@ -184,7 +189,7 @@ IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
 #
 # Both thresholds are round decimal GB, which is how the messages below say
 # them; the free-space figure is df's kB divided the binary way, as before.
-IH_MIN_DISK_KB=4000000            # 4 GB hard floor — below this nothing fits.
+IH_MIN_DISK_KB=2000000            # 2 GB hard floor — below this the stack cannot start.
 IH_RECOMMENDED_DISK_KB=16000000   # 16 GB practical minimum — below this, warn.
 
 # Docker is unusable for three different reasons and only one of them is
@@ -295,7 +300,7 @@ ih_check_disk() {
         ih_warn "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_RECOMMENDED_DISK_KB / 1000 / 1000 )) GB practical minimum (docs/hub-platform-requirements.md); fine for a bench, not for a tank — retention and a second image generation will not fit"
         return 0
     fi
-    ih_fail "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the images alone are ~2 GB"
+    ih_fail "free disk $(( kb / 1000 / 1000 )) GB is below the $(( IH_MIN_DISK_KB / 1000 / 1000 )) GB hard floor; the stack cannot start in this little space"
     return 1
 }
 

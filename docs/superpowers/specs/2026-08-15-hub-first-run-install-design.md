@@ -60,7 +60,7 @@ declines to fix stops the run.
 | Architecture is arm64 or amd64 | none, report and stop |
 | Kernel 6.x or newer | none, report and stop |
 | RAM at or above floor | none, report and warn |
-| Free disk at or above the 4 GB hard floor | none, report and stop |
+| Free disk at or above the 2 GB hard floor | none, report and stop |
 | Free disk at or above the 16 GB practical minimum | none, report and warn |
 | Clock synchronised, `chrony` + `fake-hwclock` installed and enabled | install and enable |
 | `avahi-daemon` installed, running, and interface-allowlisted | install and configure |
@@ -298,8 +298,11 @@ of it.
    wrong in both directions: it refused machines that can complete an install,
    and it said nothing about the machines that complete one and fill up later.
 
-   Ruled two-tier. **4 GB is the hard floor** — a shade over 2 GB has to land
-   before a hub exists at all, so below it the run stops. **16 GB stays the
+   Ruled two-tier. **2 GB is the hard floor** — what the stack needs beyond its
+   images to start at all; a 4 GB floor, tried first, refused the M64's re-run
+   for the images it had just pulled (4.9 GB → 3.5 GB free), because free space
+   is not remaining need. Below 2 GB the run stops; a pull that runs out of
+   room fails in phase 5 with compose's own message. **16 GB stays the
    practical minimum** (docs/hub-platform-requirements.md) and between the two
    the run warns and continues: retention, a growing Postgres, and the second
    image generation an upgrade pulls before dropping the first will not fit.
