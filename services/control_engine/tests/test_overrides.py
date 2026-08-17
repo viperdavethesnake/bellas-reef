@@ -297,3 +297,61 @@ class TestClockGate:
         assert 1700 < remaining <= 1800, (
             f"deadline should be ~30 minutes from the corrected clock, got {remaining}s"
         )
+
+
+class TestTransitionRoundTrip:
+    """``transition`` is stored with the hold and comes back on every read
+    path the engine and API use (spec 2026-08-17)."""
+
+    def test_default_is_ramp_and_snap_round_trips(self) -> None:
+        async def scenario() -> tuple[str, str, str, str]:
+            engine = await fresh()
+            store = OverrideStore(engine, clock_trusted=lambda: True)
+            defaulted = await store.create("blue", 0.5, 1800, reason="photo")
+            await store.create("white", 0.0, 900, reason="feed", transition="snap")
+            active = {o.target: o for o in await store.list_active()}
+            one = await store.active_for("white")
+            woke = {o.target: o for o in await store.load_active()}
+            assert one is not None
+            await engine.dispose()
+            return (
+                defaulted.transition,
+                active["white"].transition,
+                one.transition,
+                woke["blue"].transition,
+            )
+
+        assert run(scenario) == ("ramp", "snap", "snap", "ramp")
+
+    def test_a_row_written_without_the_column_reads_back_as_ramp(self) -> None:
+        """The backfill default, exercised the way an old row would be."""
+
+        async def scenario() -> str:
+            engine = await fresh()
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO overrides (id, target, level, created_at, expires_at) "
+                        "VALUES (gen_random_uuid(), 'blue', CAST(:level AS JSONB), now(), "
+                        "now() + interval '1 hour')"
+                    ),
+                    {"level": '{"kind": "pwm", "duty": 0.25}'},
+                )
+            found = await OverrideStore(engine).active_for("blue")
+            await engine.dispose()
+            assert found is not None
+            return found.transition
+
+        assert run(scenario) == "ramp"
+
+    def test_an_unknown_transition_is_refused(self) -> None:
+        async def scenario() -> None:
+            engine = await fresh()
+            store = OverrideStore(engine, clock_trusted=lambda: True)
+            try:
+                with pytest.raises(ValueError, match="transition"):
+                    await store.create("blue", 0.5, 60, transition="fade")  # type: ignore[arg-type]
+            finally:
+                await engine.dispose()
+
+        run(scenario)

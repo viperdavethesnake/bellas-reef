@@ -587,6 +587,11 @@ class Override(Base):
     level: Mapped[dict[str, Any]] = mapped_column(JSONB)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    #: How the engine moves the light to this level and back: "snap" (one
+    #: step) or "ramp" (the global slew). Spec 2026-08-17. Governs both ends
+    #: of the hold — arrival and release/expiry alike.
+    transition: Mapped[str] = mapped_column(String(4), server_default=text("'ramp'"))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -604,6 +609,10 @@ class Override(Base):
             "release_reason IS NULL OR release_reason IN "
             "('expired', 'lapsed', 'manual', 'superseded')",
             name="release_reason_valid",
+        ),
+        CheckConstraint(
+            "transition IN ('snap', 'ramp')",
+            name="override_transition_valid",
         ),
         Index(
             "uq_overrides_one_active_per_target",
