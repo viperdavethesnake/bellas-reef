@@ -10,9 +10,12 @@ here, that is a bug in this document, not a licence to make the change quietly.
 Values below are the measured state of the reference host as of 2026-08-09; see
 "Verified host facts" in CLAUDE.md for the full inventory.
 
-This file is the procedure for the **Raspberry Pi 5 specifically**. For what any
-machine has to provide before such a procedure is worth writing, and for boards
-evaluated against that standard, see `docs/hub-platform-requirements.md`.
+This file is the procedure for the **Raspberry Pi 5 specifically**, and the
+reference for what each host change is for. For a first install, run
+`scripts/install-hub.sh` on the hub instead: it performs the checks below,
+offers to install what is missing, and reports the boot-config changes it will
+not make for you. For what any machine has to provide before either is worth
+running, see `docs/hub-platform-requirements.md`.
 
 ---
 

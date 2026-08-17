@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Client-side expansion of local values into the remote command is the intent
+# of every ssh line in this file.
+# shellcheck disable=SC2029
+#
 # Factory-reset the hub: the 2026-08-14 manual wipe as one audited command.
 #
 # Destroys: bellasreef_postgres-data, bellasreef_vm-data, bellasreef_nats-data

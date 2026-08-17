@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Client-side expansion of local values into the remote command is the intent
+# of every ssh line in this file.
+# shellcheck disable=SC2029
+#
 # Deploy to the hub. The only supported way to change what the Pi runs.
 #
 # The rule this enforces (CLAUDE.md, "Deployment discipline"): the Pi runs
@@ -53,6 +57,10 @@ IMAGE_PREFIX="ghcr.io/viperdavethesnake/bellasreef"
 AVAHI_RECORD="deploy/avahi/bellasreef.service"
 AVAHI_INSTALLED="/etc/avahi/services/bellasreef.service"
 
+die() { printf '\033[31mdeploy: %s\033[0m\n' "$1" >&2; exit 1; }
+step() { printf '\033[1m▶ %s\033[0m\n' "$1"; }
+warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host) PI_HOST="$2"; shift 2 ;;
@@ -63,11 +71,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-cd "$(git rev-parse --show-toplevel)"
-
-die() { printf '\033[31mdeploy: %s\033[0m\n' "$1" >&2; exit 1; }
-step() { printf '\033[1m▶ %s\033[0m\n' "$1"; }
-warn() { printf '\033[33m  %s\033[0m\n' "$1"; }
+cd "$(git rev-parse --show-toplevel)" || die "could not resolve the repo root"
 
 # A compose invocation against the Pi's project, with an explicit -f/--env-file
 # rather than relying on cwd — matches how bellasreef.service itself invokes
