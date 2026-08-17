@@ -55,7 +55,7 @@ needs to say so.
   1 (an added field on a server-produced frame is additive).
 - `openapi.json` re-exported. The diff is exactly the new field in three
   places plus the version.
-- Audit: `override.placed` records `transition` alongside duty and duration.
+- Audit: `override.created` records `transition` alongside duty and expiry.
 - **No change to the NATS command contract.** `ActuatorCommand`/`PwmLevel`
   are untouched; hardware-io never sees a transition. The engine is the sole
   slew authority and remains so.
@@ -114,12 +114,18 @@ one type, and `mypy --strict` finds every test that still passes floats.
 The scheduler cannot see *why* a hold ended (`release_reason` stays an API/
 store concern), and it does not need to: it needs to know how the hold that
 just ended said it moves. `LightingScheduler` keeps
-`_last_hold: dict[str, Transition]`, written whenever `due()` sees a held
-channel, and consulted on the first tick the channel is **no longer held**:
+`_last_hold: dict[str, Transition]`. `due()` stays pure: every intent it
+returns carries `hold: Transition | None` (the transition of the hold it was
+emitted under, or `None` when the channel is not held), and `mark_emitted`
+records or clears `_last_hold` from that — so a hold whose intent was never
+published is never remembered. A hold's arrival, and any change of
+transition while held, always produces an intent (reason `hold`) even inside
+the deadband, so the memory is exact whenever a channel is held. It is
+consulted on the first tick the channel is **no longer held**:
 
 - last hold was `snap`: emit the resting target (profile curve, or
-  `SAFE_DUTY` for an unprofiled channel) in one step, reason `release`, and
-  clear the entry.
+  `SAFE_DUTY` for an unprofiled channel) in one step, reason `release`;
+  `mark_emitted` clears the entry (any intent emitted while not held does).
 - last hold was `ramp` (or there is no entry): today's path — `_limit`
   toward the resting target, reasons `converge` / `ramp`.
 
