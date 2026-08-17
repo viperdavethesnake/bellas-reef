@@ -248,7 +248,8 @@ def discover_pca9685(
       known-empty, and it is how the registry learns to prune a chip that was
       unplugged, exactly as ``discover_pwm`` does for an unmuxed block.
     * **The bus node is absent, or cannot be opened at all** (no ``/dev/i2c-1``,
-      no ``smbus2``, no permission) — say nothing (``None``). We did not learn
+      no permission, or — defensively — no ``smbus2``, which is a declared
+      dependency and should never be missing) — say nothing (``None``). We did not learn
       that the chip is gone, only that we could not look, and a dev machine
       without an I²C bus must not erase a hub's registry entry.
 
@@ -281,14 +282,24 @@ def discover_pca9685(
             extra={"bus": bus, "address": f"0x{address:02x}", "error": str(exc)},
         )
     finally:
+        # Best-effort. The probe has already happened by this point, so a bus
+        # that fails to close must not turn a successful read into a crash —
+        # this runs at startup, before the liveness guard, where an exception
+        # is a crash-loop rather than a logged fault.
         close = getattr(i2c, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:
+                log.warning("the I²C bus did not close cleanly", extra={"bus": bus})
 
     channels: list[CapabilityChannel] = []
     if mode1 is not None:
         detail: dict[str, str | int | float | bool] = {
-            "bus": str(bus),
+            # An int, matching discover_pwm's `gpio` — the bus number is a
+            # number. The address stays a hex string because that is the form
+            # every datasheet, i2cdetect scan and bench note writes it in.
+            "bus": bus,
             "address": f"0x{address:02x}",
             "mode1": f"0x{mode1:02x}",
         }

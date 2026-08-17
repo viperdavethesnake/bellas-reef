@@ -185,8 +185,9 @@ class FakeI2CBus:
     the chip, or read six registers to be sure — pass silently.
     """
 
-    def __init__(self, mode1: int | None = 0x11) -> None:
+    def __init__(self, mode1: int | None = 0x11, *, close_fails: bool = False) -> None:
         self._mode1 = mode1
+        self._close_fails = close_fails
         self.reads: list[tuple[int, int]] = []
         self.writes: list[tuple[int, int, object]] = []
         self.closed = False
@@ -205,6 +206,8 @@ class FakeI2CBus:
 
     def close(self) -> None:
         self.closed = True
+        if self._close_fails:
+            raise OSError(5, "Input/output error")
 
 
 def _dev(tmp_path: Path) -> Path:
@@ -229,7 +232,7 @@ class TestDiscoverPca9685:
         assert announcement.hardware_source == "pca9685"
         assert [c.channel for c in announcement.channels] == [str(n) for n in range(16)]
         assert announcement.channels[0].detail == {
-            "bus": "1",
+            "bus": 1,
             "address": "0x40",
             "mode1": "0x11",
         }
@@ -285,12 +288,21 @@ class TestDiscoverPca9685:
         discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
         assert bus.closed is True
 
+    def test_a_failing_close_does_not_lose_the_answer(self, tmp_path: Path) -> None:
+        """The probe has already succeeded by the time the bus is closed.
+        Discovery runs at startup, before the liveness guard, so an exception
+        on the way out is a crash-loop — not a fault the service survives."""
+        bus = FakeI2CBus(close_fails=True)
+        announcement = discover_pca9685(lambda _: bus, dev=_dev(tmp_path))
+        assert announcement is not None
+        assert len(announcement.channels) == 16
+
     def test_bus_and_address_are_overridable(self, tmp_path: Path) -> None:
         bus = FakeI2CBus()
         announcement = discover_pca9685(lambda _: bus, bus=3, address=0x41, dev=_dev(tmp_path))
         assert announcement is not None
         assert announcement.channels[0].detail == {
-            "bus": "3",
+            "bus": 3,
             "address": "0x41",
             "mode1": "0x11",
         }
@@ -335,6 +347,50 @@ class TestAnnounceCapabilities:
         asyncio.run(hardware._announce_capabilities())
 
         assert [a.hardware_source for a in spine.published] == ["pi-pwm", "w1-bus", "pca9685"]
+
+    def test_one_source_raising_does_not_silence_the_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This loop runs before httpd.start() and liveness.start(). An
+        exception escaping a discover_* would kill the process at startup and
+        crash-loop it under `restart: unless-stopped` — so a hub whose I²C bus
+        misbehaves would stop reporting its temperature probe too."""
+
+        def explode() -> CapabilityAnnouncement | None:
+            raise RuntimeError("the bus did something nobody planned for")
+
+        monkeypatch.setattr(app, "discover_pwm", lambda: _announcement("pi-pwm"))
+        monkeypatch.setattr(app, "discover_w1", explode)
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: _announcement("pca9685"))
+
+        hardware = app.HardwareIO()
+        spine = _RecordingSpine()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["pi-pwm", "pca9685"]
+
+    def test_a_publish_that_raises_does_not_silence_the_others(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same guard, the other half: the spine is inside the try too."""
+
+        class _FailsOnce(_RecordingSpine):
+            async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
+                if announcement.hardware_source == "pi-pwm":
+                    raise RuntimeError("publish failed")
+                await super().publish_capabilities(announcement)
+
+        monkeypatch.setattr(app, "discover_pwm", lambda: _announcement("pi-pwm"))
+        monkeypatch.setattr(app, "discover_w1", lambda: _announcement("w1-bus"))
+        monkeypatch.setattr(app, "discover_pca9685", lambda _opener: _announcement("pca9685"))
+
+        hardware = app.HardwareIO()
+        spine = _FailsOnce()
+        hardware.spine = cast(Any, spine)
+        asyncio.run(hardware._announce_capabilities())
+
+        assert [a.hardware_source for a in spine.published] == ["w1-bus", "pca9685"]
 
     def test_a_source_that_knows_nothing_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(app, "discover_pwm", lambda: None)

@@ -79,8 +79,9 @@ exclude = ["reference/", "db/alembic/versions/"]
 module = ["alembic.*"]
 ignore_missing_imports = true
 
-# smbus2 ships no type stubs. Imported lazily and only on a hub that declares a
-# PCA9685, so a dev machine without it still runs everything else.
+# smbus2 ships no type stubs. A declared dependency of hardware-io since
+# 2026-08-17 — capability discovery probes for the PCA9685 at every startup, so
+# it is no longer optional — but still imported lazily, at the call site.
 [[tool.mypy.overrides]]
 module = ["smbus2.*"]
 ignore_missing_imports = true
