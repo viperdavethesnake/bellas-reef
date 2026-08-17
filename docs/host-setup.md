@@ -10,6 +10,10 @@ here, that is a bug in this document, not a licence to make the change quietly.
 Values below are the measured state of the reference host as of 2026-08-09; see
 "Verified host facts" in CLAUDE.md for the full inventory.
 
+This file is the procedure for the **Raspberry Pi 5 specifically**. For what any
+machine has to provide before such a procedure is worth writing, and for boards
+evaluated against that standard, see `docs/hub-platform-requirements.md`.
+
 ---
 
 ## 1. Device tree overlays
