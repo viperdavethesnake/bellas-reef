@@ -295,13 +295,21 @@ def discover_pca9685(
 
     channels: list[CapabilityChannel] = []
     if mode1 is not None:
+        # MODE1 is logged, not announced. A client renders `detail` as the
+        # channel's identity cue, and MODE1 is a state snapshot — 0x11 asleep,
+        # 0x21 awake — so the same chip would read as a different thing between
+        # two discoveries. Once here, at info, is where a state snapshot
+        # belongs.
+        log.info(
+            "pca9685 answered",
+            extra={"bus": bus, "address": f"0x{address:02x}", "mode1": f"0x{mode1:02x}"},
+        )
         detail: dict[str, str | int | float | bool] = {
             # An int, matching discover_pwm's `gpio` — the bus number is a
             # number. The address stays a hex string because that is the form
             # every datasheet, i2cdetect scan and bench note writes it in.
             "bus": bus,
             "address": f"0x{address:02x}",
-            "mode1": f"0x{mode1:02x}",
         }
         channels = [
             CapabilityChannel(channel=str(index), detail=dict(detail))

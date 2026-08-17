@@ -250,7 +250,17 @@ class Store:
                         "        AND d.adopted "
                         "        AND COALESCE(d.binding ->> 'channel', d.binding ->> 'rom') "
                         "            = c.channel "
-                        " ORDER BY c.source, c.channel"
+                        # Natural order, not text order. `channel` is text
+                        # because a 1-Wire ROM is not a number, but a
+                        # PCA9685's sixteen channels are — and sorting them as
+                        # text listed 0, 1, 10, 11, ... 15, 2, 3 in the app.
+                        # Digits-only channels sort numerically; anything else
+                        # (ROMs) sorts lexically after them. The API is the
+                        # ordering authority: clients render what is delivered.
+                        " ORDER BY c.source, "
+                        "          (CASE WHEN c.channel ~ '^[0-9]+$' "
+                        "                THEN c.channel::integer END) NULLS LAST, "
+                        "          c.channel"
                     )
                 )
             ).mappings()
@@ -752,7 +762,20 @@ class Store:
         if kind is not None:
             sql += " WHERE kind = :kind"
             params["kind"] = kind
-        sql += " ORDER BY device_id"
+        # Grouped, then natural, then stable. `device_id` is a slug and
+        # `display_name` is the operator's, so neither gives a list an order
+        # that means anything on its own; kind and driver_type group the
+        # hardware the way a client sections it, and the channel orders within
+        # a group numerically (the same 0, 1, 10, 2 problem as capabilities).
+        # `device_id` is the final tiebreak so the order is deterministic.
+        sql += (
+            " ORDER BY kind, driver_type, "
+            "          (CASE WHEN COALESCE(binding ->> 'channel', binding ->> 'rom') ~ '^[0-9]+$' "
+            "                THEN COALESCE(binding ->> 'channel', "
+            "                              binding ->> 'rom')::integer END) NULLS LAST, "
+            "          COALESCE(binding ->> 'channel', binding ->> 'rom'), "
+            "          device_id"
+        )
 
         async with self._engine.connect() as conn:
             rows = (await conn.execute(text(sql), params)).mappings().all()
