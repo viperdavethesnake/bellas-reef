@@ -758,6 +758,11 @@ ih_phase4_configure() {
         ih_pass "gpio group GID ${gpio_gid}"
     else
         ih_fail "no gpio group on this machine; compose requires GPIO_GID and will refuse to start"
+        # A Pi gets the group from its OS packages. Other boards (the Banana Pi
+        # M64 on Armbian, measured 2026-08-17) have none, and compose only needs
+        # the GID for hardware-io's group_add, so an empty group is enough.
+        printf '      If this board has no gpio group, create one and re-run:\n'
+        printf '        sudo groupadd gpio\n'
     fi
 
     # Nothing is written past a failed check. This phase used to fall through
