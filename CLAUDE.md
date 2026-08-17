@@ -424,10 +424,14 @@ ground truth with no stack in the loop.
   `driver_type == "pca9685"` branch are complete, but nothing announces the
   capability, so no channel is adoptable. A `discover_pca9685()` is a
   prerequisite for the PCA9685 Stage 2, not for its Stage 1.
-  CODE PATH ADDED 2026-08-17 (`discover_pca9685()`, PR #36): announces 16
-  channels when the chip ACKs at 0x40 on bus 1, empty when the bus is present
-  and nothing answers. Not yet observed on the wire — this line becomes
-  RESOLVED when `deploy-pi.sh` shows the announcement.
+  RESOLVED 2026-08-17 (`discover_pca9685()`, PR #36, deployed as ca8ef2da):
+  observed on the wire — hardware-io logged `capability announced
+  hardware_source=pca9685 channels=16` at 15:51:30Z and the API's registry
+  holds sixteen `pca9685` rows (channels 0–15, detail address 0x40 / bus 1).
+  Announced empty when the bus is present and nothing answers. Presence check
+  is one MODE1 read; `0x70` is never addressed. Note `smbus2` had never been a
+  dependency of hardware-io until this PR — adoption of a PCA9685 channel
+  through the stack was never runnable on the hub before it.
 
 **Stage 1 (RP1 native PWM), CH0 and CH2 — PASSED on hardware 2026-08-15.**
 
