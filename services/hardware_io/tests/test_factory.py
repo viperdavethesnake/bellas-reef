@@ -98,3 +98,63 @@ def test_a_collapsed_duplicate_is_logged(caplog: pytest.LogCaptureFixture) -> No
         build_from_assignments([_pipwm("pi-pwm-1", adopted=True), _pipwm("pi-pwm-1", adopted=True)])
 
     assert any("dedup" in r.getMessage() or "duplicate" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------ pca9685 lifecycle
+
+
+class _Bus:
+    """Just enough PCA9685 for the factory path: registers plus block writes."""
+
+    def __init__(self) -> None:
+        self.registers: dict[int, int] = {0x00: 0x11, 0x01: 0x04, 0xFE: 0x1E}
+        self.blocks: list[tuple[int, list[int]]] = []
+
+    def read_byte_data(self, address: int, register: int) -> int:
+        return self.registers.get(register, 0)
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        if register == 0xFE and not self.registers[0x00] & 0x10:
+            return  # PRE_SCALE is discarded unless SLEEP is set
+        self.registers[register] = value
+
+    def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
+        self.blocks.append((register, list(data)))
+
+
+def _pca(device_id: str, channel: int) -> DeviceAssignment:
+    return DeviceAssignment(
+        message_id=uuid4(),
+        emitted_at=datetime.now(UTC),
+        source="api",
+        device_id=device_id,
+        adopted=True,
+        role="light",
+        driver_type="pca9685",
+        binding={"channel": str(channel)},
+    )
+
+
+def test_a_built_pca9685_channel_opens_like_every_other_actuator() -> None:
+    """The app brings actuators up via ``driver.open()`` and skips ones without
+    it. Stage 2 on 2026-08-17 found the PCA9685 driven on Stage 1's leftover
+    registers because its channel had no ``open()`` — the chip was never
+    initialised through the stack. A built PCA9685 channel must open, and
+    opening must land the measured prescaler on the bus."""
+    import asyncio
+
+    from bellasreef_hardware_io.drivers.pca9685 import PCA9685_PRE_SCALE
+
+    buses: list[_Bus] = []
+
+    def open_i2c(bus_no: int) -> _Bus:
+        buses.append(_Bus())
+        return buses[-1]
+
+    actuators, _ = build_from_assignments([_pca("pca9685-0", 0)], open_i2c=open_i2c)
+
+    assert [a.registration.actuator_id for a in actuators] == ["pca9685-0"]
+    opener = getattr(actuators[0].driver, "open", None)
+    assert opener is not None, "a PCA9685 channel must expose the open() lifecycle hook"
+    asyncio.run(opener())
+    assert buses[0].registers[0xFE] == PCA9685_PRE_SCALE
