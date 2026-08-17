@@ -624,8 +624,11 @@ Two things learned on the way, both load-bearing:
    off) this would have meant every command landing on a chip generating no
    PWM at all — dark, and silently so. Fixed the same day (`Pca9685Channel.
    open()` → `Pca9685Device.ensure_initialised()`, once per chip). The
-   frequency row (~503 Hz at 50 %) is re-verified after that deploy and
-   recorded below when measured. Follow-up, not yet done: put `open()` in the
+   fix merged as PR #40, deployed as `974faff` (hardware-io logged
+   `pca9685 initialised address=0x40 pre_scale=12 invrt=false`), and David
+   re-read the 50 % row on LED0: **502.9 Hz**, 1.654 V — against 502.7
+   predicted from the measured 26.77 MHz oscillator and 544.8 measured on
+   Stage 1's leftover prescaler. Follow-up, not yet done: put `open()` in the
    `ActuatorDriver` Protocol so a driver without a lifecycle hook fails
    `mypy --strict` rather than passing quietly; and announce the chip's
    read-back PRE_SCALE on the wire so the System tab can show it.
