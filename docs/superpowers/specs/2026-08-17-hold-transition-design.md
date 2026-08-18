@@ -82,6 +82,7 @@ where
 ```python
 Transition = Literal["snap", "ramp"]
 
+
 @dataclass(frozen=True, slots=True)
 class HeldTarget:
     duty: float

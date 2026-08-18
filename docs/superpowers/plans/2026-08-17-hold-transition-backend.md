@@ -128,7 +128,7 @@ In `db/bellasreef_db/models.py`, inside `class Override(Base)`, after the `reaso
 
 and inside `__table_args__`, after the `release_reason_valid` CheckConstraint, add:
 
-```python
+```
         CheckConstraint(
             "transition IN ('snap', 'ramp')",
             name="override_transition_valid",
@@ -671,7 +671,7 @@ git commit -m "feat(control-engine): holds carry snap|ramp — a snap hold jumps
 
 In `services/api/tests/test_stream_and_overrides.py`, inside `class TestOverrideEndpoints` add:
 
-```python
+```
     def test_transition_defaults_to_ramp_and_snap_round_trips(self) -> None:
         async def scenario() -> dict[str, Any]:
             engine = await fresh_engine()
