@@ -17,7 +17,13 @@ from bellasreef_contracts import ActuatorCommand, DeviceAssignment
 from bellasreef_control_engine.app import ControlEngine, load_profiles
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
-from bellasreef_db.overrides import ActiveOverride, OverrideStore, ReleaseReason
+from bellasreef_db.overrides import (
+    ActiveOverride,
+    OverrideStore,
+    ReleasedOverride,
+    ReleaseReason,
+    WakeReport,
+)
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -58,6 +64,7 @@ class _FakePublisher(CommandPublisher):
     def __init__(self) -> None:
         super().__init__("nats://unused:4222")
         self.published: list[ActuatorCommand] = []
+        self.audits: list[tuple[str, dict[str, object]]] = []
 
     @property
     def connected(self) -> bool:
@@ -65,6 +72,9 @@ class _FakePublisher(CommandPublisher):
 
     async def emit(self, command: ActuatorCommand) -> None:
         self.published.append(command)
+
+    async def publish_audit(self, category: str, event: dict[str, object]) -> None:
+        self.audits.append((category, dict(event)))
 
 
 class _FakeOverrideStore(OverrideStore):
@@ -97,20 +107,23 @@ class _FakeOverrideStore(OverrideStore):
             id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at, transition=o.transition
         )
 
-    async def load_active(self, *, now: datetime | None = None) -> list[ActiveOverride]:
+    async def load_active(self, *, now: datetime | None = None) -> WakeReport:
         # Same contract as the Postgres one: lapse-on-wake by *wall* clock,
-        # then re-arm every survivor from that same wall clock.
+        # then re-arm every survivor from that same wall clock, and report
+        # what was lapsed so the engine can audit it.
         wall_now = self._clock(now)
+        lapsed: list[ReleasedOverride] = []
         for target, o in list(self.rows.items()):
             if o.expires_at <= wall_now:
                 self.released.append((o.id, "lapsed"))
+                lapsed.append(ReleasedOverride(id=o.id, target=o.target))
                 del self.rows[target]
         live: list[ActiveOverride] = []
         for o in self.rows.values():
             fresh = self._fresh(o)
             fresh.arm(wall_now=wall_now)
             live.append(fresh)
-        return live
+        return WakeReport(live=live, lapsed=tuple(lapsed))
 
     async def list_active(self) -> list[ActiveOverride]:
         # Same contract as the Postgres one: a plain read of what is unreleased,
@@ -514,6 +527,62 @@ class TestLiveOverridePickup:
         assert expired_total == 1.0
         assert store.released == [(override_id, "expired")]
         assert "pi-pwm-0" not in engine._held
+        # E1 (UX review 2026-08-17): the API audits `override.created` and the
+        # manual `override.released`, and nothing audited an expiry — so the
+        # log showed holds starting and never ending. Expiry is an ending the
+        # engine alone knows about; it must say so, in the same event the API
+        # uses for a manual release, so the log reads as one trail.
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        assert fake.audits == [
+            (
+                "command",
+                {
+                    "event": "override.released",
+                    "override_id": str(override_id),
+                    "target": "pi-pwm-0",
+                    "reason": "expired",
+                    "actor": "control-engine",
+                },
+            )
+        ]
+
+    def test_lapse_on_wake_releases_and_audits_the_row(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """A hold whose deadline passed while the engine was down is lapsed at
+        wake and never applied (``load_active``). That is an ending too, and
+        the only witness is the engine, at wake — so it audits it, reason
+        'lapsed', distinct from 'expired' because the operator's thirty
+        minutes were not honoured to the end."""
+        engine, _published, store = engine_with_fake_store
+        override_id = uuid4()
+        store.rows["pi-pwm-0"] = ActiveOverride(
+            id=override_id,
+            target="pi-pwm-0",
+            duty=0.5,
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+
+        asyncio.run(engine._rearm_overrides())
+
+        assert store.released == [(override_id, "lapsed")]
+        assert engine._held == {}
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        assert fake.audits == [
+            (
+                "command",
+                {
+                    "event": "override.released",
+                    "override_id": str(override_id),
+                    "target": "pi-pwm-0",
+                    "reason": "lapsed",
+                    "actor": "control-engine",
+                },
+            )
+        ]
 
     def test_a_wall_clock_step_does_not_shorten_a_held_override(
         self,

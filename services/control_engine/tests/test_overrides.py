@@ -13,11 +13,12 @@ import os
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from uuid import UUID
 
 import pytest
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.scheduler import HeldTarget, LightingScheduler
-from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore
+from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore, WakeReport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -55,8 +56,12 @@ class TestSingleActivePerTarget:
         async def scenario() -> tuple[int, list[str]]:
             engine = await fresh()
             store = OverrideStore(engine, clock_trusted=lambda: True)
-            await store.create("blue", 0.0, 1800, reason="feed")
-            await store.create("blue", 0.0, 1800, reason="feed again")
+            first = await store.create("blue", 0.0, 1800, reason="feed")
+            second = await store.create("blue", 0.0, 1800, reason="feed again")
+            # The store names what it displaced, atomically with the insert,
+            # so the API can audit the ending beside the new beginning (E1).
+            assert first.superseded == ()
+            assert [(r.id, r.target) for r in second.superseded] == [(first.override.id, "blue")]
             active = await store.active_count("blue")
             async with engine.connect() as conn:
                 reasons = [
@@ -98,15 +103,15 @@ class TestLapseOnWake:
         outlives its promise is a silent trap.
         """
 
-        async def scenario() -> tuple[list[ActiveOverride], list[str]]:
+        async def scenario() -> tuple[WakeReport, list[str], UUID]:
             engine = await fresh()
             store = OverrideStore(engine, clock_trusted=lambda: True)
 
             # Placed an hour ago for 30 minutes: expired 30 minutes before wake.
             an_hour_ago = datetime.now(UTC) - timedelta(hours=1)
-            await store.create("blue", 0.0, 1800, reason="feed", now=an_hour_ago)
+            placed = await store.create("blue", 0.0, 1800, reason="feed", now=an_hour_ago)
 
-            live = await store.load_active()
+            woke = await store.load_active()
 
             async with engine.connect() as conn:
                 reasons = [
@@ -116,11 +121,14 @@ class TestLapseOnWake:
                     ).all()
                 ]
             await engine.dispose()
-            return live, reasons
+            return woke, reasons, placed.override.id
 
-        live, reasons = run(scenario)
-        assert live == [], "an override past its deadline must not be re-armed"
+        woke, reasons, lapsed_id = run(scenario)
+        assert woke.live == [], "an override past its deadline must not be re-armed"
         assert reasons == ["lapsed"]
+        # The lapse is an ending only the waking engine witnesses; the store
+        # names it so the engine can audit it (E1).
+        assert [(r.id, r.target) for r in woke.lapsed] == [(lapsed_id, "blue")]
 
     def test_an_override_still_owed_survives_a_restart(self) -> None:
         async def scenario() -> list[ActiveOverride]:
@@ -128,7 +136,7 @@ class TestLapseOnWake:
             store = OverrideStore(engine, clock_trusted=lambda: True)
             # Placed a minute ago for an hour: 59 minutes still owed.
             await store.create("blue", 0.0, 3600, now=datetime.now(UTC) - timedelta(minutes=1))
-            live = await store.load_active()
+            live = (await store.load_active()).live
             await engine.dispose()
             return live
 
@@ -144,8 +152,8 @@ class TestLapseOnWake:
             engine = await fresh()
             store = OverrideStore(engine, clock_trusted=lambda: True)
             await store.create("blue", 0.0, 3600)
-            first = len(await store.load_active())
-            second = len(await store.load_active())
+            first = len((await store.load_active()).live)
+            second = len((await store.load_active()).live)
             await engine.dispose()
             return first, second
 
@@ -285,7 +293,7 @@ class TestClockGate:
 
             # chrony steps the clock and time-sync.target is reached.
             trusted["value"] = True
-            placed = await store.create("blue", 0.0, 1800)
+            placed = (await store.create("blue", 0.0, 1800)).override
 
             # The deadline is measured from the corrected clock, not the wrong one.
             remaining = (placed.expires_at - datetime.now(UTC)).total_seconds()
@@ -307,11 +315,11 @@ class TestTransitionRoundTrip:
         async def scenario() -> tuple[str, str, str, str]:
             engine = await fresh()
             store = OverrideStore(engine, clock_trusted=lambda: True)
-            defaulted = await store.create("blue", 0.5, 1800, reason="photo")
+            defaulted = (await store.create("blue", 0.5, 1800, reason="photo")).override
             await store.create("white", 0.0, 900, reason="feed", transition="snap")
             active = {o.target: o for o in await store.list_active()}
             one = await store.active_for("white")
-            woke = {o.target: o for o in await store.load_active()}
+            woke = {o.target: o for o in (await store.load_active()).live}
             assert one is not None
             await engine.dispose()
             return (

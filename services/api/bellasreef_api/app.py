@@ -1926,7 +1926,7 @@ def build_app(
             )
 
         try:
-            placed = await overrides.create(
+            placement = await overrides.create(
                 body.target,
                 body.duty,
                 body.duration_s,
@@ -1937,7 +1937,26 @@ def build_app(
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        placed = placement.override
 
+        # A supersede is an ending. Record it before the new beginning, in the
+        # same event a manual release writes, so the log reads as one trail —
+        # before this the store closed the old hold as 'superseded' and the
+        # trail showed three "started" and no "ended" for one light re-held
+        # twice (UX review 2026-08-17, E1). The store names what it displaced
+        # atomically with the insert, so this can never blame the wrong hold.
+        for displaced in placement.superseded:
+            await sink(
+                "override.released",
+                {
+                    "override_id": str(displaced.id),
+                    "target": displaced.target,
+                    "reason": "superseded",
+                    "superseded_by": str(placed.id),
+                    "actor": str(actor),
+                },
+                category="command",
+            )
         await sink(
             "override.created",
             {
@@ -1975,7 +1994,7 @@ def build_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or already released")
         await sink(
             "override.released",
-            {"override_id": str(override_id), "actor": str(actor)},
+            {"override_id": str(override_id), "reason": "manual", "actor": str(actor)},
             category="command",
         )
         return {"status": "released"}

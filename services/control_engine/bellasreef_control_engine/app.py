@@ -29,6 +29,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+from uuid import UUID
 
 from bellasreef_contracts import SensorReading
 from bellasreef_db.alerts import PostgresAlertStore
@@ -367,12 +368,18 @@ class ControlEngine:
         """
         if self.overrides is None:
             return
-        live = await self.overrides.load_active()
-        self._held = {o.target: o for o in live}
+        woke = await self.overrides.load_active()
+        self._held = {o.target: o for o in woke.live}
         log.info(
             "overrides re-armed after wake",
-            extra={"active": sorted(self._held), "count": len(live)},
+            extra={"active": sorted(self._held), "count": len(woke.live)},
         )
+        # Lapsed holds are endings only this process witnessed, at wake. Audit
+        # them or the trail shows a hold that started and never finished
+        # (UX review 2026-08-17, E1). Distinct from "expired": the operator's
+        # thirty minutes were not honoured to the end.
+        for released in woke.lapsed:
+            await self._audit_override_release(released.id, released.target, "lapsed")
 
     async def _expire_overrides(self) -> None:
         """Release anything whose *monotonic* deadline has passed.
@@ -398,6 +405,39 @@ class ControlEngine:
                 del self._held[target]
                 self.metrics.suppressed.labels("override_expired").inc()
                 log.info("override expired", extra={"target": target})
+                await self._audit_override_release(override.id, target, "expired")
+
+    async def _audit_override_release(self, override_id: UUID, target: str, reason: str) -> None:
+        """One ``override.released`` row, in the same shape the API writes for a
+        manual release, so the audit log reads as one trail whoever ended the
+        hold. The API records the endings it causes (manual, superseded); the
+        engine is the only witness to the ones the clock causes (expired,
+        lapsed) — before this it recorded none of them, and the log showed
+        three "started" with no "ended" for one light re-held twice.
+
+        Failure to publish is logged, not raised: the hold is already released
+        in the store, and a broker hiccup must not turn a clean expiry into a
+        stuck tick.
+        """
+        if self.publisher is None:
+            return
+        try:
+            await self.publisher.publish_audit(
+                "command",
+                {
+                    "event": "override.released",
+                    "override_id": str(override_id),
+                    "target": target,
+                    "reason": reason,
+                    "actor": "control-engine",
+                },
+            )
+        except Exception:
+            log.warning(
+                "override release not audited",
+                extra={"override_id": str(override_id), "target": target, "reason": reason},
+                exc_info=True,
+            )
 
     async def _reload_overrides(self) -> None:
         """Pick up creations and releases made by another client mid-run.
