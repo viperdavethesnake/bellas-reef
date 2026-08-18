@@ -590,7 +590,7 @@ class Override(Base):
     #: How the engine moves the light to this level and back: "snap" (one
     #: step) or "ramp" (the global slew). Spec 2026-08-17. Governs both ends
     #: of the hold — arrival and release/expiry alike.
-    transition: Mapped[str] = mapped_column(String(4), server_default=text("'ramp'"))
+    transition: Mapped[str] = mapped_column(String(16), server_default=text("'ramp'"))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

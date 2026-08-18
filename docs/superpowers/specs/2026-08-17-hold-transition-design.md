@@ -80,7 +80,7 @@ needs to say so.
 where
 
 ```python
-Transition = Literal["snap", "ramp"]
+from bellasreef_db.overrides import Transition
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +89,10 @@ class HeldTarget:
     transition: Transition
 ```
 
-lives in `scheduler.py`. `ControlEngine._tick` builds
+`Transition` is defined in `db/bellasreef_db/overrides.py` — one vocabulary
+shared by db, engine and API, re-exported from `bellasreef_db` — and
+`HeldTarget` lives in `scheduler.py` and imports it. `ControlEngine._tick`
+builds
 `{t: HeldTarget(o.duty, o.transition) for t, o in self._held.items()}`. The
 bare-float mapping is removed, not kept as an alternate form — one call site,
 one type, and `mypy --strict` finds every test that still passes floats.
@@ -100,8 +103,11 @@ one type, and `mypy --strict` finds every test that still passes floats.
 
 - `transition == "snap"`: the intent's duty *is* the target, in one step,
   regardless of the configured slew. Reason `hold`.
-- `transition == "ramp"`: unchanged from today — `_limit` applies, reasons
-  `initial` / `converge` / `ramp` / `refresh` as before.
+- `transition == "ramp"`: the duty path is unchanged from today — `_limit`
+  applies. The arrival tick, and any tick where the transition changes while
+  held (a supersede), are labelled `hold` (see "Release and expiry" below);
+  subsequent ticks while still held use reasons `converge` / `ramp` /
+  `refresh` as before.
 - Re-holding at a new duty (supersede), and the engine re-arming a hold after
   a restart (cold start with `_last_duty` empty), both follow the *current*
   hold's transition. A snap hold re-armed after a restart jumps from

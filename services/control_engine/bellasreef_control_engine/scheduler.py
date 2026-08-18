@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from bellasreef_db.overrides import Transition
+from bellasreef_db import Transition
 
 from bellasreef_control_engine.profiles import ChannelProfile
 
@@ -104,6 +104,21 @@ class LightingScheduler:
         #: and cleared only by mark_emitted (from Intent.hold), so due() stays
         #: pure. Consulted on the first tick a channel is no longer held: a
         #: snap hold releases in one step; anything else slews as before.
+        #:
+        #: Asymmetric by design: a stale "ramp" entry can persist when a ramp
+        #: hold ends with the channel already sitting at its resting target —
+        #: release emits no intent in that case, so mark_emitted never runs
+        #: and the entry is never cleared. Harmless: "ramp" is the fallback
+        #: behaviour (both "no entry" and "entry says ramp" take the same
+        #: path in _emit_for), so the only effect of the stale entry is that
+        #: a later ramp hold at the same duty is not re-announced with reason
+        #: "hold" — it was already the behaviour with no entry at all. A
+        #: "snap" entry never goes stale the same way, because due() keeps a
+        #: channel with a remembered snap hold in the synthetic set even once
+        #: it is unprofiled and no longer held, so the one-step release is
+        #: always surfaced — and a snap release always emits one command,
+        #: even when the channel already sits at the resting duty, precisely
+        #: because that emission is what clears the memory.
         self._last_hold: dict[str, Transition] = {}
 
     @property

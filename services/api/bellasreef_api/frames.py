@@ -24,7 +24,7 @@ from typing import Annotated, Final, Literal
 from uuid import UUID
 
 from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading
-from bellasreef_db.overrides import Transition
+from bellasreef_db import Transition
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 __all__ = [

@@ -34,7 +34,7 @@ def upgrade() -> None:
         "overrides",
         sa.Column(
             "transition",
-            sa.String(4),
+            sa.String(16),
             nullable=False,
             server_default=sa.text("'ramp'"),
         ),

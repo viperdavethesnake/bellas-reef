@@ -12,7 +12,7 @@ from bellasreef_db.models import (
     Device,
     DosingTransaction,
 )
-from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore
+from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore, Transition
 
 __all__ = [
     "ActiveOverride",
@@ -28,4 +28,5 @@ __all__ = [
     "DosingTransaction",
     "OverrideStore",
     "PostgresAlertStore",
+    "Transition",
 ]

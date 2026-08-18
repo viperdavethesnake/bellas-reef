@@ -36,8 +36,13 @@ from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import DeviceAssignment
-from bellasreef_db import AlertRecord, ClockUntrustedError, OverrideStore, PostgresAlertStore
-from bellasreef_db.overrides import Transition
+from bellasreef_db import (
+    AlertRecord,
+    ClockUntrustedError,
+    OverrideStore,
+    PostgresAlertStore,
+    Transition,
+)
 from bellasreef_service import configure_logging, get_logger
 from fastapi import (
     Depends,
