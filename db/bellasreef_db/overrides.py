@@ -43,8 +43,11 @@ __all__ = [
     "ActiveOverride",
     "ClockUntrustedError",
     "OverrideStore",
+    "PlacedOverride",
     "ReleaseReason",
+    "ReleasedOverride",
     "Transition",
+    "WakeReport",
 ]
 
 
@@ -108,6 +111,45 @@ class ActiveOverride:
         self.monotonic_deadline = (monotonic_now or _time.monotonic()) + max(remaining, 0.0)
 
 
+@dataclass(frozen=True, slots=True)
+class ReleasedOverride:
+    """An override the store closed on the caller's behalf, named so the
+    caller can audit it. The store never audits — it has no spine — so it
+    reports what it released and leaves saying so to whoever asked."""
+
+    id: UUID
+    target: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlacedOverride:
+    """What :meth:`OverrideStore.create` did: the hold now live, and any hold
+    it displaced on the same target.
+
+    ``superseded`` is a tuple, not an optional, because the partial unique
+    index promises at most one — but a caller that audits "superseded" per
+    entry needs no special case for zero, and a caller that ever sees two has
+    learned the index is gone. Captured with ``RETURNING`` in the same
+    transaction as the insert, so it can never name a hold some other request
+    superseded a millisecond earlier.
+    """
+
+    override: ActiveOverride
+    superseded: tuple[ReleasedOverride, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WakeReport:
+    """What :meth:`OverrideStore.load_active` found at wake: the holds still
+    owed, and the ones it lapsed because their deadline passed while the
+    engine was down. The lapsed ones are endings nobody else witnessed —
+    reported so the engine can put them in the audit trail beside the manual
+    and expired releases the API and the tick loop record."""
+
+    live: list[ActiveOverride]
+    lapsed: tuple[ReleasedOverride, ...] = ()
+
+
 class OverrideStore:
     """Persistence for overrides. One active per target, enforced by the index.
 
@@ -141,12 +183,18 @@ class OverrideStore:
         reason: str | None = None,
         transition: Transition = "ramp",
         now: datetime | None = None,
-    ) -> ActiveOverride:
+    ) -> PlacedOverride:
         """Place an override, superseding any active one on the same target.
 
         Superseding rather than rejecting: the operator pressing "off for 30
         minutes" again clearly means the new thirty minutes, and making them
         cancel first would be ceremony.
+
+        Returns the placed hold *and* whatever it displaced, because a
+        supersede is an ending the audit trail must show — the API records
+        ``override.created`` for the new one and needs the old one's id to
+        record ``override.released`` beside it. Before this the trail showed
+        holds starting and never ending (UX review 2026-08-17, E1).
         """
         if duration_s <= 0:
             raise ValueError("duration_s must be > 0")
@@ -167,13 +215,15 @@ class OverrideStore:
         override_id = uuid4()
 
         async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "UPDATE overrides SET released_at = :now, release_reason = 'superseded' "
-                    "WHERE target = :target AND released_at IS NULL"
-                ),
-                {"now": issued, "target": target},
-            )
+            displaced = (
+                await conn.execute(
+                    text(
+                        "UPDATE overrides SET released_at = :now, release_reason = 'superseded' "
+                        "WHERE target = :target AND released_at IS NULL RETURNING id, target"
+                    ),
+                    {"now": issued, "target": target},
+                )
+            ).all()
             await conn.execute(
                 text(
                     "INSERT INTO overrides (id, target, level, reason, created_at, expires_at, "
@@ -199,24 +249,34 @@ class OverrideStore:
             transition=transition,
         )
         active.arm(wall_now=issued)
-        return active
+        return PlacedOverride(
+            override=active,
+            superseded=tuple(
+                ReleasedOverride(id=UUID(str(row[0])), target=str(row[1])) for row in displaced
+            ),
+        )
 
-    async def load_active(self, *, now: datetime | None = None) -> list[ActiveOverride]:
+    async def load_active(self, *, now: datetime | None = None) -> WakeReport:
         """Overrides still owed at wake, lapsing any that aged out while down.
 
         This is the lapse-on-wake rule. Anything whose deadline passed during
-        the outage is closed here and never applied.
+        the outage is closed here and never applied. What was lapsed is
+        reported alongside the survivors so the caller can audit it — the
+        store cannot, and an ending nobody records is how a log ends up
+        showing holds that start and never finish.
         """
         wall_now = now or datetime.now(UTC)
 
         async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "UPDATE overrides SET released_at = :now, release_reason = 'lapsed' "
-                    "WHERE released_at IS NULL AND expires_at <= :now"
-                ),
-                {"now": wall_now},
-            )
+            lapsed = (
+                await conn.execute(
+                    text(
+                        "UPDATE overrides SET released_at = :now, release_reason = 'lapsed' "
+                        "WHERE released_at IS NULL AND expires_at <= :now RETURNING id, target"
+                    ),
+                    {"now": wall_now},
+                )
+            ).all()
             rows = (
                 await conn.execute(
                     text(
@@ -237,7 +297,12 @@ class OverrideStore:
             )
             override.arm(wall_now=wall_now)
             live.append(override)
-        return live
+        return WakeReport(
+            live=live,
+            lapsed=tuple(
+                ReleasedOverride(id=UUID(str(row[0])), target=str(row[1])) for row in lapsed
+            ),
+        )
 
     async def release(
         self, override_id: UUID, reason: ReleaseReason, *, now: datetime | None = None

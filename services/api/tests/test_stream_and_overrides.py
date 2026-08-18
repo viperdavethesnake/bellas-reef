@@ -234,6 +234,53 @@ class TestOverrideEndpoints:
 
         assert run(scenario) == 404
 
+    def test_a_superseding_hold_audits_the_ending_of_the_one_it_displaces(self) -> None:
+        """E1 (UX review 2026-08-17): the log showed three "started" and no
+        "ended" for one light re-held twice, because supersede — the store's
+        own release reason — was never audited. The API knows exactly what
+        it displaced (``PlacedOverride.superseded``, captured atomically with
+        the insert) and records the ending beside the new beginning, in the
+        same event a manual release writes, so the trail reads as one."""
+
+        async def scenario() -> tuple[list[tuple[str, dict[str, Any], str]], str, str]:
+            engine = await fresh_engine()
+            await seed_devices(engine)
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(engine, app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                first = (
+                    await c.post(
+                        "/api/v1/overrides",
+                        headers=headers,
+                        json={"target": "led-blue", "duty": 0.0, "duration_s": 600},
+                    )
+                ).json()
+                second = (
+                    await c.post(
+                        "/api/v1/overrides",
+                        headers=headers,
+                        json={"target": "led-blue", "duty": 0.5, "duration_s": 600},
+                    )
+                ).json()
+            await engine.dispose()
+            return audit.records, first["id"], second["id"]
+
+        records, first_id, second_id = run(scenario)
+        events = [(e, c) for e, _, c in records if e.startswith("override.")]
+        assert events == [
+            ("override.created", "command"),
+            ("override.released", "command"),
+            ("override.created", "command"),
+        ], "the ending of the first hold is recorded before the second begins"
+        released = next(d for e, d, _ in records if e == "override.released")
+        assert released["override_id"] == first_id
+        assert released["target"] == "led-blue"
+        assert released["reason"] == "superseded"
+        assert released["superseded_by"] == second_id
+
     def test_an_untrusted_clock_returns_503_not_a_broken_override(self) -> None:
         """A deadline from a clock about to be stepped is not the duration the
         operator asked for, so the API refuses rather than storing a wrong one."""
