@@ -428,3 +428,34 @@ to actually do.
 
 Everything in Tier C and D is worth more in aggregate and costs an order of magnitude more. None of it
 is urgent.
+
+---
+
+## 8. Tier E — answers (2026-08-18)
+
+Answered from the code and the platform docs, not from opinion, so Tier C and D can be scoped
+against facts. Written by Claude, ruled by David where marked. Line references are to the commits on
+`main` at 2026-08-18 (`10690ba`) and iOS `main` (`65cfc73`).
+
+| # | Answer | Consequence |
+|---|---|---|
+| **E1** | **Audit gap, not an engine bug.** The DB closes a superseded hold (`db/bellasreef_db/overrides.py:172`, `release_reason='superseded'`) and the engine expires them (`control_engine/app.py:396`), but the audit sink fires only for `override.created` (API, on place) and `override.released` (API, on the manual DELETE). Supersede, expiry and lapse-on-wake write no audit row. | A9 is explained: three "started" is a light re-held twice. Backend fix, small: emit `override.released` with `reason=superseded` from the API create path when it displaces a hold, and from the engine's `publish_audit` on expiry/lapse. Also changes A8's "almost entirely override commands" — endings will appear. D2's shape is unaffected. |
+| **E2** | **Pending David's ruling.** Prior from the project record: home hobbyist, one tank; ceiling ≈ 16 channels per PCA9685 board + 4 RP1 channels + a few probes — dozens, not hundreds. | Gates all of Tier C. |
+| **E3** | **Client constant, not hub-exposed.** `MIN_USABLE_DUTY = 0.08` lives in hardware-io (`drivers/dimming.py:42`); the app's footer "Below 8% this dimmer is off" is a hand-copied string. Nothing on the wire carries the floor. | A6 may clamp/shade client-side today so long as it reads one constant. The honest fix — the floor as a per-channel fact on the wire (it is a property of the fixture, not of every dimmer) — is a contract item and belongs with the C1/C2 Hardware design. |
+| **E4** | **AlarmKit cannot be fired by a remote event.** Per Apple's AlarmKit documentation an alarm is scheduled by the app: `Alarm.Schedule.fixed(Date)`, `.relative(time, repeats)`, or a countdown that starts immediately when no schedule is given. There is no push-triggered path. A silent push waking the app to schedule one is opportunistic and rate-limited by iOS — not acceptable for a temperature excursion. Unverified: whether a Notification Service Extension may call `AlarmManager` at all; assume not until checked. | AlarmKit does **not** replace the critical-alert entitlement path for hub-originated alerts. D1's entitlement paperwork stands. AlarmKit is the right tool only for alarms the app itself sets (a hold-expiry countdown, say). |
+| **E5** | **Convert — and it already does, correctly.** Load displays °C in the on-screen unit, save parses back to °C, and the clear-margin is treated as a delta (× 9/5, no +32 shift) both ways (`SensorDetailSheet.swift:159–186`). Preferences are device-local `UserDefaults`, so the unit cannot change under an open sheet from another device; only `.automatic` following a Locale change mid-edit could, and that is negligible. | No livestock-risk conversion bug found. The sheet's `(°F)` label is honest. Nothing A-tier here. |
+| **E6** | **Immediate and device-local.** "Make primary" writes `UserDefaults` on tap (`Preferences.primarySensorId` `didSet`), is not Save-gated, and Cancel does not undo it. | The ambiguity is real: an immediate action inside a Cancel/Save form. Presentation fix — move it out of the form or label it as immediate. B-tier one-liner. |
+
+Also recorded from the same pass, so it is not re-derived:
+
+- The two backend items in §5 (threshold-clear latch; `forget_device` bare DELETE) were independently
+  found on 2026-08-17 and are unfixed. Both are small backend PRs.
+- A6 is half-solved on the wire since #42: `snap_duty` is proven end to end (5 % commanded → 0 V on
+  both silicons, CLAUDE.md Stage 2). The reviewer's actual point stands — the slider still lets you
+  pick it.
+- §6 channel numbering: 1-based display was David's ruling on 2026-08-17 12:11 (wire and bindings
+  stay 0-based; the caption warns). The reviewer guessed there was a reason; there was. Whether the
+  "position label at adoption" alternative is worth it is a C4-adjacent design question, not a revert.
+- Chip state on the wire (PRE_SCALE / frequency / INVRT / initialised, per chip) was ruled 2026-08-18:
+  **option A**, a per-chip Hardware surface on the System tab — the backend half of C1/C2, designed
+  there. Not a key in the capability `detail` (identity only, per #38), not a field on the device row.
