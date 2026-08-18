@@ -81,9 +81,20 @@ persisted only for restart re-arm).
 ## 5. Slew limiting **[schema-now knob, v1-implement]**
 
 One global config knob: max Δduty/second. Applies to convergence after
-restart, config edits mid-ramp, and override release alike — no visual pop,
-no 0→80% slam over livestock, one mechanism for all three causes. Engine-side
-(it shapes *intent*); the driver's 8% floor and snap-to-0 remain driver facts.
+restart, config edits mid-ramp, and schedule-driven or unattended movement
+generally — no visual pop, no 0→80% slam over livestock, one mechanism for
+all of those causes. Engine-side (it shapes *intent*); the driver's 8% floor
+and snap-to-0 remain driver facts.
+
+An operator hold is the exception, not a fourth cause folded into the same
+mechanism: it carries its own `transition` (spec 2026-08-17,
+`docs/superpowers/specs/2026-08-17-hold-transition-design.md`), chosen per
+hold from the app. A `ramp` hold still slews at the global rate on both
+ends — arrival and release/expiry alike — the same as any other movement
+above. A `snap` hold is exempt at both ends: it arrives in one step and
+releases or expires in one step to the resting target, regardless of the
+configured slew. The driver's 8% floor and snap-to-0 apply after either
+path, unchanged.
 
 ## 6. Non-goals (v1)
 

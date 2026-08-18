@@ -93,7 +93,9 @@ class _FakeOverrideStore(OverrideStore):
         # read; it never hands back an object it returned before. Mirroring
         # that is what lets these tests see whether the engine keeps its own
         # armed deadline or takes whatever the latest read says.
-        return ActiveOverride(id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at)
+        return ActiveOverride(
+            id=o.id, target=o.target, duty=o.duty, expires_at=o.expires_at, transition=o.transition
+        )
 
     async def load_active(self, *, now: datetime | None = None) -> list[ActiveOverride]:
         # Same contract as the Postgres one: lapse-on-wake by *wall* clock,
@@ -372,6 +374,50 @@ class TestHeldUnprofiledChannelPublishes:
         asyncio.run(engine._tick(datetime.now(UTC)))
         assert [c.actuator_id for c in published] == ["pi-pwm-0", "pi-pwm-0"]
         assert published[1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
+
+    def test_snap_hold_arrives_and_releases_in_one_tick_each(self) -> None:
+        """The one seam ``_tick`` owns: turning a stored ``ActiveOverride``'s
+        ``transition`` into the scheduler's ``HeldTarget``. Built directly
+        rather than via ``engine_with_fake_publisher`` because that fixture
+        does not expose ``max_duty_delta_per_s``, and this test needs a slew
+        small enough that a *ramp* hold could not reach duty 1.0 in a single
+        tick — so a snap hold arriving at 1.0 immediately, and releasing back
+        to 0.0 immediately, is proof the transition survived the seam, not
+        an artefact of an unconfigured slew.
+
+        A hardcoded ``HeldTarget(o.duty, "ramp")`` in ``_tick`` would pass
+        every other test in this file, because ``ActiveOverride.transition``
+        defaults to ``"ramp"`` — this is the one that would catch it, both by
+        the arrival duty (a 0.01/s ramp could not reach 1.0 in one tick) and
+        by the release reason (only a remembered "snap" hold releases with
+        reason ``"release"``; a ramp hold's release is an ordinary "converge"
+        or "ramp").
+        """
+        engine = ControlEngine([profile()], metrics_port=0, max_duty_delta_per_s=0.01)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        published = fake.published
+        # "pi-pwm-0" is adopted but has no entry in the "led-blue" lighting
+        # profile — the same adopted-but-unprofiled shape as this class's
+        # other tests.
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        engine._held["pi-pwm-0"] = ActiveOverride(
+            id=uuid4(),
+            target="pi-pwm-0",
+            duty=1.0,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            transition="snap",
+        )
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0"]
+        assert published[0].level.duty == pytest.approx(1.0)  # type: ignore[union-attr]
+        assert published[0].reason == "lighting:hold"
+
+        del engine._held["pi-pwm-0"]  # what an expiry/release leaves behind
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pi-pwm-0", "pi-pwm-0"]
+        assert published[1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
+        assert published[1].reason == "lighting:release"
 
 
 class TestLiveOverridePickup:

@@ -36,7 +36,13 @@ from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import DeviceAssignment
-from bellasreef_db import AlertRecord, ClockUntrustedError, OverrideStore, PostgresAlertStore
+from bellasreef_db import (
+    AlertRecord,
+    ClockUntrustedError,
+    OverrideStore,
+    PostgresAlertStore,
+    Transition,
+)
 from bellasreef_service import configure_logging, get_logger
 from fastapi import (
     Depends,
@@ -540,6 +546,11 @@ class OverrideRequest(BaseModel):
     duty: float = Field(ge=0.0, le=1.0)
     duration_s: float = Field(gt=0.0, le=86400.0)
     reason: str | None = Field(default=None, max_length=256)
+    #: How the light moves to this level and back: "snap" (one step) or
+    #: "ramp" (the engine's global slew). Governs both ends of the hold —
+    #: arrival and release/expiry (spec 2026-08-17). Defaults to "ramp",
+    #: which is what every client before 3.8.0 got.
+    transition: Transition = "ramp"
 
 
 class OverrideView(BaseModel):
@@ -549,6 +560,7 @@ class OverrideView(BaseModel):
     duty: float
     expires_at: datetime
     expires_in_s: float
+    transition: Transition
 
 
 @dataclass
@@ -1876,6 +1888,7 @@ def build_app(
                 duty=o.duty,
                 expires_at=o.expires_at,
                 expires_in_s=max(0.0, round((o.expires_at - now).total_seconds(), 1)),
+                transition=o.transition,
             )
             for o in await overrides.list_active()
         ]
@@ -1914,7 +1927,11 @@ def build_app(
 
         try:
             placed = await overrides.create(
-                body.target, body.duty, body.duration_s, reason=body.reason
+                body.target,
+                body.duty,
+                body.duration_s,
+                reason=body.reason,
+                transition=body.transition,
             )
         except ClockUntrustedError as exc:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
@@ -1929,6 +1946,7 @@ def build_app(
                 "duty": placed.duty,
                 "expires_at": placed.expires_at.isoformat(),
                 "actor": str(actor),
+                "transition": placed.transition,
             },
             category="command",
         )
@@ -1938,6 +1956,7 @@ def build_app(
             duty=placed.duty,
             expires_at=placed.expires_at,
             expires_in_s=round(body.duration_s, 1),
+            transition=placed.transition,
         )
 
     @app.delete(

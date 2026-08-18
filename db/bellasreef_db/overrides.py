@@ -31,14 +31,21 @@ import time as _time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Final, Literal
 from uuid import UUID, uuid4
 
 from bellasreef_service import clock_is_trusted
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-__all__ = ["ActiveOverride", "ClockUntrustedError", "OverrideStore", "ReleaseReason"]
+__all__ = [
+    "TRANSITIONS",
+    "ActiveOverride",
+    "ClockUntrustedError",
+    "OverrideStore",
+    "ReleaseReason",
+    "Transition",
+]
 
 
 class ClockUntrustedError(RuntimeError):
@@ -46,6 +53,24 @@ class ClockUntrustedError(RuntimeError):
 
 
 ReleaseReason = Literal["expired", "lapsed", "manual", "superseded"]
+
+#: How the engine moves the light to a held level and back. "snap" is one
+#: step; "ramp" is the global slew. Governs both ends of the hold (spec
+#: 2026-08-17). Kept beside ReleaseReason because the API and the engine
+#: both import it from here — one source of truth per vocabulary.
+Transition = Literal["snap", "ramp"]
+TRANSITIONS: Final[frozenset[str]] = frozenset({"snap", "ramp"})
+
+
+def _transition(raw: object) -> Transition:
+    value = str(raw)
+    if value == "snap":
+        return "snap"
+    if value == "ramp":
+        return "ramp"
+    # The CHECK constraint makes this unreachable; failing loudly beats
+    # silently ramping a hold the operator asked to snap.
+    raise ValueError(f"overrides.transition holds {value!r}, outside {sorted(TRANSITIONS)}")
 
 
 @dataclass(slots=True)
@@ -56,6 +81,10 @@ class ActiveOverride:
     target: str
     duty: float
     expires_at: datetime
+    #: "snap" or "ramp" — see :data:`Transition`. Defaults to "ramp" only so
+    #: dataclass construction sites predating the field keep working; every
+    #: store read sets it explicitly from the row.
+    transition: Transition = "ramp"
     #: Monotonic deadline, set when this process armed it. None for an override
     #: loaded from the database but not yet re-armed.
     monotonic_deadline: float | None = None
@@ -110,6 +139,7 @@ class OverrideStore:
         duration_s: float,
         *,
         reason: str | None = None,
+        transition: Transition = "ramp",
         now: datetime | None = None,
     ) -> ActiveOverride:
         """Place an override, superseding any active one on the same target.
@@ -122,6 +152,8 @@ class OverrideStore:
             raise ValueError("duration_s must be > 0")
         if not 0.0 <= duty <= 1.0:
             raise ValueError("duty must be within 0.0-1.0")
+        if transition not in TRANSITIONS:
+            raise ValueError(f"transition must be one of {sorted(TRANSITIONS)}, got {transition!r}")
         trusted = self._clock_trusted_override or clock_is_trusted
         if not trusted():
             raise ClockUntrustedError(
@@ -144,8 +176,9 @@ class OverrideStore:
             )
             await conn.execute(
                 text(
-                    "INSERT INTO overrides (id, target, level, reason, created_at, expires_at) "
-                    "VALUES (:id, :target, CAST(:level AS JSONB), :reason, :created, :expires)"
+                    "INSERT INTO overrides (id, target, level, reason, created_at, expires_at, "
+                    "transition) VALUES (:id, :target, CAST(:level AS JSONB), :reason, "
+                    ":created, :expires, :transition)"
                 ),
                 {
                     "id": override_id,
@@ -154,10 +187,17 @@ class OverrideStore:
                     "reason": reason,
                     "created": issued,
                     "expires": expires_at,
+                    "transition": transition,
                 },
             )
 
-        active = ActiveOverride(id=override_id, target=target, duty=duty, expires_at=expires_at)
+        active = ActiveOverride(
+            id=override_id,
+            target=target,
+            duty=duty,
+            expires_at=expires_at,
+            transition=transition,
+        )
         active.arm(wall_now=issued)
         return active
 
@@ -180,7 +220,7 @@ class OverrideStore:
             rows = (
                 await conn.execute(
                     text(
-                        "SELECT id, target, level, expires_at FROM overrides "
+                        "SELECT id, target, level, expires_at, transition FROM overrides "
                         "WHERE released_at IS NULL"
                     )
                 )
@@ -193,6 +233,7 @@ class OverrideStore:
                 target=str(row[1]),
                 duty=float(row[2]["duty"]),
                 expires_at=row[3],
+                transition=_transition(row[4]),
             )
             override.arm(wall_now=wall_now)
             live.append(override)
@@ -217,7 +258,7 @@ class OverrideStore:
             row = (
                 await conn.execute(
                     text(
-                        "SELECT id, target, level, expires_at FROM overrides "
+                        "SELECT id, target, level, expires_at, transition FROM overrides "
                         "WHERE target = :target AND released_at IS NULL"
                     ),
                     {"target": target},
@@ -230,6 +271,7 @@ class OverrideStore:
             target=str(row[1]),
             duty=float(row[2]["duty"]),
             expires_at=row[3],
+            transition=_transition(row[4]),
         )
 
     async def list_active(self) -> list[ActiveOverride]:
@@ -237,7 +279,7 @@ class OverrideStore:
             rows = (
                 await conn.execute(
                     text(
-                        "SELECT id, target, level, expires_at FROM overrides "
+                        "SELECT id, target, level, expires_at, transition FROM overrides "
                         "WHERE released_at IS NULL ORDER BY created_at"
                     )
                 )
@@ -248,6 +290,7 @@ class OverrideStore:
                 target=str(r[1]),
                 duty=float(r[2]["duty"]),
                 expires_at=r[3],
+                transition=_transition(r[4]),
             )
             for r in rows
         ]

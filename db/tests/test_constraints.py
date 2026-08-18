@@ -12,7 +12,7 @@ and only a real database can demonstrate that.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from helpers import engine, requires_postgres, run
@@ -462,3 +462,34 @@ class TestControlAuthority:
         reading behind it was measured locally or relayed."""
         with pytest.raises(IntegrityError, match="sensor_declares_type_cadence_and_transport"):
             run(lambda: _insert(_device_sql(), **_sensor(transport=None)))
+
+
+class TestOverrideTransition:
+    """Migration 0018 (docs/superpowers/specs/2026-08-17-hold-transition-design.md):
+    overrides.transition is CHECK-constrained to 'snap' or 'ramp'."""
+
+    def _override_sql(self) -> str:
+        return (
+            "INSERT INTO overrides (id, target, level, created_at, expires_at, transition) "
+            "VALUES (:id, :target, CAST(:level AS JSONB), :created, :expires, :transition)"
+        )
+
+    def _row(self, **over: object) -> dict[str, object]:
+        now = datetime.now(UTC)
+        row: dict[str, object] = {
+            "id": uuid.uuid4(),
+            "target": f"light-{uuid.uuid4().hex[:8]}",
+            "level": '{"kind": "pwm", "duty": 0.0}',
+            "created": now,
+            "expires": now + timedelta(minutes=30),
+            "transition": "snap",
+        }
+        row.update(over)
+        return row
+
+    def test_an_unknown_transition_is_rejected(self) -> None:
+        with pytest.raises(IntegrityError, match="override_transition_valid"):
+            run(lambda: _insert(self._override_sql(), **self._row(transition="fade")))
+
+    def test_snap_is_accepted(self) -> None:
+        run(lambda: _insert(self._override_sql(), **self._row(transition="snap")))

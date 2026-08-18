@@ -17,9 +17,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from bellasreef_db import Transition
+
 from bellasreef_control_engine.profiles import ChannelProfile
 
-__all__ = ["SAFE_DUTY", "Intent", "LightingScheduler"]
+__all__ = ["SAFE_DUTY", "HeldTarget", "Intent", "LightingScheduler"]
 
 #: What a channel is assumed to be at when we have no emission history.
 #:
@@ -43,11 +45,31 @@ DEFAULT_REFRESH_S = 300.0
 
 @dataclass(frozen=True, slots=True)
 class Intent:
-    """A decision, not yet a command."""
+    """A decision, not yet a command.
+
+    ``hold`` is the transition of the hold this intent was emitted under, or
+    None when the channel was not held. :meth:`LightingScheduler.mark_emitted`
+    reads it to keep the scheduler's per-channel hold memory exact without
+    :meth:`LightingScheduler.due` mutating anything.
+    """
 
     channel_id: str
     duty: float
     reason: str
+    hold: Transition | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HeldTarget:
+    """An operator hold as the scheduler sees it: a duty, and how to get there.
+
+    ``transition`` is the operator's choice per hold (spec 2026-08-17). "snap"
+    moves in one step regardless of the configured slew; "ramp" is today's
+    slew-limited path. It governs both ends — arrival and release/expiry.
+    """
+
+    duty: float
+    transition: Transition
 
 
 class LightingScheduler:
@@ -78,12 +100,32 @@ class LightingScheduler:
         self._slew = max_duty_delta_per_s
         self._last_duty: dict[str, float] = {}
         self._last_emitted_at: dict[str, datetime] = {}
+        #: Transition of the last hold each channel was emitted under. Written
+        #: and cleared only by mark_emitted (from Intent.hold), so due() stays
+        #: pure. Consulted on the first tick a channel is no longer held: a
+        #: snap hold releases in one step; anything else slews as before.
+        #:
+        #: Asymmetric by design: a stale "ramp" entry can persist when a ramp
+        #: hold ends with the channel already sitting at its resting target —
+        #: release emits no intent in that case, so mark_emitted never runs
+        #: and the entry is never cleared. Harmless: "ramp" is the fallback
+        #: behaviour (both "no entry" and "entry says ramp" take the same
+        #: path in _emit_for), so the only effect of the stale entry is that
+        #: a later ramp hold at the same duty is not re-announced with reason
+        #: "hold" — it was already the behaviour with no entry at all. A
+        #: "snap" entry never goes stale the same way, because due() keeps a
+        #: channel with a remembered snap hold in the synthetic set even once
+        #: it is unprofiled and no longer held, so the one-step release is
+        #: always surfaced — and a snap release always emits one command,
+        #: even when the channel already sits at the resting duty, precisely
+        #: because that emission is what clears the memory.
+        self._last_hold: dict[str, Transition] = {}
 
     @property
     def channel_ids(self) -> tuple[str, ...]:
         return tuple(p.channel_id for p in self._profiles)
 
-    def due(self, now: datetime, overrides: Mapping[str, float] | None = None) -> list[Intent]:
+    def due(self, now: datetime, overrides: Mapping[str, HeldTarget] | None = None) -> list[Intent]:
         """Intents that should be published at ``now``.
 
         Pure: same clock, same state, same answer. Calling it does not mutate
@@ -97,9 +139,10 @@ class LightingScheduler:
         view they are the same event: the target moved and the light must not
         pop to it.
 
-        ``overrides`` maps channel to a held duty. Passing them in rather than
-        reaching for them keeps this function pure and testable against fixed
-        clocks, which is the property the whole module is arranged around.
+        ``overrides`` maps channel to a :class:`HeldTarget` — the held duty and
+        how to move to it. Passing them in rather than reaching for them keeps
+        this function pure and testable against fixed clocks, which is the
+        property the whole module is arranged around.
 
         A held channel with no configured profile — every channel adopted
         through the app, spec 2026-08-15 — is not silently dropped: it is
@@ -121,11 +164,12 @@ class LightingScheduler:
         held = overrides or {}
         intents: list[Intent] = []
         for profile in self._profiles:
-            # An override outranks the schedule while it is owed. Slew still
-            # applies on the way in and on release — from the tank's point of
-            # view an override ending is just another target change.
-            target = held.get(profile.channel_id, profile.duty_at(now))
-            intent = self._emit_for(profile.channel_id, target, now)
+            # An override outranks the schedule while it is owed. How the
+            # channel moves — snap or slew — is the hold's decision, on the
+            # way in and on release alike.
+            intent = self._emit_for(
+                profile.channel_id, profile.duty_at(now), now, hold=held.get(profile.channel_id)
+            )
             if intent is not None:
                 intents.append(intent)
 
@@ -133,55 +177,84 @@ class LightingScheduler:
         # channel the config never mentions (every channel adopted through
         # the app, spec 2026-08-15). Semantics: a constant schedule of
         # SAFE_DUTY that the override outranks — release is just another
-        # target change, and the same slew/deadband/convergence machinery
-        # applies. Worth considering = currently held, or still converging
-        # from a hold that has already ended; once converged and released it
-        # drops out on its own and stays quiet.
+        # target change. Worth considering = currently held, still converging
+        # from a hold that has already ended, or remembered as a snap hold
+        # whose one-step release has not been emitted yet; once released and
+        # converged it drops out on its own and stays quiet.
         profiled = {p.channel_id for p in self._profiles}
         synthetic = (
-            set(held) | {cid for cid, duty in self._last_duty.items() if duty != SAFE_DUTY}
+            set(held)
+            | {cid for cid, duty in self._last_duty.items() if duty != SAFE_DUTY}
+            | {cid for cid, t in self._last_hold.items() if t == "snap"}
         ) - profiled
         for channel_id in sorted(synthetic):
-            target = held.get(channel_id, SAFE_DUTY)
-            intent = self._emit_for(channel_id, target, now)
+            intent = self._emit_for(channel_id, SAFE_DUTY, now, hold=held.get(channel_id))
             if intent is not None:
                 intents.append(intent)
 
         return intents
 
-    def _emit_for(self, channel_id: str, target: float, now: datetime) -> Intent | None:
+    def _emit_for(
+        self, channel_id: str, resting: float, now: datetime, *, hold: HeldTarget | None
+    ) -> Intent | None:
         """The shared per-channel emission decision.
 
-        Given a target duty (a profile's curve, or an unprofiled channel's
-        synthetic constant-SAFE_DUTY schedule), decide whether — and with what
-        reason — a channel is due. Cold-start, slew-limited convergence,
-        deadband suppression and periodic refresh are all target-agnostic, so
+        ``resting`` is what the channel should be at when nobody holds it (a
+        profile's curve, or SAFE_DUTY for an unprofiled channel); ``hold`` is
+        the operator's override if one is owed. Cold-start, convergence,
+        deadband suppression and periodic refresh are target-agnostic, so
         this is the one place that logic lives; both loops in :meth:`due` call
         it rather than duplicating the block.
+
+        Transition rule (spec 2026-08-17): a target that comes from a hold
+        moves the way that hold says. A snap hold's intent *is* the target;
+        a ramp hold goes through :meth:`_limit` like a schedule. A hold's
+        arrival, or a change of transition while held, is always announced
+        (reason ``hold``) even inside the deadband, so that after
+        :meth:`mark_emitted` the hold memory is exact. On the first tick a
+        channel is no longer held, a remembered snap hold releases to
+        ``resting`` in one step (reason ``release``); anything else slews.
         """
         previous = self._last_duty.get(channel_id)
         cold = previous is None
         if previous is None:
             previous = SAFE_DUTY
-
         last_at = self._last_emitted_at.get(channel_id, now)
-        duty = self._limit(previous, target, (now - last_at).total_seconds())
-        converging = duty != target
+        dt_s = (now - last_at).total_seconds()
+        remembered = self._last_hold.get(channel_id)
 
+        if hold is None:
+            if remembered == "snap":
+                return Intent(channel_id, resting, "release")
+            target = resting
+            duty = self._limit(previous, target, dt_s)
+            tag: Transition | None = None
+        else:
+            target = hold.duty
+            duty = target if hold.transition == "snap" else self._limit(previous, target, dt_s)
+            tag = hold.transition
+            if remembered != hold.transition:
+                # Arrival, or a supersede that changed the mode: announce it,
+                # deadband or not, so mark_emitted records the new memory.
+                return Intent(channel_id, duty, "hold", tag)
+            if hold.transition == "snap" and duty != previous:
+                # A snap hold re-held at a new duty: still a jump, still a hold.
+                return Intent(channel_id, duty, "hold", tag)
+
+        converging = duty != target
         if cold:
-            return Intent(channel_id, duty, "initial")
+            return Intent(channel_id, duty, "initial", tag)
         if converging:
             # Mid-convergence. Emit even if this step is smaller than the
             # deadband, or a slow slew would stall short of the target and
             # sit there — the deadband exists to suppress noise, not
             # progress.
-            return Intent(channel_id, duty, "converge")
+            return Intent(channel_id, duty, "converge", tag)
         if abs(duty - previous) >= self._deadband:
-            return Intent(channel_id, duty, "ramp")
+            return Intent(channel_id, duty, "ramp", tag)
 
-        elapsed = (now - last_at).total_seconds()
-        if channel_id not in self._last_emitted_at or elapsed >= self._refresh_s:
-            return Intent(channel_id, duty, "refresh")
+        if channel_id not in self._last_emitted_at or dt_s >= self._refresh_s:
+            return Intent(channel_id, duty, "refresh", tag)
         return None
 
     def _limit(self, previous: float, target: float, dt_s: float) -> float:
@@ -194,9 +267,19 @@ class LightingScheduler:
         return previous + allowed if target > previous else previous - allowed
 
     def mark_emitted(self, intent: Intent, at: datetime) -> None:
-        """Record that an intent was actually published."""
+        """Record that an intent was actually published.
+
+        Also the only writer of the hold memory: an intent emitted under a
+        hold records that hold's transition; an intent emitted while not held
+        (a release, or ordinary convergence back to the resting target)
+        clears it. A hold whose intent never went out is never remembered.
+        """
         self._last_duty[intent.channel_id] = intent.duty
         self._last_emitted_at[intent.channel_id] = at
+        if intent.hold is None:
+            self._last_hold.pop(intent.channel_id, None)
+        else:
+            self._last_hold[intent.channel_id] = intent.hold
 
     def reset(self) -> None:
         """Forget emission history for every channel.
@@ -206,6 +289,7 @@ class LightingScheduler:
         """
         self._last_duty.clear()
         self._last_emitted_at.clear()
+        self._last_hold.clear()
 
     def forget(self, channel_id: str) -> None:
         """Forget emission history for one channel.
@@ -235,6 +319,11 @@ class LightingScheduler:
         cold start once ``_last_duty`` is populated. Clearing it here forces
         the first post-readoption intent back to "initial", converging from
         :data:`SAFE_DUTY` like any other cold start.
+
+        The hold memory goes with it — a re-adopted channel must not
+        snap-release on the strength of a hold that ended before its driver
+        was rebuilt.
         """
         self._last_duty.pop(channel_id, None)
         self._last_emitted_at.pop(channel_id, None)
+        self._last_hold.pop(channel_id, None)
