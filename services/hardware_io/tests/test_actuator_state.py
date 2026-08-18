@@ -63,12 +63,22 @@ class FakeSpinePublisher:
         self.states: list[ActuatorState] = []
         self.raises = raises
         self.attempts = 0
+        self.closed = False
 
     async def publish_state(self, state: ActuatorState) -> None:
         self.attempts += 1
         if self.raises:
             raise RuntimeError("spine unreachable")
+        if self.closed:
+            # Mirrors the real Spine: close() drops the JetStream context and
+            # any publish after it raises from the ``js`` property. A test
+            # that lets a closed spine record states would prove nothing
+            # about shutdown ordering.
+            raise RuntimeError("spine not connected")
         self.states.append(state)
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class NoReadBackActuator(FakeActuator):
@@ -604,6 +614,37 @@ def test_shutdown_event_that_reached_safe_state_is_published() -> None:
     states = run(scenario)
     assert len(states) == 1
     assert states[0].reason == "safe_state"
+
+
+def test_shutdown_publishes_each_actuator_safe_state_before_closing_the_spine() -> None:
+    """The real ``shutdown()`` path, not a hand-injected event.
+
+    Item 3 put "shutdown" among the autonomous trips, then app.py's own
+    comment conceded it never reached the wire: ``shutdown()`` closed the
+    spine *before* ``supervisor.stop()`` drove the actuators safe, so every
+    shutdown state was published into a closed connection — one WARNING with
+    a traceback per actuator on every clean stop (seen on the 2026-08-17
+    adoption restart), and a real transition (a light going dark) that the
+    API never learned about until the next process's startup publish. The
+    supervisor must stop while the spine is live; the spine closes last.
+    """
+
+    async def scenario() -> tuple[list[ActuatorState], bool]:
+        service = HardwareIO(metrics_port=0)
+        service.supervisor.register(registration("light-a"), FakeActuator("light-a", OFF))
+        service.supervisor.register(registration("light-b"), FakeActuator("light-b", OFF))
+        await service.supervisor.start()
+        spine = FakeSpinePublisher()
+        service.spine = spine  # type: ignore[assignment]
+
+        await service.shutdown()
+        return list(spine.states), spine.closed
+
+    states, closed = run(scenario)
+    assert closed is True
+    shutdown_states = [s for s in states if s.reason == "safe_state"]
+    assert {s.actuator_id for s in shutdown_states} == {"light-a", "light-b"}
+    assert all(s.level == OFF for s in shutdown_states)
 
 
 def test_on_safety_event_for_an_unregistered_actuator_does_not_raise() -> None:
