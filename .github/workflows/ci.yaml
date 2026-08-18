@@ -93,16 +93,28 @@ jobs:
       # to match the server container: pg_dump refuses to dump a server newer
       # than itself, and the runner image ships 16. Without this the suite
       # skips, and a skip for a missing environment fails the gate.
+      #
+      # Bounded, and every network fetch carries its own timeout: on 2026-08-18
+      # this step hung twice in a row, 40 min then 10+, on a runner where it
+      # normally takes seconds, and a hung step shows no log until the job
+      # ends — so there was nothing to read. A hard failure with output beats
+      # an open-ended wait. `set -x` so the log names the command that stalled.
       - name: Install PostgreSQL 17 client
+        timeout-minutes: 5
         run: |
+          set -x
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          sudo curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
           https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120 \
+            install -y --no-install-recommends postgresql-client-17
           pg_dump --version
 
       - name: Sync workspace
