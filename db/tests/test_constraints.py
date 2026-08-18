@@ -12,7 +12,7 @@ and only a real database can demonstrate that.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from helpers import engine, requires_postgres, run
@@ -481,7 +481,7 @@ class TestOverrideTransition:
             "target": f"light-{uuid.uuid4().hex[:8]}",
             "level": '{"kind": "pwm", "duty": 0.0}',
             "created": now,
-            "expires": now,
+            "expires": now + timedelta(minutes=30),
             "transition": "snap",
         }
         row.update(over)
