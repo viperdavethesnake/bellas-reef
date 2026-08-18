@@ -327,3 +327,47 @@ def test_refresh_uses_the_publish_time_not_the_decision_time() -> None:
     s.mark_emitted(intent, published_at)
     assert s.due(published_at + timedelta(seconds=99)) == []
     assert s.due(published_at + timedelta(seconds=101)) != []
+
+
+class TestSlewArrival:
+    """The last step of a slew must land, even when the residual is inside
+    the deadband (bench 2026-08-17: a ramp hold to 100 % published 0.9956
+    and then nothing — 3.294 V on the meter, "Now 99 %" in the app — until
+    the 300 s refresh). The deadband suppresses noise, not arrival."""
+
+    def test_final_slew_step_inside_deadband_still_lands(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)  # default deadband 0.005
+        [first] = s.due(T0, {"pi-pwm-0": ramp_hold(1.0)})
+        s.mark_emitted(first, T0)
+        t_almost = T0 + timedelta(seconds=99.56)
+        [almost] = s.due(t_almost, {"pi-pwm-0": ramp_hold(1.0)})
+        assert almost.duty == pytest.approx(0.9956)
+        assert almost.reason == "converge"
+        s.mark_emitted(almost, t_almost)
+        t_arrive = t_almost + timedelta(seconds=1)
+        [arrived] = s.due(t_arrive, {"pi-pwm-0": ramp_hold(1.0)})
+        assert (arrived.duty, arrived.reason) == (1.0, "converge")
+        s.mark_emitted(arrived, t_arrive)
+        # at target: quiet until refresh
+        assert s.due(t_arrive + timedelta(seconds=1), {"pi-pwm-0": ramp_hold(1.0)}) == []
+
+    def test_final_step_of_a_release_slew_lands_too(self) -> None:
+        s = LightingScheduler([], max_duty_delta_per_s=0.01)
+        [held] = s.due(T0, {"pi-pwm-0": snap(1.0)})
+        s.mark_emitted(held, T0)
+        # supersede with a ramp hold at 0.0044: one slew step short of dark
+        [step] = s.due(T1, {"pi-pwm-0": ramp_hold(0.0)})
+        s.mark_emitted(step, T1)  # 0.95, hold
+        t = T1
+        for _ in range(94):
+            t = t + timedelta(seconds=1)
+            [i] = s.due(t, {"pi-pwm-0": ramp_hold(0.0)})
+            s.mark_emitted(i, t)
+        assert i.duty == pytest.approx(0.01)
+        # release: 0.01 → 0.0 is 0.01, exactly at the allowance; then nothing
+        # must be left short — the channel must reach 0.0 and go quiet
+        t = t + timedelta(seconds=1)
+        [rel] = s.due(t, {})
+        assert rel.duty == pytest.approx(0.0)
+        s.mark_emitted(rel, t)
+        assert s.due(t + timedelta(seconds=1), {}) == []
