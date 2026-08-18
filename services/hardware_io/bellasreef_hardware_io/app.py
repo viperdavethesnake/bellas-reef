@@ -404,12 +404,24 @@ class HardwareIO:
     async def shutdown(self) -> None:
         self.liveness.stop()
         await self.httpd.stop()
-        if self.spine is not None:
-            await self.spine.close()
+        # Actuators safe first, spine last. supervisor.stop() drives every
+        # actuator to its declared safe state and emits a "shutdown" trip per
+        # actuator, which _on_safety_event publishes as an ActuatorState — a
+        # real transition (a light going dark) that the API and engine need to
+        # see. Closing the spine before this ran meant every one of those
+        # publishes hit a closed connection: a WARNING with a traceback per
+        # actuator on each clean stop, and a "Now" that stayed at the last
+        # held duty until the next process's startup publish. drive_safe()
+        # itself never touches the spine, so nothing here delays safety; the
+        # publish is bounded by _PUBLISH_TIMEOUT_S either way. The command
+        # consumer is pull-based from _loop, which has already exited, so no
+        # command can land between the safe drive and the close.
         try:
             await self.supervisor.stop()
         except ExceptionGroup:
             log.exception("one or more actuators failed to reach safe state on shutdown")
+        if self.spine is not None:
+            await self.spine.close()
         log.info("stopped")
 
     def request_stop(self) -> None:
@@ -733,10 +745,11 @@ class HardwareIO:
     #: an actuator to its safe state, as opposed to merely refusing a command
     #: (clock_untrusted, command_expired, latched, unknown_actuator — none of
     #: those move anything, so publishing a state for them would claim a
-    #: transition that never happened). "shutdown" is included per item 3's
-    #: scope, but see the report: by the time supervisor.stop() drives it, the
-    #: spine is already closed in HardwareIO.shutdown(), so in practice this
-    #: one is a no-op today rather than a state that reaches the wire.
+    #: transition that never happened). "shutdown" is a real one: the
+    #: supervisor drives every actuator safe on the way down, and
+    #: HardwareIO.shutdown() stops the supervisor *before* closing the spine
+    #: precisely so these states reach the wire — until 2026-08-18 the order
+    #: was reversed and every shutdown publish failed into a closed spine.
     _AUTONOMOUS_TRIP_REASONS: Final[frozenset[str]] = frozenset(
         {"heartbeat_timeout", "max_runtime_exceeded", "shutdown"}
     )

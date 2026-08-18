@@ -633,8 +633,15 @@ Two things learned on the way, both load-bearing:
    tightened and nothing else changed, `mypy --strict` flagged 33 sites,
    every one a test fake and neither real driver, which is the gap that
    would have caught the PCA9685 at gate time; `app.py` calls `open()`
-   unconditionally now instead of duck-typing it. Still open: announce the
-   chip's read-back PRE_SCALE on the wire so the System tab can show it.
+   unconditionally now instead of duck-typing it. Chip state on the wire
+   (read-back PRE_SCALE / frequency / INVRT / initialised, per chip) — ruled
+   2026-08-18 by David: **option A**, a per-chip Hardware surface on the
+   System tab, not a key in the capability `detail` (which is identity, per
+   #38) and not a field on the adopted device row. It is the backend half of
+   the UX review's Tier C (C1 Hardware leaf, C2 relocating register state —
+   `docs/bellas-reef-ios-ux-review.md`) and is designed there, not shipped
+   standalone. Needs a new message type (contracts MINOR), API store +
+   endpoint, iOS.
 2. **Adopting a channel restarts hardware-io** (`assignment_restart`: "exiting
    to rebuild from registry"), and on the way down it logged `failed to
    publish actuator state … reason=safe_state` for both pi-pwm channels — the
