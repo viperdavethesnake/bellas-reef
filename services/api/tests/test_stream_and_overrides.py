@@ -277,6 +277,57 @@ class TestOverrideEndpoints:
 
         assert run(scenario) == 401
 
+    def test_transition_defaults_to_ramp_and_snap_round_trips(self) -> None:
+        async def scenario() -> dict[str, Any]:
+            engine = await fresh_engine()
+            await seed_devices(engine)
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(engine, app)
+            out: dict[str, Any] = {}
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                omitted = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={"target": "led-blue", "duty": 0.5, "duration_s": 60},
+                )
+                out["omitted"] = omitted.json()
+                snapped = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={
+                        "target": "led-blue",
+                        "duty": 0.0,
+                        "duration_s": 60,
+                        "transition": "snap",
+                    },
+                )
+                out["snapped"] = snapped.json()
+                out["listed"] = (await c.get("/api/v1/overrides", headers=headers)).json()
+                bad = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={
+                        "target": "led-blue",
+                        "duty": 0.0,
+                        "duration_s": 60,
+                        "transition": "fade",
+                    },
+                )
+                out["bad_code"] = bad.status_code
+            await engine.dispose()
+            out["created_details"] = [d for e, d, _ in audit.records if e == "override.created"]
+            return out
+
+        out = run(scenario)
+        assert out["omitted"]["transition"] == "ramp"
+        assert out["snapped"]["transition"] == "snap"
+        assert [o["transition"] for o in out["listed"]] == ["snap"]  # superseded the ramp one
+        assert out["bad_code"] == 422
+        assert [d["transition"] for d in out["created_details"]] == ["ramp", "snap"]
+
 
 class TestAuthFrameParsing:
     def test_a_valid_frame_yields_the_token(self) -> None:
@@ -331,7 +382,9 @@ class TestWebSocketStream:
             from bellasreef_db import OverrideStore
             from bellasreef_hardware_io.spine import Spine
 
-            await OverrideStore(engine).create("led-blue", 0.0, 1800, reason="feed")
+            await OverrideStore(engine).create(
+                "led-blue", 0.0, 1800, reason="feed", transition="snap"
+            )
             spine = Spine(os.environ[_NATS])
             await spine.connect()
             await asyncio.sleep(0.4)  # let the bridge's subscription settle
@@ -367,6 +420,7 @@ class TestWebSocketStream:
             assert frame["override"] is not None, "state frames must carry override context"
             assert frame["override"]["duty"] == pytest.approx(0.0)
             assert frame["override"]["expires_in_s"] > 0
+            assert frame["override"]["transition"] == "snap"
 
         run(engine.dispose)
 

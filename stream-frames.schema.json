@@ -189,13 +189,22 @@
           "format": "uuid",
           "title": "Id",
           "type": "string"
+        },
+        "transition": {
+          "enum": [
+            "snap",
+            "ramp"
+          ],
+          "title": "Transition",
+          "type": "string"
         }
       },
       "required": [
         "id",
         "duty",
         "expires_at",
-        "expires_in_s"
+        "expires_in_s",
+        "transition"
       ],
       "title": "OverrideContext",
       "type": "object"

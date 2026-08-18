@@ -138,6 +138,7 @@ class StreamBridge:
             expires_in_s=max(
                 0.0, round((active.expires_at - datetime.now(UTC)).total_seconds(), 1)
             ),
+            transition=active.transition,
         )
 
     async def subscribe(self) -> asyncio.Queue[str]:

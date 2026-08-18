@@ -1076,13 +1076,22 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "transition": {
+            "enum": [
+              "snap",
+              "ramp"
+            ],
+            "title": "Transition",
+            "type": "string"
           }
         },
         "required": [
           "id",
           "duty",
           "expires_at",
-          "expires_in_s"
+          "expires_in_s",
+          "transition"
         ],
         "title": "OverrideContext",
         "type": "object"
@@ -1114,6 +1123,15 @@
             "maxLength": 64,
             "minLength": 1,
             "title": "Target",
+            "type": "string"
+          },
+          "transition": {
+            "default": "ramp",
+            "enum": [
+              "snap",
+              "ramp"
+            ],
+            "title": "Transition",
             "type": "string"
           }
         },
@@ -1149,6 +1167,14 @@
           "target": {
             "title": "Target",
             "type": "string"
+          },
+          "transition": {
+            "enum": [
+              "snap",
+              "ramp"
+            ],
+            "title": "Transition",
+            "type": "string"
           }
         },
         "required": [
@@ -1156,7 +1182,8 @@
           "target",
           "duty",
           "expires_at",
-          "expires_in_s"
+          "expires_in_s",
+          "transition"
         ],
         "title": "OverrideView",
         "type": "object"
@@ -1626,7 +1653,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "3.7.0"
+    "version": "3.8.0"
   },
   "openapi": "3.1.0",
   "paths": {

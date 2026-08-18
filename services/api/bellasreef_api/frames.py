@@ -24,6 +24,7 @@ from typing import Annotated, Final, Literal
 from uuid import UUID
 
 from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading
+from bellasreef_db.overrides import Transition
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 __all__ = [
@@ -65,6 +66,10 @@ class OverrideContext(BaseModel):
     duty: float = Field(ge=0.0, le=1.0)
     expires_at: datetime
     expires_in_s: float = Field(ge=0.0)
+    #: "snap" or "ramp" — how the engine will move the light when this hold
+    #: ends, as much as how it arrived. Shown on the active-hold row so what
+    #: happens at expiry is legible (spec 2026-08-17).
+    transition: Transition
 
 
 class ReadyFrame(_Frame):
