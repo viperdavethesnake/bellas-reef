@@ -356,13 +356,15 @@ class Pca9685Channel:
     async def open(self) -> None:
         """Bring the channel up: make sure its chip is configured.
 
-        This is the hook hardware-io calls before registering an actuator
-        (``app.py`` duck-types ``driver.open()``, exactly as it does for the
-        RP1 channel). Without it the chip is driven on whatever registers it
-        powered up with or the last process left behind — which is how Stage 2
-        on 2026-08-17 measured every voltage correctly and the frequency at
-        Stage 1's leftover 545 Hz: ``initialise()`` was tested and never
-        called. The chip work is per-chip and idempotent; see
+        This is the ``ActuatorDriver.open()`` hardware-io calls on every
+        actuator before registering it. Without it the chip is driven on
+        whatever registers it powered up with or the last process left
+        behind — which is how Stage 2 on 2026-08-17 measured every voltage
+        correctly and the frequency at Stage 1's leftover 545 Hz:
+        ``initialise()`` was tested and never called, because ``app.py``
+        duck-typed the hook and this class had none. ``open()`` is a
+        required Protocol member since, so that gap is a type error now.
+        The chip work is per-chip and idempotent; see
         :meth:`Pca9685Device.ensure_initialised`.
         """
         await self._device.ensure_initialised()

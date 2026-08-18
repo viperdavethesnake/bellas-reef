@@ -202,6 +202,21 @@ class ActuatorDriver(Protocol):
         """The level this output takes when anything goes wrong."""
         ...
 
+    async def open(self) -> None:
+        """Bring the output up, before it is registered or driven.
+
+        Whatever the hardware needs to be commandable happens here — export a
+        channel, wake a chip, write a prescaler — and hardware-io calls it on
+        every actuator it builds, unconditionally. Required rather than
+        optional because an optional hook is one the type checker cannot see
+        missing: on 2026-08-17 a driver whose chip setup was written and
+        tested shipped without this method, hardware-io duck-typed past the
+        gap, and the bench measured the chip running on whatever the last
+        process had left in it. Must be idempotent for the hardware it
+        touches; a driver with nothing to bring up returns.
+        """
+        ...
+
     async def apply(self, level: ActuatorLevel) -> None:
         """Drive the output to ``level``.
 
