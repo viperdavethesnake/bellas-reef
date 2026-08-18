@@ -4,7 +4,10 @@
 **Input:** `docs/bellas-reef-ios-ux-review.md` (David's review, 2026-08-17) with its §8 Tier E answers.
 **Code audited:** iOS `main` `9f9847f`, backend `main` `d5d4515`.
 **Status:** proposals for David's triage. Items marked *built* are on the iOS branch
-`ux-review/tier-a-b`, one commit per item, for review — nothing is merged.
+`ux-review/tier-a-b` — draft PR viperdavethesnake/bellasreef-ios#9, one commit per item, kit
+157 tests / 31 suites green, installed on the iPhone 17 sim — for review. Nothing is merged.
+Built 2026-08-18 13:20–13:45: A1, A2, A3(3), A4, A5, A6, A7, A8 (client half), A9, B2, B5, B6,
+B8 (two of three), E6.
 
 ## How to read this
 
