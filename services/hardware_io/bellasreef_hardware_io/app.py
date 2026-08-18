@@ -229,16 +229,20 @@ class HardwareIO:
             # open took the temperature probe offline with them, which is a far
             # worse outcome than a dark channel. A light that cannot be opened
             # is dark either way; a hub that will not start monitors nothing.
-            opener = getattr(built.driver, "open", None)
-            if opener is not None:
-                try:
-                    await opener()
-                except Exception:
-                    log.exception(
-                        "actuator could not be opened; skipped",
-                        extra={"actuator_id": built.registration.actuator_id},
-                    )
-                    continue
+            #
+            # ``open()`` is a required member of ``ActuatorDriver``, called
+            # unconditionally: this used to duck-type it, and a driver that
+            # lacked the hook was silently never brought up (the PCA9685,
+            # 2026-08-17). A missing hook is now a ``mypy --strict`` error
+            # in the factory, not a bench finding.
+            try:
+                await built.driver.open()
+            except Exception:
+                log.exception(
+                    "actuator could not be opened; skipped",
+                    extra={"actuator_id": built.registration.actuator_id},
+                )
+                continue
 
             self.supervisor.register(built.registration, built.driver)
             self._registrations.append(built.registration)

@@ -84,3 +84,53 @@ class TestAddressing:
         assert OneWireDevice(device_id="28-0000075d1b2c").device_id.startswith("28-")
         with pytest.raises(ValidationError):
             OneWireDevice(device_id="not-a-1wire-id")
+
+
+class TestActuatorDriverLifecycle:
+    """``open()`` is part of the actuator contract, not a courtesy.
+
+    Stage 2 on 2026-08-17 measured a PCA9685 running on a leftover prescaler
+    because its ``initialise()`` had no caller: hardware-io duck-typed
+    ``driver.open()`` and the channel simply had none. A lifecycle hook that
+    is optional in the Protocol is a hook that ``mypy --strict`` cannot see
+    missing. Making it required moves that failure from the bench to the
+    type checker.
+    """
+
+    def _driver_without_open(self) -> object:
+        class Driver:
+            @property
+            def driver_id(self) -> str:
+                return "d"
+
+            @property
+            def actuator_id(self) -> str:
+                return "a"
+
+            @property
+            def safe_state(self) -> object:
+                return object()
+
+            async def apply(self, level: object) -> None: ...
+
+            async def drive_safe(self) -> None: ...
+
+            async def read_back(self) -> object | None:
+                return None
+
+        return Driver()
+
+    def test_a_driver_without_open_is_not_an_actuator_driver(self) -> None:
+        from bellasreef_contracts.driver import ActuatorDriver
+
+        assert not isinstance(self._driver_without_open(), ActuatorDriver)
+
+    def test_a_driver_with_open_is_an_actuator_driver(self) -> None:
+        from bellasreef_contracts.driver import ActuatorDriver
+
+        base = self._driver_without_open()
+
+        class Driver(type(base)):  # type: ignore[misc]
+            async def open(self) -> None: ...
+
+        assert isinstance(Driver(), ActuatorDriver)

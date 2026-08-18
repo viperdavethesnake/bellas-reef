@@ -120,6 +120,9 @@ class SnappingFakeActuator:
     def safe_state(self) -> ActuatorLevel:
         return self._safe_state
 
+    async def open(self) -> None:
+        pass
+
     async def apply(self, level: ActuatorLevel) -> None:
         assert isinstance(level, PwmLevel)
         self._level = PwmLevel(duty=snap_duty(level.duty))

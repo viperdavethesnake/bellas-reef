@@ -205,6 +205,19 @@ exception as below, and for a stronger reason: the alternative is that every
 registration written before the change silently changed meaning, with no way to
 tell from the data which guarantee a historical record was asserting.
 
+**contracts 4.0.0 makes `open()` a required member of `ActuatorDriver`**
+(docs/contracts/driver-interface.md §4). No subject, payload or OpenAPI path
+changes — the wire is byte-for-byte 3.8.0 — but the driver interface is the
+third versioned contract and a required member added to a Protocol breaks
+every implementer that lacks it, so under our own table this is MAJOR, and
+calling it 3.9.0 would tell someone building a driver against 3.x that
+nothing had changed for them. Honest version. No dual-publish migration
+because the change touches no subject root — the migration path below
+protects consumers of the wire, and the wire did not move; the only
+implementers of the Protocol are `hardware-io`'s two drivers and its fakes,
+updated in the same commit. Clients see only the number: the API's `/info`
+reports it, and iOS re-pins its vendored spec to match. Ruled 2026-08-18.
+
 ### Pre-release exception (expires at the first tagged release)
 
 **contracts 2.0.0 added the required `role` on `ActuatorRegistration` without

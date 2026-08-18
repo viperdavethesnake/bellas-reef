@@ -116,10 +116,22 @@ class ActuatorDriver(Protocol):
     @property
     def safe_state(self) -> ActuatorLevel: ...
 
+    async def open(self) -> None: ...
     async def apply(self, level: ActuatorLevel) -> None: ...
     async def drive_safe(self) -> None: ...
     async def read_back(self) -> ActuatorLevel | None: ...
 ```
+
+`open()` brings the output up — export the channel, wake the chip, write the
+prescaler — and `hardware-io` calls it on every actuator it builds, before the
+supervisor asserts safe state, unconditionally. It is a **required** member
+(since 2026-08-18), not an optional hook: an optional hook is one the type
+checker cannot see missing, and on 2026-08-17 a driver whose chip setup was
+written and tested shipped without it — `hardware-io` duck-typed past the gap
+and the bench measured the chip running on whatever the previous process had
+left in its registers. A driver with nothing to bring up returns; a driver
+that raises is skipped, alone, and logged. Must be idempotent for the
+hardware it touches, because sixteen channels may share one chip.
 
 `drive_safe()` is the last line of defence and has the hardest requirement in
 this document: **it must work when the spine is down, the control engine is

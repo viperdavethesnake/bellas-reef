@@ -40,6 +40,11 @@ class FakeActuator:
         one broken driver stops the others going safe.
     ``apply_delay_s``
         ``apply`` takes this long, for testing timeouts.
+    ``open_raises``
+        ``open`` raises. Models a channel that cannot be brought up — an
+        unexported RP1 channel whose udev rule never ran, a PCA9685 that
+        answers no I²C — which the app must skip without taking the rest of
+        the hub down with it.
     """
 
     def __init__(
@@ -56,10 +61,12 @@ class FakeActuator:
         self.level: ActuatorLevel = safe_state
         self.applied: list[ActuatorLevel] = []
         self.safe_calls: int = 0
+        self.opened: int = 0
 
         self.stuck: bool = False
         self.fail_safe_raises: bool = False
         self.apply_delay_s: float = 0.0
+        self.open_raises: bool = False
 
     @property
     def driver_id(self) -> str:
@@ -72,6 +79,11 @@ class FakeActuator:
     @property
     def safe_state(self) -> ActuatorLevel:
         return self._safe_state
+
+    async def open(self) -> None:
+        if self.open_raises:
+            raise OSError(f"{self._actuator_id} cannot be brought up")
+        self.opened += 1
 
     async def apply(self, level: ActuatorLevel) -> None:
         if self.apply_delay_s:

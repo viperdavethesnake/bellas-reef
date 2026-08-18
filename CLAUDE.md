@@ -628,17 +628,25 @@ Two things learned on the way, both load-bearing:
    `pca9685 initialised address=0x40 pre_scale=12 invrt=false`), and David
    re-read the 50 % row on LED0: **502.9 Hz**, 1.654 V — against 502.7
    predicted from the measured 26.77 MHz oscillator and 544.8 measured on
-   Stage 1's leftover prescaler. Follow-up, not yet done: put `open()` in the
-   `ActuatorDriver` Protocol so a driver without a lifecycle hook fails
-   `mypy --strict` rather than passing quietly; and announce the chip's
-   read-back PRE_SCALE on the wire so the System tab can show it.
+   Stage 1's leftover prescaler. Follow-ups: `open()` is a required member
+   of the `ActuatorDriver` Protocol since 2026-08-18 — with the Protocol
+   tightened and nothing else changed, `mypy --strict` flagged 33 sites,
+   every one a test fake and neither real driver, which is the gap that
+   would have caught the PCA9685 at gate time; `app.py` calls `open()`
+   unconditionally now instead of duck-typing it. Still open: announce the
+   chip's read-back PRE_SCALE on the wire so the System tab can show it.
 2. **Adopting a channel restarts hardware-io** (`assignment_restart`: "exiting
    to rebuild from registry"), and on the way down it logged `failed to
    publish actuator state … reason=safe_state` for both pi-pwm channels — the
    safe-state publish racing the NATS close. Not investigated yet.
 
-Bench notes: the engine slews at 1 %/s in 1 % steps, so 100 → 5 % takes ~95 s
-(the ramp-vs-snap design item, next round). David's meter was on CH1 from the
+Bench notes: the engine slewed at 1 %/s in 1 % steps at the time, so 100 → 5 %
+took ~95 s. Resolved since: holds carry a per-hold `snap` | `ramp` transition
+(#42, contracts 3.8.0), the global slew is 0.05/s (#43, 0 → 100 % in ~20 s),
+and #43 also fixed the arrival step of a slew being swallowed by the deadband
+— David measured Ramp 100 % on LED0 land at **3.294 V / "Now 99 %"** on
+2026-08-17 (fail), and on 2026-08-18 after #43 both **Ramp and Snap 100 %
+passed** from the app, hold and release. David's meter was on CH1 from the
 end of Stage 1 when the PCA leg began; a CLI `i2cset` full-on to LED0 read 0 V
 until the probe was moved, then the register was written back to full-off and
 the leg re-run from the app. The stack's "Now" reads the last commanded duty
