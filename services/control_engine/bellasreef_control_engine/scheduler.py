@@ -57,6 +57,13 @@ class Intent:
     duty: float
     reason: str
     hold: Transition | None = None
+    #: True when this intent was slew-limited short of its target — the
+    #: channel is still on its way. :meth:`LightingScheduler.mark_emitted`
+    #: remembers it so the *arrival* step (the one that finally equals the
+    #: target) is emitted even when it is smaller than the deadband. Without
+    #: this a ramp to 100 % published 0.9956 and then nothing until the
+    #: 300 s refresh (bench 2026-08-17: 3.294 V, "Now 99 %").
+    converging: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +127,10 @@ class LightingScheduler:
         #: even when the channel already sits at the resting duty, precisely
         #: because that emission is what clears the memory.
         self._last_hold: dict[str, Transition] = {}
+        #: Channels whose last emitted intent was slew-limited short of its
+        #: target (Intent.converging). Written only by mark_emitted, so due()
+        #: stays pure. The arrival step bypasses the deadband for these.
+        self._slewing: set[str] = set()
 
     @property
     def channel_ids(self) -> tuple[str, ...]:
@@ -233,25 +244,35 @@ class LightingScheduler:
             target = hold.duty
             duty = target if hold.transition == "snap" else self._limit(previous, target, dt_s)
             tag = hold.transition
+        converging = duty != target
+
+        if hold is not None:
             if remembered != hold.transition:
                 # Arrival, or a supersede that changed the mode: announce it,
                 # deadband or not, so mark_emitted records the new memory.
-                return Intent(channel_id, duty, "hold", tag)
+                return Intent(channel_id, duty, "hold", tag, converging)
             if hold.transition == "snap" and duty != previous:
                 # A snap hold re-held at a new duty: still a jump, still a hold.
-                return Intent(channel_id, duty, "hold", tag)
+                return Intent(channel_id, duty, "hold", tag, converging)
 
-        converging = duty != target
         if cold:
-            return Intent(channel_id, duty, "initial", tag)
+            return Intent(channel_id, duty, "initial", tag, converging)
         if converging:
             # Mid-convergence. Emit even if this step is smaller than the
             # deadband, or a slow slew would stall short of the target and
             # sit there — the deadband exists to suppress noise, not
             # progress.
-            return Intent(channel_id, duty, "converge", tag)
+            return Intent(channel_id, duty, "converge", tag, converging=True)
         if abs(duty - previous) >= self._deadband:
             return Intent(channel_id, duty, "ramp", tag)
+        if channel_id in self._slewing:
+            # The arrival step that ends a convergence, when the residual is
+            # smaller than the deadband: `_limit` returned the target,
+            # `converging` went false, and without this clause the deadband
+            # swallowed the last step — a ramp to 100 % published 0.9956 and
+            # then nothing until refresh (bench 2026-08-17: 3.294 V on LED0,
+            # "Now 99 %"). Arrival is progress, not noise.
+            return Intent(channel_id, duty, "converge", tag)
 
         if channel_id not in self._last_emitted_at or dt_s >= self._refresh_s:
             return Intent(channel_id, duty, "refresh", tag)
@@ -280,6 +301,10 @@ class LightingScheduler:
             self._last_hold.pop(intent.channel_id, None)
         else:
             self._last_hold[intent.channel_id] = intent.hold
+        if intent.converging:
+            self._slewing.add(intent.channel_id)
+        else:
+            self._slewing.discard(intent.channel_id)
 
     def reset(self) -> None:
         """Forget emission history for every channel.
@@ -290,6 +315,7 @@ class LightingScheduler:
         self._last_duty.clear()
         self._last_emitted_at.clear()
         self._last_hold.clear()
+        self._slewing.clear()
 
     def forget(self, channel_id: str) -> None:
         """Forget emission history for one channel.
@@ -327,3 +353,4 @@ class LightingScheduler:
         self._last_duty.pop(channel_id, None)
         self._last_emitted_at.pop(channel_id, None)
         self._last_hold.pop(channel_id, None)
+        self._slewing.discard(channel_id)
