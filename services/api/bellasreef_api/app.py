@@ -1717,20 +1717,28 @@ def build_app(
         series: list[HistorySeries] = []
         for device in await store.list_devices():
             if device["kind"] == "sensor":
-                metric, unit = "bellasreef_sensor_reading", "degC"
+                found = await reader.series(
+                    metric="bellasreef_sensor_reading",
+                    device_id=device["device_id"],
+                    unit="degC",
+                    start=start,
+                    end=end,
+                    buckets=wanted,
+                )
             else:
                 # Duty is dimensionless 0–1; the client renders it as a
                 # percentage. Saying "ratio" beats an empty string, which reads
-                # as a missing field rather than a deliberate one.
-                metric, unit = "bellasreef_actuator_level", "ratio"
-            found = await reader.series(
-                metric=metric,
-                device_id=device["device_id"],
-                unit=unit,
-                start=start,
-                end=end,
-                buckets=wanted,
-            )
+                # as a missing field rather than a deliberate one. And it is a
+                # step signal — published on change, held until the next — so
+                # it is bucketed as one (history.py, H1/H2).
+                found = await reader.step_series(
+                    metric="bellasreef_actuator_level",
+                    device_id=device["device_id"],
+                    unit="ratio",
+                    start=start,
+                    end=end,
+                    buckets=wanted,
+                )
             if found.buckets:
                 series.append(
                     HistorySeries(
