@@ -964,6 +964,17 @@ class Store:
         bad request gets a 422 with a field name rather than a 500 with a
         constraint name, but the database is what makes them true — a future
         writer that is not this endpoint cannot bypass them.
+
+        A bound that is written as ``None`` also closes any open threshold
+        episode that bound raised, in the same transaction. The evaluator only
+        looks at bounds that have a threshold, so an episode left open under a
+        removed bound has no reading path that could ever end it — it would
+        stay "ongoing" in ``/alerts`` until the band was put back and the tank
+        happened to recover. No reading closes it here, so ``cleared_value``
+        carries the row's own ``raised_value`` (``cleared_pair_together``
+        requires a number); the ``thresholds.set`` audit event is where the
+        reason is recorded. The bounds closed come back under
+        ``closed_episode_bounds`` so the endpoint can say so.
         """
         async with self._engine.begin() as conn:
             row = (
@@ -985,7 +996,31 @@ class Store:
                 .mappings()
                 .first()
             )
-        return dict(row) if row is not None else None
+            if row is None:
+                return None
+            closed = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE sensor_alerts "
+                            "SET cleared_at = now(), cleared_value = raised_value "
+                            "WHERE device_id = :device_id AND alert_class = 'threshold' "
+                            "AND cleared_at IS NULL "
+                            "AND ((bound = 'min' AND CAST(:min_removed AS boolean)) "
+                            "  OR (bound = 'max' AND CAST(:max_removed AS boolean))) "
+                            "RETURNING bound"
+                        ),
+                        {
+                            "device_id": device_id,
+                            "min_removed": minimum is None,
+                            "max_removed": maximum is None,
+                        },
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return {**row, "closed_episode_bounds": sorted(closed)}
 
     # ------------------------------------------------------- recovery window
 

@@ -197,8 +197,62 @@ class AlertSupervisor:
 
     async def prime(self) -> None:
         """Load open episodes so a restart does not re-announce a live breach."""
+        self._open = await self._load_open()
+        if self._open:
+            log.info(
+                "resumed open alert episodes",
+                extra={
+                    "devices": sorted(self._open),
+                    "count": sum(len(b) for b in self._open.values()),
+                },
+            )
+
+    async def resync(self) -> None:
+        """Re-read the open episodes so this mirror follows the record.
+
+        The engine is not the only writer that closes an episode: the API
+        closes one when the bound that raised it is removed from the band
+        (``Store.set_thresholds``), because no reading could ever clear it
+        once the evaluator stops looking at that bound. Left un-synced, this
+        map would still call the bound open — a re-set band would then never
+        re-raise a live breach, and the first in-range reading would try to
+        clear a row that is already closed. Called on the threshold-refresh
+        cadence, so the mirror is at most one refresh behind the record.
+
+        The read is an await, and the sensor callback runs on another task,
+        so an episode can be raised or cleared *while* the record is being
+        read. Reconciled rather than replaced: whatever this mirror changed
+        during the read is applied on top of what the record said, so a
+        breach that began mid-read is not forgotten (a forgotten one would be
+        re-raised into the partial unique index and lost).
+        """
+        before = {device: set(bounds) for device, bounds in self._open.items()}
+        fresh = await self._load_open()
+        after = self._open
+        for device in set(before) | set(after):
+            raised = after.get(device, set()) - before.get(device, set())
+            cleared = before.get(device, set()) - after.get(device, set())
+            if raised:
+                fresh.setdefault(device, set()).update(raised)
+            if cleared and device in fresh:
+                fresh[device].difference_update(cleared)
+        # on_reading leaves an empty set behind for every device it has seen;
+        # those are not open episodes and must not read as a difference.
+        held = {device: bounds for device, bounds in after.items() if bounds}
+        result = {device: bounds for device, bounds in fresh.items() if bounds}
+        if result != held:
+            log.info(
+                "open alert episodes resynced from the record",
+                extra={
+                    "before": {d: sorted(b) for d, b in sorted(held.items())},
+                    "after": {d: sorted(b) for d, b in sorted(result.items())},
+                },
+            )
+        self._open = result
+
+    async def _load_open(self) -> dict[str, set[AlertBound]]:
         known: set[str] = {"min", "max"}
-        resumed: dict[str, set[AlertBound]] = {}
+        loaded: dict[str, set[AlertBound]] = {}
         for device_id, bounds in (await self._store.open_bounds()).items():
             for bound in bounds:
                 if bound not in known:
@@ -209,16 +263,8 @@ class AlertSupervisor:
                         extra={"device_id": device_id, "bound": bound},
                     )
                     continue
-                resumed.setdefault(device_id, set()).add(bound)  # type: ignore[arg-type]
-        self._open = resumed
-        if self._open:
-            log.info(
-                "resumed open alert episodes",
-                extra={
-                    "devices": sorted(self._open),
-                    "count": sum(len(b) for b in self._open.values()),
-                },
-            )
+                loaded.setdefault(device_id, set()).add(bound)  # type: ignore[arg-type]
+        return loaded
 
     async def on_reading(self, reading: SensorReading, thresholds: Thresholds) -> list[SensorAlert]:
         """Evaluate one reading. Returns the alerts published, for tests."""

@@ -1845,6 +1845,10 @@ def build_app(
         if row is None:  # pragma: no cover - the row existed a statement ago
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
 
+        # Removing a bound closes the episode it raised (see
+        # Store.set_thresholds). The episode row cannot say why it closed, so
+        # the audit event does: this was operator config, not a recovery.
+        closed_bounds: list[str] = row["closed_episode_bounds"]
         await sink(
             "thresholds.set",
             {
@@ -1853,6 +1857,8 @@ def build_app(
                 "maximum": body.maximum,
                 "clear_margin": body.clear_margin,
                 "actor": str(actor),
+                "closed_open_episode": bool(closed_bounds),
+                "closed_bounds": closed_bounds,
             },
             category="config",
         )
