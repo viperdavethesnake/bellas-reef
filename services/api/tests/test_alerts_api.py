@@ -179,6 +179,9 @@ class TestThresholdConfiguration:
             "maximum": 27.0,
             "clear_margin": 0.5,
             "actor": client_id,
+            # Setting a full band closes nothing (see TestClearingABandClosesItsEpisode).
+            "closed_open_episode": False,
+            "closed_bounds": [],
         }
 
     def test_clearing_every_field_turns_alerting_off(self) -> None:
@@ -339,3 +342,65 @@ class TestAlertHistory:
             return response.status_code
 
         assert run(scenario) == 401
+
+
+class TestClearingABandClosesItsEpisode:
+    """Removing a bound must close the episode that bound raised.
+
+    The evaluator only looks at bounds that have a threshold, so an episode
+    left open under a removed bound has no reading path that can ever close
+    it: it would sit in ``/alerts`` as ongoing until the band was put back
+    and the tank happened to recover. Recorded as the ios-ux-review §5 latch;
+    these are the tests that fail while it is latent.
+    """
+
+    @staticmethod
+    async def _put_and_read(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        engine = await fresh_engine()
+        await seed_episode(engine, cleared=False)  # an open 'min' episode
+        audit = Audit()
+        app = build_app(engine, audit=audit)
+        headers = await paired(app)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://hub"
+        ) as c:
+            put = await c.put(
+                "/api/v1/devices/display-tank/thresholds", headers=headers, json=payload
+            )
+            assert put.status_code == 200, put.text
+            alerts: dict[str, Any] = (await c.get("/api/v1/alerts", headers=headers)).json()
+        await engine.dispose()
+        (detail,) = [d for e, d, _ in audit.records if e == "thresholds.set"]
+        return alerts, detail
+
+    def test_clearing_the_band_closes_the_open_episode(self) -> None:
+        alerts, detail = run(lambda: self._put_and_read({}))
+        assert alerts["active"] == []
+        (episode,) = alerts["recent"]
+        assert episode["cleared_at"] is not None
+        # No reading ended this episode, so the row closes on the only value
+        # it has. The audit trail is where the "why" lives.
+        assert episode["cleared_value"] == episode["raised_value"] == 23.1
+        assert detail["closed_open_episode"] is True
+        assert detail["closed_bounds"] == ["min"]
+
+    def test_removing_only_the_raising_bound_closes_it(self) -> None:
+        alerts, detail = run(lambda: self._put_and_read({"maximum": 27.0, "clear_margin": 0.5}))
+        assert alerts["active"] == []
+        assert detail["closed_open_episode"] is True
+        assert detail["closed_bounds"] == ["min"]
+
+    def test_removing_the_other_bound_leaves_it_open(self) -> None:
+        """A min-only band still watches the minimum, so its open min episode
+        is live and the evaluator closes it on recovery, as ever."""
+        alerts, detail = run(lambda: self._put_and_read({"minimum": 24.0, "clear_margin": 0.5}))
+        assert [a["bound"] for a in alerts["active"]] == ["min"]
+        assert detail["closed_open_episode"] is False
+        assert detail["closed_bounds"] == []
+
+    def test_re_setting_a_full_band_leaves_it_open(self) -> None:
+        alerts, detail = run(
+            lambda: self._put_and_read({"minimum": 24.0, "maximum": 27.0, "clear_margin": 0.5})
+        )
+        assert [a["bound"] for a in alerts["active"]] == ["min"]
+        assert detail["closed_open_episode"] is False

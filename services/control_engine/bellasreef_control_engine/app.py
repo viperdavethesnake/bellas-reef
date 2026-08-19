@@ -310,6 +310,12 @@ class ControlEngine:
                 log.exception("ignoring unusable thresholds", extra={"device_id": device_id})
         self._thresholds = bands
 
+        # Same cadence, same reason: the API closes an episode when the bound
+        # that raised it is removed, and the supervisor's in-memory mirror has
+        # to follow or it will treat a re-set band as still in breach.
+        if self.alerts is not None:
+            await self.alerts.resync()
+
     async def _on_reading(self, reading: SensorReading) -> None:
         if self.alerts is None:
             return
