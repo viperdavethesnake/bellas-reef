@@ -99,6 +99,12 @@ jobs:
       # normally takes seconds, and a hung step shows no log until the job
       # ends — so there was nothing to read. A hard failure with output beats
       # an open-ended wait. `set -x` so the log names the command that stalled.
+      #
+      # And it named it: `apt-get update` refreshing *every* source, stalling
+      # on the runner's `azure.archive.ubuntu.com` mirror (Ign: on each
+      # InRelease, then a hang after the fallback). Only the pgdg list is
+      # refreshed now — the Ubuntu mirrors are never touched, and the runner
+      # image's own package lists serve the dependencies.
       - name: Install PostgreSQL 17 client
         timeout-minutes: 5
         run: |
@@ -111,7 +117,9 @@ jobs:
           https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120 update
+            -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120 \
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/pgdg.list \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 update
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=120 \
             install -y --no-install-recommends postgresql-client-17
