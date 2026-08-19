@@ -36,10 +36,11 @@ class ChipState(_Message):
     last-value per subject, like a capability announcement — a consumer that
     starts late still learns how the chip is set up.
     """
-    hardware_source: CapabilitySource        # "pi-pwm" | "pca9685" | "w1-bus"
-    instance: str                             # "0x40@1", "1f00098000.pwm", "w1_bus_master1"
-    initialised: bool                         # this process configured it
-    initialised_at: AwareDatetime | None      # when; None if it never was
+
+    hardware_source: CapabilitySource  # "pi-pwm" | "pca9685" | "w1-bus"
+    instance: str  # "0x40@1", "1f00098000.pwm", "w1_bus_master1"
+    initialised: bool  # this process configured it
+    initialised_at: AwareDatetime | None  # when; None if it never was
     #: Facts a client renders as a table. Free-form for the same reason
     #: CapabilityChannel.detail is: they differ per source and no consumer
     #: should switch on them. Keys are stable strings; values scalars.
