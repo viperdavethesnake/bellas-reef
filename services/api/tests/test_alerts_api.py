@@ -44,6 +44,10 @@ class Audit:
     def category(self, event: str) -> str:
         return next(c for e, _, c in self.records if e == event)
 
+    def detail(self, event: str) -> dict[str, Any]:
+        """The detail the first occurrence of ``event`` was recorded with."""
+        return next(d for e, d, _ in self.records if e == event)
+
 
 async def fresh_engine() -> AsyncEngine:
     engine = create_async_engine(os.environ[_PG], future=True, poolclass=NullPool)
@@ -77,7 +81,8 @@ async def fresh_engine() -> AsyncEngine:
     return engine
 
 
-async def paired(app: Any) -> dict[str, str]:
+async def paired_with_id(app: Any) -> tuple[dict[str, str], str]:
+    """Bearer headers for a freshly paired client, and the id the hub gave it."""
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://hub"
     ) as c:
@@ -85,7 +90,12 @@ async def paired(app: Any) -> dict[str, str]:
         tok = (
             await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
         ).json()
-    return {"Authorization": f"Bearer {tok['access_token']}"}
+    return {"Authorization": f"Bearer {tok['access_token']}"}, str(granted["client_id"])
+
+
+async def paired(app: Any) -> dict[str, str]:
+    headers, _ = await paired_with_id(app)
+    return headers
 
 
 async def seed_episode(engine: AsyncEngine, *, cleared: bool) -> None:
@@ -131,11 +141,11 @@ class TestThresholdConfiguration:
         }
 
     def test_setting_and_reading_back_a_band(self) -> None:
-        async def scenario() -> tuple[int, dict[str, Any], list[str]]:
+        async def scenario() -> tuple[int, dict[str, Any], Audit, str]:
             engine = await fresh_engine()
             audit = Audit()
             app = build_app(engine, audit=audit)
-            headers = await paired(app)
+            headers, client_id = await paired_with_id(app)
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://hub"
             ) as c:
@@ -148,9 +158,9 @@ class TestThresholdConfiguration:
                     await c.get("/api/v1/devices/display-tank/thresholds", headers=headers)
                 ).json()
             await engine.dispose()
-            return put.status_code, got, audit.events
+            return put.status_code, got, audit, client_id
 
-        code, thresholds, events = run(scenario)
+        code, thresholds, audit, client_id = run(scenario)
         assert code == 200
         assert (thresholds["minimum"], thresholds["maximum"], thresholds["clear_margin"]) == (
             24.0,
@@ -158,8 +168,18 @@ class TestThresholdConfiguration:
             0.5,
         )
         # Changing what the tank is allowed to do is an operator action, so it
-        # belongs in the audit trail alongside pairing and overrides.
-        assert "thresholds.set" in events
+        # belongs in the audit trail alongside pairing and overrides — and,
+        # like them, it names the client that did it. Without ``actor`` in the
+        # detail the sink fills in ``api``, which is the process, not the
+        # operator.
+        assert "thresholds.set" in audit.events
+        assert audit.detail("thresholds.set") == {
+            "device_id": "display-tank",
+            "minimum": 24.0,
+            "maximum": 27.0,
+            "clear_margin": 0.5,
+            "actor": client_id,
+        }
 
     def test_clearing_every_field_turns_alerting_off(self) -> None:
         """The only way to say "stop watching this" without a separate verb."""

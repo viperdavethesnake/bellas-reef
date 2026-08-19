@@ -65,6 +65,10 @@ class Audit:
         """The category the first occurrence of ``event`` was filed under."""
         return next(c for e, _, c in self.records if e == event)
 
+    def details(self, event: str) -> list[dict[str, Any]]:
+        """Every detail dict recorded under ``event``, in order."""
+        return [d for e, d, _ in self.records if e == event]
+
 
 async def fresh_engine() -> AsyncEngine:
     engine = create_async_engine(os.environ[_PG], future=True)
@@ -87,16 +91,25 @@ async def announce(engine: AsyncEngine, source: str, channel: str) -> None:
         )
 
 
+async def paired_client(
+    engine: AsyncEngine, *, audit: Audit | None = None, nats_url: str | None = None
+) -> tuple[httpx.AsyncClient, dict[str, str], str]:
+    """A client, its bearer headers, and the client id the hub paired it under."""
+    app = build_app(engine, audit=audit or Audit(), nats_url=nats_url, vm_url=None)
+    c = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://hub")
+    granted = (
+        await c.post("/api/v1/pair", json={"client_name": f"t-{uuid.uuid4().hex[:6]}"})
+    ).json()
+    minted = await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
+    token = minted.json()["access_token"]
+    return c, {"Authorization": f"Bearer {token}"}, str(granted["client_id"])
+
+
 async def client_for(
     engine: AsyncEngine, *, audit: Audit | None = None, nats_url: str | None = None
 ) -> tuple[httpx.AsyncClient, dict[str, str]]:
-    app = build_app(engine, audit=audit or Audit(), nats_url=nats_url, vm_url=None)
-    c = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://hub")
-    granted = await c.post("/api/v1/pair", json={"client_name": f"t-{uuid.uuid4().hex[:6]}"})
-    token = (
-        await c.post("/api/v1/token", json={"refresh_token": granted.json()["refresh_token"]})
-    ).json()["access_token"]
-    return c, {"Authorization": f"Bearer {token}"}
+    c, headers, _ = await paired_client(engine, audit=audit, nats_url=nats_url)
+    return c, headers
 
 
 async def device_count(engine: AsyncEngine) -> int:
@@ -1119,6 +1132,68 @@ def test_forget_audits_and_publishes_no_assignment(
     ]
     # Bound, then unbound: no third publish for the forget.
     assert len(RecordingPublisher.published) == 2
+
+
+def test_every_device_config_event_names_the_client_that_did_it() -> None:
+    """The audit log must say *who*, not merely *what*.
+
+    Every ``config``-category event goes through the same sink as pairing and
+    overrides, and the sink fills ``actor`` with its own source name (``api``)
+    unless the detail says otherwise. Override and pairing events always said
+    otherwise; the device lifecycle events did not, so the audit trail recorded
+    ``api`` renaming, unbinding and forgetting devices — an actor that describes
+    the process rather than the operator holding the phone. This walks one
+    device through its whole lifecycle from one paired client and checks that
+    each event carries that client's id.
+    """
+
+    async def scenario() -> tuple[str, Audit]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        audit = Audit()
+        c, headers, client_id = await paired_client(engine, audit=audit)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            renamed = await c.patch(
+                "/api/v1/devices/pi-pwm-0", headers=headers, json={"display_name": "Left bank"}
+            )
+            assert renamed.status_code == 200, renamed.text
+            unbound = await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            assert unbound.status_code == 204, unbound.text
+            readopted = await c.post("/api/v1/devices/pi-pwm-0/readopt", headers=headers)
+            assert readopted.status_code == 200, readopted.text
+            unbound_again = await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            assert unbound_again.status_code == 204, unbound_again.text
+            forgotten = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            assert forgotten.status_code == 204, forgotten.text
+            return client_id, audit
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    client_id, audit = run(scenario)
+
+    config_records = [(e, d) for e, d, cat in audit.records if cat == "config"]
+    assert [e for e, _ in config_records] == [
+        "device.bound",
+        "device.renamed",
+        "device.unbound",
+        "device.bound",  # the readopt
+        "device.unbound",
+        "device.forgotten",
+    ]
+    for event, detail in config_records:
+        assert detail.get("actor") == client_id, (
+            f"{event} was audited without the acting client: {detail!r}. The sink "
+            "would fill in 'api', which names the process, not the operator."
+        )
+    # The readopt is the second device.bound; it must be attributed too, not
+    # only the original binding.
+    assert audit.details("device.bound")[1] == {
+        "device_id": "pi-pwm-0",
+        "readopt": True,
+        "actor": client_id,
+    }
 
 
 # --------------------------------------------------- the order things arrive in

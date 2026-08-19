@@ -42,6 +42,10 @@ class Audit:
     def category(self, event: str) -> str:
         return next(c for e, _, c in self.records if e == event)
 
+    def detail(self, event: str) -> dict[str, Any]:
+        """The detail the first occurrence of ``event`` was recorded with."""
+        return next(d for e, d, _ in self.records if e == event)
+
 
 async def fresh_engine() -> AsyncEngine:
     engine = create_async_engine(os.environ[_PG], future=True, poolclass=NullPool)
@@ -55,7 +59,8 @@ async def fresh_engine() -> AsyncEngine:
     return engine
 
 
-async def paired(app: Any, name: str = "phone") -> dict[str, str]:
+async def paired_with_id(app: Any, name: str = "phone") -> tuple[dict[str, str], str]:
+    """Bearer headers for a freshly paired client, and the id the hub gave it."""
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://hub"
     ) as c:
@@ -63,7 +68,12 @@ async def paired(app: Any, name: str = "phone") -> dict[str, str]:
         tok = (
             await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
         ).json()
-    return {"Authorization": f"Bearer {tok['access_token']}"}
+    return {"Authorization": f"Bearer {tok['access_token']}"}, str(granted["client_id"])
+
+
+async def paired(app: Any, name: str = "phone") -> dict[str, str]:
+    headers, _ = await paired_with_id(app, name)
+    return headers
 
 
 class TestRegistrationUpsert:
@@ -137,7 +147,7 @@ class TestRegistrationUpsert:
 
 class TestNaming:
     def test_naming_a_device_and_clearing_it(self) -> None:
-        async def scenario() -> tuple[int, Any, Any, list[str]]:
+        async def scenario() -> tuple[int, Any, Any, Audit, str]:
             engine = await fresh_engine()
             store = Store(engine)
             await store.upsert_sensor(
@@ -149,7 +159,7 @@ class TestNaming:
             )
             audit = Audit()
             app = build_app(engine, audit=audit)
-            headers = await paired(app)
+            headers, client_id = await paired_with_id(app)
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://hub"
             ) as c:
@@ -164,14 +174,23 @@ class TestNaming:
                 named.status_code,
                 named.json()["display_name"],
                 cleared.json()["display_name"],
-                audit.events,
+                audit,
+                client_id,
             )
 
-        code, named, cleared, events = run(scenario)
+        code, named, cleared, audit, client_id = run(scenario)
         assert code == 200
         assert named == "Frag tank"
         assert cleared is None, "clearing the name goes back to the raw id, not a blank label"
-        assert "device.renamed" in events
+        assert "device.renamed" in audit.events
+        # Named by whom: the sink fills ``actor`` with ``api`` unless the detail
+        # says otherwise, and a rename attributed to the process is no
+        # attribution at all.
+        assert audit.detail("device.renamed") == {
+            "device_id": "probe",
+            "display_name": "Frag tank",
+            "actor": client_id,
+        }
 
     def test_a_whitespace_name_normalises_to_no_name(self) -> None:
         """Otherwise every client renders a blank label where the id used to be."""
