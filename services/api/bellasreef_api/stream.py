@@ -6,6 +6,15 @@ Forwards `bellasreef.state.>` and `bellasreef.sensor.>`. The API stays
 stateless — it subscribes, translates, and forwards; it holds no state of its
 own and makes no control decisions.
 
+**A new socket is told where things stand before it is told what changes.**
+Actuator state is published on change, not on a cadence, so a client that
+connects after the last change would otherwise see nothing until the next one
+— on 2026-08-18 that was every light reading "no state yet" for as long as
+nobody touched a light. `BR_STATE` retains the last value per actuator, so on
+each subscribe the bridge reads that once (an ephemeral consumer, deleted after)
+and hands those frames over ahead of the live fan-out. The state of record is
+still the stream, not this process.
+
 **Authentication is the first message, not a header or a query parameter.**
 Browsers cannot set headers on a WebSocket handshake, and a token in the query
 string ends up in access logs and proxy history. So the socket opens
@@ -34,6 +43,7 @@ from bellasreef_db import OverrideStore
 from bellasreef_service import get_logger
 from nats.aio.client import Client
 from nats.aio.msg import Msg
+from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import ValidationError
 
 from bellasreef_api.frames import AlertFrame, OverrideContext, SensorFrame, StateFrame
@@ -48,6 +58,14 @@ AUTH_TIMEOUT_S = 10.0
 #: Close codes. 1008 is "policy violation" in RFC 6455, which is the honest
 #: code for "you did not authenticate" — 1000 would imply a normal close.
 CLOSE_UNAUTHENTICATED = 1008
+
+#: The stream hardware-io provisions for `bellasreef.state.>`, retained
+#: last-value-per-subject (`max_msgs_per_subject=1`). Named here rather than
+#: imported from hardware-io: the API must not depend on that package.
+STATE_STREAM = "BR_STATE"
+#: How long one replay fetch may wait for the server. Replay is a courtesy to
+#: the connecting client; a slow broker must not hold the socket hostage.
+REPLAY_FETCH_TIMEOUT_S = 1.0
 
 
 class StreamBridge:
@@ -70,47 +88,53 @@ class StreamBridge:
             await self._nc.subscribe(subjects.ALL_ALERTS, cb=self._on_message)
             log.info("stream bridge subscribed", extra={"url": self._url})
 
-    async def _on_message(self, msg: Msg) -> None:
-        """Translate a spine message into a validated frame.
+    async def _encode(self, subject: str, data: bytes) -> str | None:
+        """Translate a spine message into a validated, serialised frame.
 
         Frames are built through the Pydantic models rather than assembled as
         dicts, so the JSON Schema clients generate from is a description of what
         is actually sent. A hand-assembled dict would drift from the schema the
         first time a field was added.
+
+        ``None`` for a payload that does not satisfy the contract: that is a
+        producer bug, and forwarding it would push the failure into every
+        client at once.
         """
         received_at = datetime.now(UTC)
         try:
-            if msg.subject.startswith(f"{subjects.ROOT}.state."):
-                state = ActuatorState.model_validate_json(msg.data)
+            if subject.startswith(f"{subjects.ROOT}.state."):
+                state = ActuatorState.model_validate_json(data)
                 frame: StateFrame | SensorFrame | AlertFrame = StateFrame(
                     received_at=received_at,
-                    subject=msg.subject,
+                    subject=subject,
                     payload=state,
                     override=await self._override_for(state.actuator_id),
                 )
-            elif msg.subject.startswith(f"{subjects.ROOT}.alert."):
+            elif subject.startswith(f"{subjects.ROOT}.alert."):
                 frame = AlertFrame(
                     received_at=received_at,
-                    subject=msg.subject,
-                    payload=SensorAlert.model_validate_json(msg.data),
+                    subject=subject,
+                    payload=SensorAlert.model_validate_json(data),
                 )
             else:
                 frame = SensorFrame(
                     received_at=received_at,
-                    subject=msg.subject,
-                    payload=SensorReading.model_validate_json(msg.data),
+                    subject=subject,
+                    payload=SensorReading.model_validate_json(data),
                 )
         except ValidationError:
-            # A payload that does not satisfy the contract is a producer bug.
-            # Forwarding it would push the failure into every client at once.
             log.warning(
                 "spine payload failed contract validation; frame dropped",
-                extra={"subject": msg.subject},
+                extra={"subject": subject},
                 exc_info=True,
             )
-            return
+            return None
+        return frame.model_dump_json()
 
-        encoded = frame.model_dump_json()
+    async def _on_message(self, msg: Msg) -> None:
+        encoded = await self._encode(msg.subject, msg.data)
+        if encoded is None:
+            return
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(encoded)
@@ -141,9 +165,56 @@ class StreamBridge:
             transition=active.transition,
         )
 
+    async def _retained_state(self) -> list[str]:
+        """Every actuator's last known state, from BR_STATE, as frames.
+
+        An ephemeral pull consumer with ``last_per_subject`` yields exactly one
+        message per actuator and nothing more; it is deleted before returning
+        so nothing accumulates on the broker (CLAUDE.md: a consumer that is
+        left behind is not litter, it is contention). Best-effort throughout:
+        a replay that fails costs the client its first frames, not its socket.
+        """
+        if self._nc is None:
+            return []
+        frames: list[str] = []
+        sub = None
+        try:
+            js = self._nc.jetstream()
+            sub = await js.pull_subscribe(
+                subjects.ALL_STATE,
+                stream=STATE_STREAM,
+                config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+            )
+            while True:
+                try:
+                    batch = await sub.fetch(batch=64, timeout=REPLAY_FETCH_TIMEOUT_S)
+                except TimeoutError:
+                    break
+                for msg in batch:
+                    encoded = await self._encode(msg.subject, msg.data)
+                    if encoded is not None:
+                        frames.append(encoded)
+                if len(batch) < 64:
+                    break
+        except Exception:
+            log.warning("could not replay retained actuator state", exc_info=True)
+        finally:
+            if sub is not None:
+                try:
+                    info = await sub.consumer_info()
+                    await self._nc.jetstream().delete_consumer(STATE_STREAM, info.name)
+                except Exception:
+                    log.warning("ephemeral replay consumer not deleted", exc_info=True)
+        return frames
+
     async def subscribe(self) -> asyncio.Queue[str]:
         await self._ensure_connected()
         queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        # Retained first, then live. A change that lands between the two
+        # would reach the client after its own replayed predecessor; the
+        # frames carry `emitted_at`, and clients keep the newer of the two.
+        for encoded in await self._retained_state():
+            queue.put_nowait(encoded)
         self._subscribers.add(queue)
         return queue
 
