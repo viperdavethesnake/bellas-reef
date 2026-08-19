@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -475,12 +476,18 @@ class TestWebSocketStream:
         """H3 (2026-08-18): a client that connected after the last state
         publish saw "no state yet" on every light, indefinitely — the bridge
         forwarded live messages only, and BR_STATE's retained last value per
-        actuator was never read. Publish first, connect second: the state must
-        arrive right after `ready` without anything else moving.
+        actuator was never read.
+
+        Publish led-blue first, connect second. Then publish a *sentinel* live
+        state for another actuator: everything the socket receives before the
+        sentinel is replay, so led-blue must be among it. Bounded by the
+        sentinel rather than a timeout — TestClient's receive has none, and a
+        test that hangs on RED tells nobody anything.
         """
         app, token, engine = self._app_and_token()
+        sentinel = f"sentinel-{uuid.uuid4().hex[:8]}"
 
-        async def publish_before_anyone_listens() -> None:
+        async def publish(actuator_id: str, duty: float) -> None:
             from bellasreef_contracts import ActuatorState, PwmLevel
             from bellasreef_hardware_io.spine import Spine
 
@@ -491,38 +498,44 @@ class TestWebSocketStream:
                     message_id=uuid.uuid4(),
                     emitted_at=datetime.now(UTC),
                     source="hardware-io",
-                    actuator_id="led-blue",
-                    level=PwmLevel(duty=0.42),
+                    actuator_id=actuator_id,
+                    level=PwmLevel(duty=duty),
                     reason="commanded",
                     since=datetime.now(UTC),
                 )
             )
             await spine.close()
 
-        publisher = threading.Thread(target=lambda: asyncio.run(publish_before_anyone_listens()))
-        publisher.start()
-        publisher.join(timeout=30)
+        def publish_in_thread(actuator_id: str, duty: float) -> None:
+            t = threading.Thread(target=lambda: asyncio.run(publish(actuator_id, duty)))
+            t.start()
+            t.join(timeout=30)
+
+        publish_in_thread("led-blue", 0.42)
 
         with TestClient(app) as client, client.websocket_connect("/api/v1/stream") as ws:
             ws.send_text(json.dumps({"token": token}))
             ready = json.loads(ws.receive_text())
             assert ready["kind"] == "ready"
-            # BR_STATE is shared with every other suite on this NATS, so the
-            # replay may carry other actuators' last states too. Nothing is
-            # publishing now, so everything that arrives is replay; led-blue
-            # must be among the first few frames.
-            seen: list[dict[str, Any]] = []
-            for _ in range(16):
+
+            time.sleep(0.4)  # let the bridge's live subscription settle
+            publish_in_thread(sentinel, 0.99)
+
+            before_sentinel: list[dict[str, Any]] = []
+            for _ in range(64):
                 frame = json.loads(ws.receive_text())
-                seen.append(frame)
-                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == "led-blue":
+                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == sentinel:
                     break
+                before_sentinel.append(frame)
+            else:
+                pytest.fail(f"sentinel never arrived; saw {before_sentinel}")
+
             mine = [
                 f
-                for f in seen
+                for f in before_sentinel
                 if f["kind"] == "state" and f["payload"]["actuator_id"] == "led-blue"
             ]
-            assert mine, f"no retained state for led-blue after ready; got {seen}"
+            assert mine, "led-blue's retained state must arrive before the first live frame"
             assert mine[0]["payload"]["level"]["duty"] == pytest.approx(0.42)
 
         run(engine.dispose)
