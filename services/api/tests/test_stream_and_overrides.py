@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -461,13 +462,89 @@ class TestWebSocketStream:
             publisher.start()
             publisher.join(timeout=30)
 
-            frame = json.loads(ws.receive_text())
+            # Since H3 the bridge replays every actuator's retained state right
+            # after `ready` — including other suites' actuators on this shared
+            # BR_STATE — so read until led-blue's frame rather than assuming
+            # the first frame is the live one.
+            frame: dict[str, Any] = {}
+            for _ in range(64):
+                frame = json.loads(ws.receive_text())
+                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == "led-blue":
+                    break
             assert frame["kind"] == "state"
             assert frame["payload"]["actuator_id"] == "led-blue"
             assert frame["override"] is not None, "state frames must carry override context"
             assert frame["override"]["duty"] == pytest.approx(0.0)
             assert frame["override"]["expires_in_s"] > 0
             assert frame["override"]["transition"] == "snap"
+
+        run(engine.dispose)
+
+    def test_a_fresh_socket_receives_the_last_known_state_before_anything_changes(self) -> None:
+        """H3 (2026-08-18): a client that connected after the last state
+        publish saw "no state yet" on every light, indefinitely — the bridge
+        forwarded live messages only, and BR_STATE's retained last value per
+        actuator was never read.
+
+        Publish led-blue first, connect second. Then publish a *sentinel* live
+        state for another actuator: everything the socket receives before the
+        sentinel is replay, so led-blue must be among it. Bounded by the
+        sentinel rather than a timeout — TestClient's receive has none, and a
+        test that hangs on RED tells nobody anything.
+        """
+        app, token, engine = self._app_and_token()
+        sentinel = f"sentinel-{uuid.uuid4().hex[:8]}"
+
+        async def publish(actuator_id: str, duty: float) -> None:
+            from bellasreef_contracts import ActuatorState, PwmLevel
+            from bellasreef_hardware_io.spine import Spine
+
+            spine = Spine(os.environ[_NATS])
+            await spine.connect()
+            await spine.publish_state(
+                ActuatorState(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    actuator_id=actuator_id,
+                    level=PwmLevel(duty=duty),
+                    reason="commanded",
+                    since=datetime.now(UTC),
+                )
+            )
+            await spine.close()
+
+        def publish_in_thread(actuator_id: str, duty: float) -> None:
+            t = threading.Thread(target=lambda: asyncio.run(publish(actuator_id, duty)))
+            t.start()
+            t.join(timeout=30)
+
+        publish_in_thread("led-blue", 0.42)
+
+        with TestClient(app) as client, client.websocket_connect("/api/v1/stream") as ws:
+            ws.send_text(json.dumps({"token": token}))
+            ready = json.loads(ws.receive_text())
+            assert ready["kind"] == "ready"
+
+            time.sleep(0.4)  # let the bridge's live subscription settle
+            publish_in_thread(sentinel, 0.99)
+
+            before_sentinel: list[dict[str, Any]] = []
+            for _ in range(64):
+                frame = json.loads(ws.receive_text())
+                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == sentinel:
+                    break
+                before_sentinel.append(frame)
+            else:
+                pytest.fail(f"sentinel never arrived; saw {before_sentinel}")
+
+            mine = [
+                f
+                for f in before_sentinel
+                if f["kind"] == "state" and f["payload"]["actuator_id"] == "led-blue"
+            ]
+            assert mine, "led-blue's retained state must arrive before the first live frame"
+            assert mine[0]["payload"]["level"]["duty"] == pytest.approx(0.42)
 
         run(engine.dispose)
 
