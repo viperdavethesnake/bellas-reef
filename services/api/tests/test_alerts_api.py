@@ -179,6 +179,9 @@ class TestThresholdConfiguration:
             "maximum": 27.0,
             "clear_margin": 0.5,
             "actor": client_id,
+            # Setting a full band closes nothing (see TestClearingABandClosesItsEpisode).
+            "closed_open_episode": False,
+            "closed_bounds": [],
         }
 
     def test_clearing_every_field_turns_alerting_off(self) -> None:
