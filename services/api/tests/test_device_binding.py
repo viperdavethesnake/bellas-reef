@@ -1196,6 +1196,165 @@ def test_every_device_config_event_names_the_client_that_did_it() -> None:
     }
 
 
+async def _device_pk(engine: AsyncEngine, device_id: str) -> uuid.UUID:
+    async with engine.connect() as conn:
+        pk = (
+            await conn.execute(
+                text("SELECT id FROM devices WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).scalar_one()
+    return uuid.UUID(str(pk))
+
+
+async def _add_calibration(engine: AsyncEngine, device_pk: uuid.UUID) -> None:
+    """A fitted calibration on the device, as the calibration service would
+    write it. Column set is 0001_initial_schema's, nothing invented."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO calibration_records "
+                " (id, calibration_id, device_pk, coefficients, residual, points, unit,"
+                "  created_by) "
+                "VALUES (:id, :calibration_id, :device_pk, '[1.0, 0.0]'::jsonb, 0.0,"
+                "        '[]'::jsonb, 'C', 'test')"
+            ),
+            {"id": uuid.uuid4(), "calibration_id": uuid.uuid4(), "device_pk": device_pk},
+        )
+
+
+async def _add_dose_intent(engine: AsyncEngine, device_pk: uuid.UUID) -> None:
+    """One dosing_journal row in state ``intent`` — the minimum the check
+    constraints accept (no timestamps or evidence required at that state)."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO dosing_journal "
+                " (id, device_pk, idempotency_key, state, requested_ml, intent_at) "
+                "VALUES (:id, :device_pk, :key, 'intent', 1.0, now())"
+            ),
+            {"id": uuid.uuid4(), "device_pk": device_pk, "key": uuid.uuid4()},
+        )
+
+
+def test_forget_refuses_a_device_that_history_still_references() -> None:
+    """``calibration_records.device_pk`` and ``dosing_journal.device_pk`` are
+    both ``ON DELETE RESTRICT``. Before this, `forget_device` ran a bare
+    DELETE and let Postgres refuse — an IntegrityError, surfaced as a 500.
+    The refusal is now a decision the store makes inside the same
+    transaction, and the endpoint says what holds the row and what the
+    operator can still do (unadopt), rather than "internal server error".
+
+    Latent rather than live — nothing writes either table yet — which is
+    exactly why it is pinned here: the first calibration written would have
+    turned "clear" into a 500 with no test to say why.
+    """
+
+    async def scenario() -> tuple[int, str, int, str, int, int]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            pk = await _device_pk(engine, "pi-pwm-0")
+
+            await _add_calibration(engine, pk)
+            await _add_calibration(engine, pk)
+            held = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+
+            await _add_dose_intent(engine, pk)
+            held_both = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+
+            # The row is untouched by the refusals — still there, still detached.
+            survivors = await device_count(engine)
+
+            # Once nothing references it, the same request goes through.
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM dosing_journal WHERE device_pk = :pk"), {"pk": pk}
+                )
+                await conn.execute(
+                    text("DELETE FROM calibration_records WHERE device_pk = :pk"), {"pk": pk}
+                )
+            cleared = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            return (
+                held.status_code,
+                held.json()["detail"],
+                held_both.status_code,
+                held_both.json()["detail"],
+                survivors,
+                cleared.status_code,
+            )
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    held, reason, held_both, reason_both, survivors, cleared = run(scenario)
+    assert held == 409, reason
+    assert reason == (
+        "2 calibration records reference this device; it can be unadopted but not cleared."
+    )
+    assert held_both == 409, reason_both
+    assert reason_both == (
+        "2 calibration records and 1 dosing journal entry reference this device; "
+        "it can be unadopted but not cleared."
+    )
+    assert survivors == 1, "a refused forget deletes nothing"
+    assert cleared == 204, "with the references gone, forget is the plain path again"
+
+
+def test_forget_turns_a_late_integrity_error_into_the_same_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last line of defence: a referencing row that lands between the
+    store's pre-check and its DELETE. The pre-check cannot see it; Postgres
+    still refuses (``ON DELETE RESTRICT``); that refusal must read as the same
+    409, not a 500. Simulated by blinding the pre-check once and writing the
+    calibration from inside it, in its own committed transaction."""
+
+    async def scenario() -> tuple[int, str, int]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        c, headers = await client_for(engine)
+        try:
+            await bind_light(c, headers, "pi-pwm-0", "0")
+            await c.delete("/api/v1/devices/pi-pwm-0", headers=headers)
+            pk = await _device_pk(engine, "pi-pwm-0")
+
+            real = Store._forget_holders
+            calls = 0
+
+            async def blind_once(self: Store, conn: Any, device_pk: uuid.UUID) -> dict[str, int]:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    # Saw nothing; make it untrue before the DELETE runs.
+                    await _add_calibration(engine, pk)
+                    return {}
+                return await real(self, conn, device_pk)
+
+            monkeypatch.setattr(Store, "_forget_holders", blind_once)
+            raced = await c.post("/api/v1/devices/pi-pwm-0/forget", headers=headers)
+            monkeypatch.undo()
+
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM calibration_records WHERE device_pk = :pk"), {"pk": pk}
+                )
+            return raced.status_code, raced.json()["detail"], await device_count(engine)
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    code, reason, survivors = run(scenario)
+    assert code == 409, reason
+    assert reason == (
+        "1 calibration record references this device; it can be unadopted but not cleared."
+    ), "the fallback re-counts after rollback, so the reason is still exact"
+    assert survivors == 1
+
+
 # --------------------------------------------------- the order things arrive in
 
 
