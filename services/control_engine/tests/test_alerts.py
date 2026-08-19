@@ -265,6 +265,47 @@ def test_priming_from_an_open_episode_does_not_re_announce() -> None:
     run(scenario)
 
 
+def test_resync_forgets_an_episode_closed_elsewhere() -> None:
+    """The API closes an episode when its bound is removed from the band.
+
+    Without a resync the mirror keeps calling the bound open, so a re-set band
+    never re-raises a live breach: the reading below is still cold and would
+    have gone unannounced. With it, the record wins and the breach is raised
+    afresh — the row the API closed is history, this is a new episode.
+    """
+
+    async def scenario() -> None:
+        store = FakeStore({"ds18b20-28-000000bfe244": frozenset[AlertBound]({"min"})})
+        publish = Recorder()
+        supervisor = AlertSupervisor(store, publish)
+        await supervisor.prime()
+
+        store._open = {}  # the API closed it when the operator removed the bound
+        await supervisor.resync()
+
+        await supervisor.on_reading(reading(23.0), BAND)  # band re-set, still cold
+        assert [a.state for _, a in publish.published] == ["breach"]
+        assert store.calls == [("raise", "ds18b20-28-000000bfe244", "min")]
+
+    run(scenario)
+
+
+def test_resync_is_a_no_op_when_the_record_agrees() -> None:
+    async def scenario() -> None:
+        store = FakeStore({"ds18b20-28-000000bfe244": frozenset[AlertBound]({"min"})})
+        publish = Recorder()
+        supervisor = AlertSupervisor(store, publish)
+        await supervisor.prime()
+        await supervisor.on_reading(reading(23.0), BAND)  # seen, still open, nothing said
+
+        await supervisor.resync()
+
+        await supervisor.on_reading(reading(23.0), BAND)
+        assert publish.published == []
+
+    run(scenario)
+
+
 def test_a_device_with_no_configured_band_is_skipped() -> None:
     async def scenario() -> None:
         publish = Recorder()
@@ -273,5 +314,36 @@ def test_a_device_with_no_configured_band_is_skipped() -> None:
 
         assert await supervisor.on_reading(reading(-40.0), empty) == []
         assert publish.published == []
+
+    run(scenario)
+
+
+def test_resync_keeps_an_episode_raised_while_the_record_was_being_read() -> None:
+    """The record read is an await and the sensor callback is another task: a
+    breach can begin between the read starting and finishing. Replacing the
+    mirror with the read would forget it, and the next reading would re-raise
+    into the partial unique index and lose the alert. Reconciled: the raise
+    survives the resync."""
+
+    async def scenario() -> None:
+        store = FakeStore()
+        publish = Recorder()
+        supervisor = AlertSupervisor(store, publish)
+        await supervisor.prime()
+
+        # Make the read slow enough to interleave, and raise during it.
+        original = store.open_bounds
+
+        async def slow_read() -> Mapping[str, frozenset[str]]:
+            await supervisor.on_reading(reading(23.0), BAND)  # breach raised mid-read
+            return await original()
+
+        store.open_bounds = slow_read  # type: ignore[method-assign]
+        await supervisor.resync()
+
+        # A second cold reading must NOT re-raise: the mirror still holds it.
+        await supervisor.on_reading(reading(23.0), BAND)
+        assert [a.state for _, a in publish.published] == ["breach"]
+        assert store.calls == [("raise", "ds18b20-28-000000bfe244", "min")]
 
     run(scenario)
