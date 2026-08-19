@@ -462,7 +462,15 @@ class TestWebSocketStream:
             publisher.start()
             publisher.join(timeout=30)
 
-            frame = json.loads(ws.receive_text())
+            # Since H3 the bridge replays every actuator's retained state right
+            # after `ready` — including other suites' actuators on this shared
+            # BR_STATE — so read until led-blue's frame rather than assuming
+            # the first frame is the live one.
+            frame: dict[str, Any] = {}
+            for _ in range(64):
+                frame = json.loads(ws.receive_text())
+                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == "led-blue":
+                    break
             assert frame["kind"] == "state"
             assert frame["payload"]["actuator_id"] == "led-blue"
             assert frame["override"] is not None, "state frames must carry override context"
