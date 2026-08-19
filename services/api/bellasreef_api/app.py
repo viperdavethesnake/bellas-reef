@@ -69,7 +69,7 @@ from bellasreef_api.security import (
     issue_access_token,
     verify_access_token,
 )
-from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, Store
+from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, DeviceReferencedError, Store
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 from bellasreef_api.telemetry import TelemetryWriter
 
@@ -655,6 +655,28 @@ def _alert_view(row: AlertRecord) -> "AlertView":
         cleared_at=row.cleared_at,
         cleared_value=row.cleared_value,
     )
+
+
+#: What each ``ON DELETE RESTRICT`` table onto ``devices`` is called in a 409
+#: reason, singular and plural. Keys are the store's table names.
+_HOLDER_NOUNS: Final[dict[str, tuple[str, str]]] = {
+    "calibration_records": ("calibration record", "calibration records"),
+    "dosing_journal": ("dosing journal entry", "dosing journal entries"),
+}
+
+
+def _held_reason(holders: dict[str, int]) -> str:
+    """The one sentence a refused forget carries, e.g. ``2 calibration records
+    and 1 dosing journal entry reference this device; it can be unadopted but
+    not cleared.`` Names what holds the row and what the operator can still do,
+    so the 409 reads as a decision rather than an accident."""
+    parts = [
+        f"{n} {_HOLDER_NOUNS.get(table, (table, table))[0 if n == 1 else 1]}"
+        for table, n in holders.items()
+    ]
+    subject = " and ".join(parts) or "history rows"
+    verb = "references" if sum(holders.values()) == 1 else "reference"
+    return f"{subject} {verb} this device; it can be unadopted but not cleared."
 
 
 def build_app(
@@ -1618,7 +1640,14 @@ def build_app(
             204: {"description": "Deleted. Identity and settings are gone."},
             401: AUTH_401,
             404: {"description": "No such device."},
-            409: {"description": "Still adopted. Unbind it first."},
+            409: {
+                "description": (
+                    "Refused, and the detail says why: still adopted (unbind it "
+                    "first), or calibration records / dosing journal entries "
+                    "still reference the device (it can be unadopted but not "
+                    "cleared)."
+                )
+            },
         },
     )
     async def forget_device(
@@ -1637,7 +1666,10 @@ def build_app(
         No assignment publish: a detached device holds no channel claim to
         retract, and `unbind_device`'s tombstone already recorded the release.
         """
-        outcome = await store.forget_device(device_id)
+        try:
+            outcome = await store.forget_device(device_id)
+        except DeviceReferencedError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, _held_reason(exc.holders)) from exc
         if outcome == "missing":
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"no device {device_id!r}.")
         if outcome == "adopted":

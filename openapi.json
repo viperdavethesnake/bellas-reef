@@ -2285,7 +2285,7 @@
             "description": "No such device."
           },
           "409": {
-            "description": "Still adopted. Unbind it first."
+            "description": "Refused, and the detail says why: still adopted (unbind it first), or calibration records / dosing journal entries still reference the device (it can be unadopted but not cleared)."
           },
           "422": {
             "content": {
