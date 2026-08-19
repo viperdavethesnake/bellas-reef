@@ -18,7 +18,8 @@ from uuid import UUID, uuid4
 
 from bellasreef_contracts import LIGHT_HEARTBEAT_TIMEOUT_S, LIGHT_MAX_RUNTIME_S
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from bellasreef_api.security import hash_refresh_token, new_refresh_token, new_signing_secret
 
@@ -59,6 +60,21 @@ class ChannelHeldError(Exception):
     def __init__(self, holder: str) -> None:
         self.holder = holder
         super().__init__(f"channel now held by {holder!r}")
+
+
+class DeviceReferencedError(Exception):
+    """Raised by :meth:`Store.forget_device` when history rows still point at
+    the device's primary key.
+
+    ``holders`` maps referencing table name to row count, non-zero entries
+    only, in the order the tables are checked (``calibration_records``,
+    ``dosing_journal``). Both are ``ON DELETE RESTRICT`` in the schema; the
+    endpoint turns this into a 409 that says which, and how many.
+    """
+
+    def __init__(self, holders: dict[str, int]) -> None:
+        self.holders = holders
+        super().__init__(f"device still referenced by {holders!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,23 +567,75 @@ class Store:
         ``NOT adopted`` so an operator can never delete history out from under
         a channel that is still claimed; they must unbind first, which is the
         409 this returns "adopted" for.
+
+        The second gate is the schema's, made explicit: ``calibration_records``
+        and ``dosing_journal`` both reference ``devices.id`` with ``ON DELETE
+        RESTRICT``. A bare DELETE against a device they still point at raises
+        :class:`IntegrityError` — which the endpoint would have surfaced as a
+        500. So the referencing rows are counted inside the same transaction
+        first and, if any exist, :class:`DeviceReferencedError` is raised
+        without deleting. The IntegrityError handler beneath is the last line
+        of defence for a referencing row that lands between the count and the
+        DELETE; it re-counts after the rollback so the reason is still exact.
+        Nothing else can make ``DELETE FROM devices`` violate integrity — no
+        other table restricts on it — so the catch is not hiding a second
+        failure under the first one's name.
         """
         async with self._engine.begin() as conn:
             row = (
                 await conn.execute(
-                    text("SELECT adopted FROM devices WHERE device_id = :device_id"),
+                    text("SELECT id, adopted FROM devices WHERE device_id = :device_id"),
                     {"device_id": device_id},
                 )
             ).first()
             if row is None:
                 return "missing"
-            if row[0]:
+            device_pk, adopted = row
+            if adopted:
                 return "adopted"
-            await conn.execute(
-                text("DELETE FROM devices WHERE device_id = :device_id"),
-                {"device_id": device_id},
-            )
+            holders = await self._forget_holders(conn, device_pk)
+            if holders:
+                raise DeviceReferencedError(holders)
+            try:
+                await conn.execute(
+                    text("DELETE FROM devices WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            except IntegrityError as exc:
+                # ``conn`` is now in an aborted transaction and cannot be
+                # queried; count on a second connection, which sees the row
+                # whose commit made the DELETE fail. Raising out of the
+                # ``begin()`` block rolls the first one back.
+                async with self._engine.connect() as fresh:
+                    holders = await self._forget_holders(fresh, device_pk)
+                raise DeviceReferencedError(holders) from exc
             return "forgotten"
+
+    async def _forget_holders(self, conn: AsyncConnection, device_pk: UUID) -> dict[str, int]:
+        """Rows that would make ``DELETE FROM devices`` fail, by table.
+
+        Non-zero counts only, so an empty dict means "nothing holds it". The
+        two tables listed here are exactly the ``ON DELETE RESTRICT`` foreign
+        keys onto ``devices.id`` in the schema; adding a third such key means
+        adding it here, or the endpoint is back to a 500 for that table.
+        """
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT "
+                        " (SELECT count(*) FROM calibration_records WHERE device_pk = :pk)"
+                        "   AS calibration_records,"
+                        " (SELECT count(*) FROM dosing_journal WHERE device_pk = :pk)"
+                        "   AS dosing_journal"
+                    ),
+                    {"pk": device_pk},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        return {table: int(n) for table, n in row.items() if n}
 
     async def adopted_assignments(self) -> list[dict[str, Any]]:
         """Every device an operator has claimed, for republishing on startup.
