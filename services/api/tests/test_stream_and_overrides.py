@@ -471,6 +471,60 @@ class TestWebSocketStream:
 
         run(engine.dispose)
 
+    def test_a_fresh_socket_receives_the_last_known_state_before_anything_changes(self) -> None:
+        """H3 (2026-08-18): a client that connected after the last state
+        publish saw "no state yet" on every light, indefinitely — the bridge
+        forwarded live messages only, and BR_STATE's retained last value per
+        actuator was never read. Publish first, connect second: the state must
+        arrive right after `ready` without anything else moving.
+        """
+        app, token, engine = self._app_and_token()
+
+        async def publish_before_anyone_listens() -> None:
+            from bellasreef_contracts import ActuatorState, PwmLevel
+            from bellasreef_hardware_io.spine import Spine
+
+            spine = Spine(os.environ[_NATS])
+            await spine.connect()
+            await spine.publish_state(
+                ActuatorState(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    actuator_id="led-blue",
+                    level=PwmLevel(duty=0.42),
+                    reason="commanded",
+                    since=datetime.now(UTC),
+                )
+            )
+            await spine.close()
+
+        publisher = threading.Thread(target=lambda: asyncio.run(publish_before_anyone_listens()))
+        publisher.start()
+        publisher.join(timeout=30)
+
+        with TestClient(app) as client, client.websocket_connect("/api/v1/stream") as ws:
+            ws.send_text(json.dumps({"token": token}))
+            ready = json.loads(ws.receive_text())
+            assert ready["kind"] == "ready"
+            # BR_STATE is shared with every other suite on this NATS, so the
+            # replay may carry other actuators' last states too. Nothing is
+            # publishing now, so everything that arrives is replay; led-blue
+            # must be among the first few frames.
+            seen: list[dict[str, Any]] = []
+            for _ in range(16):
+                frame = json.loads(ws.receive_text())
+                seen.append(frame)
+                if frame["kind"] == "state" and frame["payload"]["actuator_id"] == "led-blue":
+                    break
+            mine = [
+                f for f in seen if f["kind"] == "state" and f["payload"]["actuator_id"] == "led-blue"
+            ]
+            assert mine, f"no retained state for led-blue after ready; got {seen}"
+            assert mine[0]["payload"]["level"]["duty"] == pytest.approx(0.42)
+
+        run(engine.dispose)
+
     def test_a_revoked_client_is_disconnected_at_the_next_frame(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
