@@ -1288,7 +1288,7 @@ def build_app(
     )
     async def bind_device(
         body: BindDeviceRequest,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> BoundDevice:
         """Bind an announced capability channel to a device.
 
@@ -1402,6 +1402,8 @@ def build_app(
                 )
             )
 
+        # ``actor`` in every config event: the sink otherwise fills it with its
+        # own source name (``api``), which names the process, not the operator.
         await sink(
             "device.bound",
             {
@@ -1409,6 +1411,7 @@ def build_app(
                 "driver_type": body.driver_type,
                 "channel": body.channel,
                 "created": created,
+                "actor": str(actor),
             },
             category="config",
         )
@@ -1450,7 +1453,7 @@ def build_app(
     async def rename_device(
         device_id: str,
         body: DeviceName,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> DeviceNameView:
         """Name a device, or clear the name.
 
@@ -1463,7 +1466,7 @@ def build_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
         await sink(
             "device.renamed",
-            {"device_id": device_id, "display_name": body.display_name},
+            {"device_id": device_id, "display_name": body.display_name, "actor": str(actor)},
             category="config",
         )
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
@@ -1482,7 +1485,7 @@ def build_app(
     )
     async def unbind_device(
         device_id: str,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> Response:
         """Release a device's claim on its hardware channel.
 
@@ -1536,6 +1539,7 @@ def build_app(
                 "device_id": row["device_id"],
                 "driver_type": row["driver_type"],
                 "binding": row["binding"],
+                "actor": str(actor),
             },
             category="config",
         )
@@ -1555,7 +1559,7 @@ def build_app(
     )
     async def readopt_device(
         device_id: str,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> DeviceView:
         """Reattach a detached device to the channel its row still remembers.
 
@@ -1598,7 +1602,7 @@ def build_app(
 
         await sink(
             "device.bound",
-            {"device_id": device_id, "readopt": True},
+            {"device_id": device_id, "readopt": True, "actor": str(actor)},
             category="config",
         )
         full = next(d for d in await store.list_devices() if d["device_id"] == device_id)
@@ -1619,7 +1623,7 @@ def build_app(
     )
     async def forget_device(
         device_id: str,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> Response:
         """Delete a detached device row for good.
 
@@ -1641,7 +1645,11 @@ def build_app(
                 status.HTTP_409_CONFLICT,
                 f"{device_id!r} is adopted. Unbind it first.",
             )
-        await sink("device.forgotten", {"device_id": device_id}, category="config")
+        await sink(
+            "device.forgotten",
+            {"device_id": device_id, "actor": str(actor)},
+            category="config",
+        )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get(
@@ -1814,7 +1822,7 @@ def build_app(
     async def put_thresholds(
         device_id: str,
         body: AlertThresholds,
-        _: Annotated[UUID, Depends(current_client)],
+        actor: Annotated[UUID, Depends(current_client)],
     ) -> AlertThresholdsView:
         """Set or clear the band. The engine picks up the change within seconds.
 
@@ -1844,6 +1852,7 @@ def build_app(
                 "minimum": body.minimum,
                 "maximum": body.maximum,
                 "clear_margin": body.clear_margin,
+                "actor": str(actor),
             },
             category="config",
         )
