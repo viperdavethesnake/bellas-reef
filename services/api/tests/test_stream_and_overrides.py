@@ -518,7 +518,9 @@ class TestWebSocketStream:
                 if frame["kind"] == "state" and frame["payload"]["actuator_id"] == "led-blue":
                     break
             mine = [
-                f for f in seen if f["kind"] == "state" and f["payload"]["actuator_id"] == "led-blue"
+                f
+                for f in seen
+                if f["kind"] == "state" and f["payload"]["actuator_id"] == "led-blue"
             ]
             assert mine, f"no retained state for led-blue after ready; got {seen}"
             assert mine[0]["payload"]["level"]["duty"] == pytest.approx(0.42)
