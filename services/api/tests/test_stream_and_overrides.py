@@ -602,7 +602,12 @@ class TestWebSocketStream:
             worker.join(timeout=30)
 
             # The frame that would have been sent instead carries the close.
+            # Since H3 the socket may already hold replayed retained states,
+            # buffered before the revoke; drain those — each is a real frame —
+            # and the close must come within a bounded number of reads.
             with pytest.raises(Exception):  # noqa: B017
-                ws.receive_text()
+                for _ in range(64):
+                    frame = json.loads(ws.receive_text())
+                    assert frame["kind"] in {"state", "sensor", "alert"}, frame
 
         run(engine.dispose)
