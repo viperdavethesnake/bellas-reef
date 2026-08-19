@@ -3,11 +3,16 @@
 **Date:** 2026-08-18
 **Input:** `docs/bellas-reef-ios-ux-review.md` (David's review, 2026-08-17) with its §8 Tier E answers.
 **Code audited:** iOS `main` `9f9847f`, backend `main` `d5d4515`.
-**Status:** proposals for David's triage. Items marked *built* are on the iOS branch
-`ux-review/tier-a-b` — draft PR viperdavethesnake/bellasreef-ios#9, one commit per item, kit
-157 tests / 31 suites green, installed on the iPhone 17 sim — for review. Nothing is merged.
-Built 2026-08-18 13:20–13:45: A1, A2, A3(3), A4, A5, A6, A7, A8 (client half), A9, B2, B5, B6,
-B8 (two of three), E6.
+**Status 2026-08-19 01:00:** iOS #9 **merged** (Tier A/B built set + C1/C2 System index +
+H2 dot + H3 never-regress + the Hardware-leaf layout-loop fix + Tank drops frames for
+unadopted devices). Backend merged and deployed: H3 stream replay (#50), H1/H2 history
+step-hold (#52), CI apt fix (#51), A8 backend `actor` (#54). Open for David: iOS #10 (B7
+rediscovery — passed on the sim, verify on the Wi-Fi-only redeploy), iOS #11 (B4 scrub +
+audio graph — gesture needs a hands-on pass), backend #55 (forget 409), #56 (threshold-clear
+closes episode + engine resync), #53 (chip-state spec). Findings from David's live review that
+were not in the original document: **H1** (light with no change inside the window had no
+series), **H2** (a lone bucket rendered as nothing), **H3** (no state on connect) — all three
+fixed and deployed.
 
 ## How to read this
 
@@ -125,7 +130,7 @@ is `ds18b20-<rom>` and the channel is `<rom>`.
 **Proposal:** when `channel` is a suffix of `driverId`, omit it. `ds18b20-28-000000bfe244 ·
 temperature`. **Touches:** `SystemView.deviceSubtitle`. **Risk:** none.
 
-### A8 · Audit log is not a post-mortem record — **accept 3 of 4, S–M; one is done backend-side**
+### A8 · Audit log is not a post-mortem record — **done: client half in #9, backend `actor` in #54**
 
 Four separate things, as the review says:
 - **UUID as row identity** → device name from the catalog when the event carries a `target` /
@@ -182,7 +187,7 @@ with three states only (live / stale / disconnected), teal / amber / amber, matc
 `HealthTone`; no glass of its own (design brief §7.6). Prototype on the branch behind a flag if
 David wants to see it before deciding.
 
-### B4 · Chart capability unused — **split**
+### B4 · Chart capability unused — **split; scrub + audio graph built (iOS #11), gesture needs a hands-on pass**
 
 - **Scrub / crosshair readout** — accept, **M**: `chartOverlay` + drag gesture, a readout of the
   bucket under the finger (mean, min–max, time). Not built yet; worth its own commit.
@@ -207,7 +212,7 @@ the axis (the review's "clamp to available data" would make 7D lie about being 7
 one-line caption when data covers < 50 % of the window: "Data starts <date> — the hub has
 recorded 1 day of the 7 shown." Honest, and it says why the plot is empty.
 
-### B7 · Hub addressed by typed IP — **reject the diagnosis, accept the consequence, M**
+### B7 · Hub addressed by typed IP — **built (iOS #10); passed on the sim, verify on Wi-Fi-only**
 
 **Code:** discovery is already `NWBrowser` for `_bellasreef._tcp` (`HubDiscovery.swift`), with
 manual entry as the documented fallback. What the reviewer saw is the *result* of discovery: the
@@ -234,7 +239,7 @@ returns a new one).
 E2 is answered ("dozens at most; RP1 + one PCA9685 board"), so these can be scoped. Sized for
 that answer, not for a rack.
 
-### C1 · System tab will not scale — **design, L; the Hardware leaf is where follow-up 3 lands**
+### C1 · System tab will not scale — **built (#9: index + Devices/Hardware/Access leaves); chip state spec'd in #53**
 
 With ~20 PWM channels + a few probes as the ceiling, "will not scale" is bounded — but the
 five-concerns-in-one-scroll point stands at today's size (25 rows for 3 devices). Proposal for
@@ -245,7 +250,7 @@ the backend half: a `ChipState` message on `bellasreef.chip.<source>` (contracts
 store + `GET /api/v1/hardware`, iOS view. **Alerts** and **Units** from the review's sketch:
 Units is one row and can stay on the index; Alerts has no global content until D1/C5.
 
-### C2 · Device and channel are different nouns — **design, folds into C1**
+### C2 · Device and channel are different nouns — **built with C1 (#9)**
 
 Agree. Devices (role-bearing, named) and channels (board-native) split when C1 lands;
 transport identity moves to device detail; register state to Hardware. This is the same design
