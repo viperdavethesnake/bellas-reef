@@ -5,16 +5,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, time, timedelta
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from bellasreef_contracts import ActuatorCommand, DeviceAssignment
-from bellasreef_control_engine.app import ControlEngine, load_profiles
+from bellasreef_contracts import ActuatorCommand, DeviceAssignment, ScheduleDefinition
+from bellasreef_control_engine.app import ControlEngine
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_db.overrides import (
@@ -24,6 +23,7 @@ from bellasreef_db.overrides import (
     ReleaseReason,
     WakeReport,
 )
+from bellasreef_db.schedules import ScheduleStore
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -139,6 +139,28 @@ class _FakeOverrideStore(OverrideStore):
                 del self.rows[target]
                 return True
         return False
+
+
+class _FakeScheduleStore(ScheduleStore):
+    """A ScheduleStore whose assigned curves live in a dict, not Postgres.
+
+    Subclasses ScheduleStore (rather than duck-typing) for the same reason
+    _FakeOverrideStore subclasses OverrideStore: ``engine.schedules`` stays a
+    real ``ScheduleStore | None`` under mypy --strict. Deliberately does not
+    call ``super().__init__`` — it needs no ``AsyncEngine``, since
+    ``assigned_curves`` is the only method these tests exercise.
+    """
+
+    def __init__(self) -> None:
+        self.curves: dict[str, ScheduleDefinition] = {}
+        #: When True, assigned_curves raises instead of returning — simulates
+        #: a flapping database.
+        self.fail = False
+
+    async def assigned_curves(self) -> dict[str, ScheduleDefinition]:
+        if self.fail:
+            raise RuntimeError("schedule store unavailable")
+        return dict(self.curves)
 
 
 @pytest.fixture
@@ -746,27 +768,114 @@ class TestReconnectReDrain:
         assert engine._assignments_loaded is True
 
 
-class TestProfileLoading:
-    def test_loads_the_shipped_example(self) -> None:
-        profiles = load_profiles(Path("deploy/config/lighting.json"))
-        assert [p.channel_id for p in profiles] == ["led-blue"]
-        assert profiles[0].duty_at(datetime(2026, 6, 1, 13, tzinfo=UTC)) == pytest.approx(1.0)
+class TestScheduleReload:
+    """`_reload_schedules` (Task 7): the engine re-reads Postgres every tick,
+    so an edit the API made is live within one tick with no push channel to
+    desync — the archive's schedules died of exactly that."""
 
-    def test_an_invalid_profile_raises_rather_than_starting_half_configured(
-        self, tmp_path: Path
-    ) -> None:
-        """Half a schedule would light a tank to a shape nobody designed."""
-        bad = tmp_path / "bad.json"
-        bad.write_text(
-            json.dumps(
-                [
-                    {
-                        "channel_id": "x",
-                        "anchor": "clock",
-                        "points": [{"at": "08:00:00", "duty": 2.0}],
-                    }
-                ]
-            )
+    def test_schedule_edit_is_live_within_a_tick(self) -> None:
+        store = _FakeScheduleStore()
+        curve_a = ScheduleDefinition(
+            name="a",
+            points=(RampPoint(at=time(0, 0), duty=0.3), RampPoint(at=time(12, 0), duty=0.3)),
         )
-        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
-            load_profiles(bad)
+        curve_b = ScheduleDefinition(
+            name="b",
+            points=(RampPoint(at=time(0, 0), duty=0.7), RampPoint(at=time(12, 0), duty=0.7)),
+        )
+        store.curves = {"pi-pwm-0": curve_a}
+        engine = ControlEngine([], metrics_port=0, schedule_store=store)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+
+        asyncio.run(engine._tick(datetime(2026, 6, 1, 6, tzinfo=UTC)))
+        assert fake.published[-1].level.duty == pytest.approx(0.3)  # type: ignore[union-attr]
+
+        # The API edits the assignment against Postgres, mid-run — not
+        # through anything on this engine object.
+        store.curves = {"pi-pwm-0": curve_b}
+        asyncio.run(engine._tick(datetime(2026, 6, 1, 6, 1, tzinfo=UTC)))
+        assert fake.published[-1].level.duty == pytest.approx(0.7)  # type: ignore[union-attr]
+
+    def test_schedule_store_error_keeps_last_good_set(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = _FakeScheduleStore()
+        curve_a = ScheduleDefinition(
+            name="a",
+            points=(RampPoint(at=time(0, 0), duty=0.0), RampPoint(at=time(12, 0), duty=1.0)),
+        )
+        store.curves = {"pi-pwm-0": curve_a}
+        engine = ControlEngine([], metrics_port=0, schedule_store=store)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+
+        asyncio.run(engine._tick(datetime(2026, 6, 1, 6, tzinfo=UTC)))
+        assert fake.published[-1].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
+
+        store.fail = True
+        with caplog.at_level(logging.WARNING, logger="bellasreef_control_engine.app"):
+            asyncio.run(engine._tick(datetime(2026, 6, 1, 9, tzinfo=UTC)))
+            asyncio.run(engine._tick(datetime(2026, 6, 1, 12, tzinfo=UTC)))
+
+        # Kept the last good curve throughout the outage: the duty at 12:00
+        # follows curve_a's own ramp, not some fallback or frozen value — the
+        # schedule keeps ticking, only the store read is broken.
+        assert fake.published[-1].level.duty == pytest.approx(1.0)  # type: ignore[union-attr]
+
+        samples = [s for m in engine.metrics.schedule_reload_errors.collect() for s in m.samples]
+        error_total = sum(
+            s.value for s in samples if s.name == "bellasreef_schedule_reload_errors_total"
+        )
+        assert error_total == 2.0
+
+        warnings = [r for r in caplog.records if "schedule reload failed" in r.message]
+        assert len(warnings) == 1  # one log per outage, not per failing tick
+
+    def test_no_store_means_no_schedules_and_no_crash(self) -> None:
+        """schedule_store=None (db-less dev/drill mode) must not crash the
+        reload step, and must not conjure schedules out of nowhere."""
+        engine = ControlEngine([], metrics_port=0)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+        assert engine.schedules is None
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+
+        assert fake.published == []
+
+    def test_unassign_walks_channel_dark(self) -> None:
+        store = _FakeScheduleStore()
+        curve = ScheduleDefinition(
+            name="a",
+            points=(RampPoint(at=time(0, 0), duty=0.6), RampPoint(at=time(12, 0), duty=0.6)),
+        )
+        store.curves = {"pi-pwm-0": curve}
+        engine = ControlEngine([], metrics_port=0, schedule_store=store, max_duty_delta_per_s=0.05)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+
+        t0 = datetime(2026, 6, 1, 6, 0, 0, tzinfo=UTC)
+        asyncio.run(engine._tick(t0))  # cold; slew starts from SAFE_DUTY
+        asyncio.run(engine._tick(t0 + timedelta(seconds=15)))  # settles at 0.6
+        assert fake.published[-1].level.duty == pytest.approx(0.6)  # type: ignore[union-attr]
+
+        # The API unassigns the schedule against Postgres.
+        store.curves = {}
+
+        asyncio.run(engine._tick(t0 + timedelta(seconds=20)))  # partial converge toward 0
+        partial = fake.published[-1].level.duty  # type: ignore[union-attr]
+        assert 0.0 < partial < 0.6
+
+        asyncio.run(engine._tick(t0 + timedelta(seconds=40)))  # fully dark
+        assert fake.published[-1].level.duty == pytest.approx(0.0)  # type: ignore[union-attr]
+        settled_count = len(fake.published)
+
+        # Converged and resting at SAFE_DUTY: the channel goes quiet, no
+        # further commands.
+        asyncio.run(engine._tick(t0 + timedelta(seconds=41)))
+        assert len(fake.published) == settled_count

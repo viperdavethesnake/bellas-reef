@@ -168,7 +168,6 @@ services:
     user: "1000:1000"
     environment:
       BELLASREEF_NATS_URL: nats://nats:4222
-      BELLASREEF_LIGHTING_PROFILES: /config/lighting.json
       BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
       # Global slew: max duty change per second, for schedule-driven and
       # ramp-hold movement (a snap hold is exempt — spec 2026-08-17). 0.05
@@ -182,8 +181,6 @@ services:
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
       BELLASREEF_METRICS_PORT: "9102"
       BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
-    volumes:
-      - ./config:/config:ro
     expose:
       - "9102"
     restart: unless-stopped
