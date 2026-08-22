@@ -43,6 +43,7 @@ __all__ = [
     "CapabilityAnnouncement",
     "CapabilityChannel",
     "CapabilitySource",
+    "ChipState",
     "ControlAuthority",
     "DeviceAssignment",
     "DeviceId",
@@ -236,6 +237,26 @@ class CapabilityAnnouncement(_Message):
     #: announcement.
     hardware_source: CapabilitySource
     channels: list[CapabilityChannel]
+
+
+class ChipState(_Message):
+    """What one hardware source is configured as, right now.
+
+    Published on ``bellasreef.chip.<source>.<instance>`` and retained
+    last-value per subject, like a capability announcement — a consumer that
+    starts late still learns how the chip is set up. Per hardware source
+    instance, not per channel: frequency, polarity, output mode and
+    "initialised" are properties of the chip (spec 2026-08-19).
+    """
+
+    hardware_source: CapabilitySource
+    instance: str = Field(min_length=1, max_length=64)
+    initialised: bool
+    initialised_at: AwareDatetime | None = None
+    #: Facts a client renders as a table. Free-form for the same reason
+    #: CapabilityChannel.detail is: they differ per source and no consumer
+    #: should switch on them. Keys are stable strings; values scalars.
+    facts: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
 class DeviceAssignment(_Message):

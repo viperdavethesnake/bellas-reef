@@ -25,6 +25,6 @@
     <type>_bellasreef._tcp</type>
     <port>8000</port>
     <txt-record>api=/api/v1</txt-record>
-    <txt-record>contracts=4.1.0</txt-record>
+    <txt-record>contracts=4.2.0</txt-record>
   </service>
 </service-group>
