@@ -153,6 +153,8 @@ class TestScheduleJourney:
 
         # ---- place a ramp hold at 50%: published duty is held -----------
         t2 = t1 + timedelta(minutes=1)
+        # written directly — hold placement/expiry is the override store's
+        # proven machinery, out of this journey's scope
         engine._held[CHANNEL] = ActiveOverride(
             id=uuid4(),
             target=CHANNEL,

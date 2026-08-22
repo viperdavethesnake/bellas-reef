@@ -43,6 +43,7 @@ from typing import Self
 from zoneinfo import ZoneInfo
 
 from bellasreef_contracts.schedules import (
+    CHANNEL_ID_PATTERN,
     Anchor,
     Locale,
     OnMiss,
@@ -68,7 +69,7 @@ class ChannelProfile(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    channel_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    channel_id: str = Field(pattern=CHANNEL_ID_PATTERN)
     anchor: Anchor
     zone: str = "UTC"
     points: tuple[RampPoint, ...] = Field(min_length=2)

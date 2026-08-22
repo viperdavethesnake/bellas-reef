@@ -834,6 +834,52 @@ class TestScheduleReload:
         warnings = [r for r in caplog.records if "schedule reload failed" in r.message]
         assert len(warnings) == 1  # one log per outage, not per failing tick
 
+    def test_malformed_channel_id_row_keeps_last_good_set(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Whole-branch review finding: `ChannelProfile.from_definition` used
+        to live outside `_reload_schedules`' try/except, so a row whose
+        channel_id violates ChannelProfile's pattern (predating the API's
+        write-time check, or written by anything else that talks to this
+        table) raised straight out of the tick loop and crash-looped the
+        engine. It must now degrade exactly like a store read failure: keep
+        the last good profile set, count it, warn once per outage."""
+        store = _FakeScheduleStore()
+        good = ScheduleDefinition(
+            name="a",
+            points=(RampPoint(at=time(0, 0), duty=0.4), RampPoint(at=time(12, 0), duty=0.4)),
+        )
+        store.curves = {"pi-pwm-0": good}
+        engine = ControlEngine([], metrics_port=0, schedule_store=store)
+        fake = _FakePublisher()
+        engine.publisher = fake
+        engine.assignments.apply(_assignment("pi-pwm-0", adopted=True))
+
+        asyncio.run(engine._tick(datetime(2026, 6, 1, 6, tzinfo=UTC)))
+        assert fake.published[-1].level.duty == pytest.approx(0.4)  # type: ignore[union-attr]
+
+        # A row with a pattern-violating channel_id appears in the store.
+        # The API's write-time check (assign_schedule) should have stopped
+        # this from ever landing, but the engine must survive it regardless.
+        store.curves = {"LED-Blue": good}
+        with caplog.at_level(logging.WARNING, logger="bellasreef_control_engine.app"):
+            asyncio.run(engine._tick(datetime(2026, 6, 1, 9, tzinfo=UTC)))
+            asyncio.run(engine._tick(datetime(2026, 6, 1, 12, tzinfo=UTC)))
+
+        # Kept the last good schedule set throughout: pi-pwm-0 is still
+        # commanded from the good curve (a flat 0.4), not dropped and not
+        # crashed by the bad row.
+        assert fake.published[-1].level.duty == pytest.approx(0.4)  # type: ignore[union-attr]
+
+        samples = [s for m in engine.metrics.schedule_reload_errors.collect() for s in m.samples]
+        error_total = sum(
+            s.value for s in samples if s.name == "bellasreef_schedule_reload_errors_total"
+        )
+        assert error_total == 2.0
+
+        warnings = [r for r in caplog.records if "schedule reload failed" in r.message]
+        assert len(warnings) == 1  # one log per outage, not per failing tick
+
     def test_no_store_means_no_schedules_and_no_crash(self) -> None:
         """schedule_store=None (db-less dev/drill mode) must not crash the
         reload step, and must not conjure schedules out of nowhere."""

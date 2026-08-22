@@ -495,11 +495,27 @@ class ControlEngine:
         the tick re-reads it, so an edit the API made is live within one tick with
         no push channel to desync — the archive's schedules died of exactly that.
         On a read error, keep the last good set: a flapping database must not
-        strip the tank's schedule."""
+        strip the tank's schedule.
+
+        ``ChannelProfile.from_definition`` lives inside this same try/except,
+        not just the store read: its ``channel_id`` field carries a pattern
+        constraint, and a row with a channel_id that violates it (the API
+        validates on write, but a row can predate that check, or be written
+        by anything else that talks to this table) would otherwise raise
+        outside any handler here and kill the tick loop. Degrading exactly
+        like a store read failure — keep the last good profile set, count it,
+        warn once per outage — is defense in depth for a check that already
+        exists at the API, not the only place it exists.
+        """
         if self.schedules is None:
             return
         try:
             curves = await self.schedules.assigned_curves()
+            profiles = (
+                [ChannelProfile.from_definition(cid, d) for cid, d in sorted(curves.items())]
+                if curves != self._last_curves
+                else None
+            )
         except Exception:
             self.metrics.schedule_reload_errors.inc()
             if not self._schedule_read_failing:  # one log per outage, not per tick
@@ -507,8 +523,7 @@ class ControlEngine:
                 log.warning("schedule reload failed; keeping last good set", exc_info=True)
             return
         self._schedule_read_failing = False
-        if curves != self._last_curves:
-            profiles = [ChannelProfile.from_definition(cid, d) for cid, d in sorted(curves.items())]
+        if profiles is not None:
             self.scheduler.set_profiles(profiles)
             self._last_curves = curves
             self.metrics.lighting_schedules.set(len(profiles))

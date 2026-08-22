@@ -24,6 +24,7 @@ token buys, and it is the whole reason the pairing code needs no rate limiter.
 import asyncio
 import json
 import os
+import re
 import secrets
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -35,7 +36,14 @@ from time import monotonic
 from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
-from bellasreef_contracts import Anchor, DeviceAssignment, Locale, ScheduleDefinition, SchedulePoint
+from bellasreef_contracts import (
+    CHANNEL_ID_PATTERN,
+    Anchor,
+    DeviceAssignment,
+    Locale,
+    ScheduleDefinition,
+    SchedulePoint,
+)
 from bellasreef_db import (
     AlertRecord,
     ClockUntrustedError,
@@ -581,7 +589,7 @@ class ScheduleView(BaseModel):
     name: str
     zone: str
     anchor: Anchor
-    locale: Locale | None
+    locale: Locale | None = None
     points: list[SchedulePoint]
     assigned_channels: list[str]
 
@@ -589,6 +597,16 @@ class ScheduleView(BaseModel):
 class ScheduleAssignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schedule_id: UUID
+
+
+#: Same pattern the engine's ChannelProfile.channel_id field validates
+#: against (bellasreef_contracts.schedules) — checked here too because an
+#: unknown channel is legal (schedule-before-adoption) but a MALFORMED one is
+#: not: without this, the row lands in Postgres and the first place it is
+#: ever rejected is the engine's next reload, building a ChannelProfile from
+#: it. The engine survives that (defense in depth, keep-last-good), but a
+#: malformed id belongs in a 422 at the door, not a warning on a tick.
+_CHANNEL_ID_RE = re.compile(CHANNEL_ID_PATTERN)
 
 
 @dataclass
@@ -2253,6 +2271,7 @@ def build_app(
             401: AUTH_401,
             404: {"description": "Unknown schedule."},
             409: {"description": "The channel is registered observe_only and accepts no commands."},
+            422: {"description": "channel_id is not a legal channel id."},
         },
     )
     async def assign_schedule(
@@ -2266,8 +2285,17 @@ def build_app(
         ``observe_only`` channel accepts no commands, live or scheduled. An
         **unknown** channel is allowed — scheduling before adoption is legal,
         and the engine holds the curve until the channel is adopted (spec
-        2026-08-19).
+        2026-08-19). A **malformed** channel id is not allowed: the engine's
+        ``ChannelProfile`` validates ``channel_id`` against this same
+        pattern, so a request that skipped this check would still write the
+        row and surface only as the engine failing to build a profile for it
+        on the next reload.
         """
+        if not _CHANNEL_ID_RE.match(channel_id):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"{channel_id!r} is not a legal channel id: expected {CHANNEL_ID_PATTERN!r}",
+            )
         _, authority = await store.control_authority_of(channel_id)
         if authority == "observe_only":
             raise HTTPException(

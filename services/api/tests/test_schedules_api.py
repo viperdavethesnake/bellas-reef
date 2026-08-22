@@ -544,6 +544,35 @@ class TestAssign:
 
         assert run(scenario) == 200
 
+    def test_assign_malformed_channel_id_is_422(self) -> None:
+        """Unknown is legal (test above); malformed is not. The engine's
+        ChannelProfile.channel_id validates against this same pattern, so a
+        row that skipped this check would only surface as the engine failing
+        to build a profile for it on the next reload — see the whole-branch
+        review finding this closes."""
+
+        async def scenario() -> tuple[int, str]:
+            engine = await fresh_engine()
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                created = (
+                    await c.post("/api/v1/lighting/schedules", headers=headers, json=curve())
+                ).json()
+                r = await c.put(
+                    "/api/v1/lighting/channels/LED-Blue/schedule",
+                    headers=headers,
+                    json={"schedule_id": created["id"]},
+                )
+            await engine.dispose()
+            return r.status_code, r.text
+
+        code, body = run(scenario)
+        assert code == 422
+        assert "LED-Blue" in body
+
 
 class TestUnassign:
     def test_unassign_then_404(self) -> None:

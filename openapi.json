@@ -1509,7 +1509,6 @@
           "name",
           "zone",
           "anchor",
-          "locale",
           "points",
           "assigned_channels"
         ],
@@ -2828,7 +2827,7 @@
         ]
       },
       "put": {
-        "description": "Point a channel at a named curve, replacing whatever it had.\n\nAuthority-gated the same way ``create_override`` is: an\n``observe_only`` channel accepts no commands, live or scheduled. An\n**unknown** channel is allowed \u2014 scheduling before adoption is legal,\nand the engine holds the curve until the channel is adopted (spec\n2026-08-19).",
+        "description": "Point a channel at a named curve, replacing whatever it had.\n\nAuthority-gated the same way ``create_override`` is: an\n``observe_only`` channel accepts no commands, live or scheduled. An\n**unknown** channel is allowed \u2014 scheduling before adoption is legal,\nand the engine holds the curve until the channel is adopted (spec\n2026-08-19). A **malformed** channel id is not allowed: the engine's\n``ChannelProfile`` validates ``channel_id`` against this same\npattern, so a request that skipped this check would still write the\nrow and surface only as the engine failing to build a profile for it\non the next reload.",
         "operationId": "assignSchedule",
         "parameters": [
           {
@@ -2884,14 +2883,7 @@
             "description": "The channel is registered observe_only and accepts no commands."
           },
           "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
+            "description": "channel_id is not a legal channel id."
           }
         },
         "summary": "Assign Schedule",

@@ -372,6 +372,43 @@ class TestSlewArrival:
         s.mark_emitted(rel, t)
         assert s.due(t + timedelta(seconds=1), {}) == []
 
+    def test_release_to_curve_final_step_inside_deadband_still_lands(self) -> None:
+        """Same bug class as the two tests above, aimed at the one leg
+        neither covers: a RAMP release back onto a profiled channel's
+        non-zero resting duty (0.61, not SAFE_DUTY). Numbers mirror
+        test_final_slew_step_inside_deadband_still_lands — the arrival
+        step's residual (0.0044) sits inside the default 0.005 deadband, so
+        without the arrival bypass this stalls at 0.6056 until refresh."""
+        curve = flat("blue", 0.61)
+        s = LightingScheduler([curve], max_duty_delta_per_s=0.01)  # default deadband 0.005
+
+        # A ramp hold at 0.0 settles immediately on the very first (cold, dt=0)
+        # tick, holding the channel away from the curve's resting duty until
+        # it is released.
+        [held] = s.due(T0, {"blue": ramp_hold(0.0)})
+        assert held.duty == pytest.approx(0.0)
+        s.mark_emitted(held, T0)
+
+        t_release = T0 + timedelta(seconds=1)
+        [released] = s.due(t_release, {})
+        assert released.reason == "converge"
+        s.mark_emitted(released, t_release)
+
+        t_almost = t_release + timedelta(seconds=59.56)
+        [almost] = s.due(t_almost, {})
+        assert almost.duty == pytest.approx(0.6056)
+        assert almost.reason == "converge"
+        s.mark_emitted(almost, t_almost)
+
+        t_arrive = t_almost + timedelta(seconds=1)
+        [arrived] = s.due(t_arrive, {})
+        assert arrived.duty == pytest.approx(0.61)
+        assert arrived.reason == "converge"
+        s.mark_emitted(arrived, t_arrive)
+
+        # at the curve's resting duty: quiet until refresh
+        assert s.due(t_arrive + timedelta(seconds=1), {}) == []
+
 
 def flat(channel: str, duty: float) -> ChannelProfile:
     """A two-point curve that holds one duty all day — the min-length-2 rule

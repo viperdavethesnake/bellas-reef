@@ -36,6 +36,7 @@ from bellasreef_contracts.messages import (
     Transport,
 )
 from bellasreef_contracts.schedules import (
+    CHANNEL_ID_PATTERN,
     Anchor,
     Locale,
     OnMiss,
@@ -45,6 +46,7 @@ from bellasreef_contracts.schedules import (
 )
 
 __all__ = [
+    "CHANNEL_ID_PATTERN",
     "LIGHT_HEARTBEAT_TIMEOUT_S",
     "LIGHT_MAX_RUNTIME_S",
     "SCHEMA_VERSION",

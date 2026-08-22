@@ -25,9 +25,18 @@ reads must validate against exactly one definition of "valid curve".** Two
 copies of this validation is two things that can drift — an API that accepts
 a curve the engine would reject is a schedule that silently never runs.
 ``validate_curve`` is the one rule; :class:`ScheduleDefinition` is the API's
-wire shape and the engine's ``ChannelProfile`` (services/control_engine)
-calls the same function from its own ``points``/``zone``/``anchor``/``locale``
-fields until a later task rewires it onto this model directly.
+wire shape, and the engine's ``ChannelProfile`` (services/control_engine)
+delegates to the same ``validate_curve`` from its own
+``points``/``zone``/``anchor``/``locale`` fields. This is the steady state,
+not a stop on the way to something else: ``ChannelProfile`` stays the
+engine's own runtime type — it carries fields ``ScheduleDefinition`` does not
+(``channel_id``, ``on_miss``) and drops fields it does not need — while the
+one curve-validity rule stays shared so the two can never disagree about
+what a valid curve is. ``CHANNEL_ID_PATTERN`` is the other half of that
+sharing: the API validates an assignment's ``channel_id`` against it before
+the row ever reaches Postgres, so a malformed id 422s at the door instead of
+reaching ``ChannelProfile`` — whose own ``channel_id`` field uses the same
+pattern — for the first time on the engine's next tick.
 
 **The engine never clamps duty.** Sub-8% output is undefined on the XLG
 drivers, and the ruling is snap-to-0 — but that floor belongs to the PCA9685
@@ -45,6 +54,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "CHANNEL_ID_PATTERN",
     "Anchor",
     "Locale",
     "OnMiss",
@@ -52,6 +62,13 @@ __all__ = [
     "SchedulePoint",
     "validate_curve",
 ]
+
+#: What a channel id is allowed to look like, shared by the API's assignment
+#: check and the engine's ``ChannelProfile.channel_id`` field. One home for
+#: the pattern: an API check that used a lookalike copy could accept a
+#: channel id the engine would then refuse to build a profile for outside any
+#: try/except, killing the engine's tick loop on every reload.
+CHANNEL_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 
 #: Where a schedule's day *shape* sits in the operator's day.
 #:
