@@ -101,3 +101,31 @@ path, unchanged.
 Solar math, preset catalog, lunar cycle, multi-override queues, per-channel
 slew rates, weather/cloud simulation (archived BA had it; explicitly v2+).
 The schema fields above are the entire v1 cost of the v2 feature.
+
+## 7. Composition law
+
+Two layers, total order, no third:
+
+```
+resting(channel, now) = assigned schedule's duty_at(now)   — else SAFE_DUTY (dark)
+output(channel, now)  = override if one is owed, else resting
+```
+
+- An override always wins and always ends (duration, expiry, lapse-on-wake,
+  every ending audited) — unchanged from today.
+- Release/expiry returns to `resting(channel, now)` — the schedule's value *at
+  that moment*, which closes the hold-transition spec's deferred
+  "resting-state layer" (spec 2026-08-17,
+  `docs/superpowers/specs/2026-08-17-hold-transition-design.md`: "Release
+  returns to today's resting target. With no schedule and no resting-state
+  layer yet, that is `SAFE_DUTY` (dark). The resting-state / schedule layer
+  is the schedules round, not this one."). A held channel's "returns to N %"
+  is computable.
+- Future effects are overrides whose level is a pattern instead of a constant
+  (additive field on the existing override machinery). Future generated
+  schedules replace `duty_at` with a per-day computation behind the same
+  interface. Neither changes this law.
+
+Source: spec 2026-08-19,
+`docs/superpowers/specs/2026-08-19-lighting-schedules-design.md` §Composition
+law.
