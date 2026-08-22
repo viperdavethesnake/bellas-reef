@@ -576,6 +576,66 @@
         "title": "CapabilityView",
         "type": "object"
       },
+      "ChipStateView": {
+        "additionalProperties": false,
+        "description": "What one chip last reported about itself, not what it does for the tank.\n\nA capability is *what channels this hardware offers*; this is *what the\nchip's own registers say* \u2014 prescaler, measured oscillator, INVRT, whether\n`ensure_initialised()` has run. The Hardware leaf's data source (System\ntab, option A, ruled 2026-08-18): a per-chip surface, not a key folded\ninto `CapabilityView.detail` (that field is identity, per #38) and not a\nfield on the adopted device row.",
+        "properties": {
+          "announced_at": {
+            "format": "date-time",
+            "title": "Announced At",
+            "type": "string"
+          },
+          "facts": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "title": "Facts",
+            "type": "object"
+          },
+          "initialised": {
+            "title": "Initialised",
+            "type": "boolean"
+          },
+          "initialised_at": {
+            "format": "date-time",
+            "title": "Initialised At",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance": {
+            "title": "Instance",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "instance",
+          "initialised",
+          "facts",
+          "announced_at"
+        ],
+        "title": "ChipStateView",
+        "type": "object"
+      },
       "Client": {
         "additionalProperties": false,
         "properties": {
@@ -2663,6 +2723,59 @@
         "summary": "Put Thresholds",
         "tags": [
           "alerts"
+        ]
+      }
+    },
+    "/api/v1/hardware": {
+      "get": {
+        "description": "What each chip last reported about itself.\n\nThe Hardware leaf's data source (System tab, option A): per-chip\nregister-level facts \u2014 prescaler, measured oscillator, INVRT,\nwhether initialisation has run \u2014 as last announced by hardware-io.\nOrdered by source then instance; the API is the ordering authority,\nsame reasoning as `/api/v1/capabilities`.",
+        "operationId": "listHardware",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChipStateView"
+                  },
+                  "title": "Response Listhardware",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Hardware",
+        "tags": [
+          "devices"
         ]
       }
     },

@@ -282,6 +282,64 @@ class Store:
             ).mappings()
             return [dict(row) for row in rows]
 
+    # ------------------------------------------------------------ chip state
+
+    async def upsert_chip_state(
+        self,
+        *,
+        source: str,
+        instance: str,
+        initialised: bool,
+        initialised_at: datetime | None,
+        facts: dict[str, Any],
+        announced_at: datetime,
+    ) -> None:
+        """Store what one chip reported, replacing what it said before.
+
+        ``(source, instance)`` is the upsert target per 0020's unique
+        constraint, not the primary key — same shape as
+        :meth:`replace_capabilities`. What hardware-io announces on
+        reconnect is the current truth for that chip, so a later
+        announcement overwrites rather than merges.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO chip_state "
+                    "(id, source, instance, initialised, initialised_at, facts, announced_at) "
+                    "VALUES (:id, :source, :instance, :initialised, :initialised_at, "
+                    "        CAST(:facts AS jsonb), :announced_at) "
+                    "ON CONFLICT (source, instance) DO UPDATE "
+                    "SET initialised = EXCLUDED.initialised, "
+                    "    initialised_at = EXCLUDED.initialised_at, "
+                    "    facts = EXCLUDED.facts, "
+                    "    announced_at = EXCLUDED.announced_at"
+                ),
+                {
+                    "id": uuid4(),
+                    "source": source,
+                    "instance": instance,
+                    "initialised": initialised,
+                    "initialised_at": initialised_at,
+                    "facts": json.dumps(facts),
+                    "announced_at": announced_at,
+                },
+            )
+
+    async def list_chip_state(self) -> list[dict[str, Any]]:
+        """Every chip's last-announced state, ordered by source then instance."""
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT source, instance, initialised, initialised_at, facts, announced_at "
+                        "  FROM chip_state "
+                        " ORDER BY source, instance"
+                    )
+                )
+            ).mappings()
+            return [dict(row) for row in rows]
+
     async def device_bound_to(self, driver_type: str, channel: str) -> str | None:
         """Which device has claimed this capability channel, if any."""
         async with self._engine.connect() as conn:

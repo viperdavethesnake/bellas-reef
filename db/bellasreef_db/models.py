@@ -31,6 +31,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -331,6 +332,56 @@ class Capability(Base):
         # One row per physical thing. A second announcement updates rather than
         # duplicates, so a hardware-io restart does not double the list.
         Index("uq_capabilities_source_channel", "source", "channel", unique=True),
+    )
+
+
+class ChipStateRow(Base):
+    """What one hardware source instance is configured as, right now.
+
+    Tier one of the registry, same status as :class:`Capability` — a fact
+    about the hardware, not an operator's decision. Unlike a capability
+    (per-channel identity), this is per-*chip*: frequency, polarity, output
+    mode and whether ``initialise()`` has run are properties of the board a
+    channel lives on, not of the channel itself. Ruled 2026-08-18: option A —
+    its own surface, not a key in ``Capability.detail`` and not a field on the
+    adopted device row (docs/superpowers/specs/2026-08-19-chip-state-on-the-
+    wire-design.md).
+
+    Rows are replaced on each announcement rather than merged, same reasoning
+    as ``Capability``: what hardware-io reports right now is the truth. Named
+    ``ChipStateRow`` rather than ``ChipState`` to avoid colliding with the
+    contracts message of that name in shared import contexts.
+    """
+
+    __tablename__ = "chip_state"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    #: ``pi-pwm`` | ``pca9685`` | ``w1-bus`` — same vocabulary as
+    #: ``Capability.source``. Deliberately no CHECK constraint here (unlike
+    #: ``Capability``'s ``capability_source_valid``): a new hardware source
+    #: should not need a migration to be storable. The wire's
+    #: ``CapabilitySource`` literal in contracts is the real gate.
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    #: Stable identifier for the chip within its source: an I²C address@bus,
+    #: a pwmchip device path, a 1-Wire bus master name.
+    instance: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    #: Whether this process configured the chip, versus finding it already
+    #: running (or not present at all) from a prior process's state.
+    initialised: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    initialised_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    #: Free-form, source-specific facts a client renders as a table — same
+    #: shape and reasoning as ``Capability.detail``.
+    facts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    announced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # Upsert target: one row per physical chip, not one per message.
+        UniqueConstraint("source", "instance", name="uq_chip_state_source_instance"),
     )
 
 

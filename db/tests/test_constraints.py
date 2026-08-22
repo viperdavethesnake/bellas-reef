@@ -552,3 +552,40 @@ class TestLightingSchedules:
         # channel_id is the PK; assign-replace is an upsert, not a second row.
         with pytest.raises(IntegrityError, match="pk_schedule_assignments"):
             run(lambda: self._insert_assignment("pi-pwm-1", b))
+
+
+class TestChipState:
+    """Migration 0020
+    (docs/superpowers/specs/2026-08-19-chip-state-on-the-wire-design.md
+    §API, option A ruled 2026-08-18): ``chip_state`` — one row per hardware
+    source instance, upserted on ``(source, instance)``.
+    """
+
+    @staticmethod
+    def _chip_sql() -> str:
+        return (
+            "INSERT INTO chip_state "
+            "(id, source, instance, initialised, initialised_at, facts, announced_at) "
+            "VALUES (:id, :source, :instance, :initialised, :initialised_at, "
+            "CAST(:facts AS JSONB), :announced_at)"
+        )
+
+    @staticmethod
+    def _row(**over: object) -> dict[str, object]:
+        now = datetime.now(UTC)
+        row: dict[str, object] = {
+            "id": uuid.uuid4(),
+            "source": "pca9685",
+            "instance": "0x40@1",
+            "initialised": True,
+            "initialised_at": now,
+            "facts": '{"address": "0x40", "bus": 1, "pre_scale": 12}',
+            "announced_at": now,
+        }
+        row.update(over)
+        return row
+
+    def test_one_chip_state_row_per_source_instance(self) -> None:
+        run(lambda: _insert(self._chip_sql(), **self._row()))
+        with pytest.raises(IntegrityError, match="uq_chip_state_source_instance"):
+            run(lambda: _insert(self._chip_sql(), **self._row(id=uuid.uuid4())))
