@@ -13,7 +13,6 @@ rather than a broker.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
@@ -66,26 +65,22 @@ def test_br_chip_stream_is_configured_as_retained_last_value() -> None:
 def test_publish_chip_state_uses_the_sanitized_subject() -> None:
     """The '.' in a PWM instance id must not split the subject token."""
 
-    async def scenario() -> tuple[str, bytes]:
+    async def scenario() -> tuple[str, bytes, ChipState]:
         spine = Spine("nats://example.invalid:4222")
         fake_nc = _FakeNc()
         spine._nc = fake_nc  # type: ignore[assignment]
         state = _chip_state(instance="1f00098000.pwm")
         await spine.publish_chip_state(state)
         subject, payload = fake_nc.published[0]
-        return subject, payload
+        return subject, payload, state
 
-    subject, payload = run(scenario)
+    subject, payload, state = run(scenario)
 
     assert subject == "bellasreef.chip.pi-pwm.1f00098000-pwm"
-    # The payload round-trips back to an equivalent model — what's on the wire
-    # is what was published, not just a subject that looks right.
-    assert ChipState.model_validate_json(payload) == ChipState.model_validate(json.loads(payload))
-    published = ChipState.model_validate_json(payload)
-    assert published.hardware_source == "pi-pwm"
-    assert published.instance == "1f00098000.pwm"
-    assert published.initialised is True
-    assert published.facts == {"frequency_hz": 500, "polarity": "normal"}
+    # The payload round-trips back to the exact model that was published —
+    # including message_id and the two datetimes, which a UUID- or
+    # datetime-serialization bug would otherwise slip past unnoticed.
+    assert ChipState.model_validate_json(payload) == state
 
 
 def test_publish_chip_state_without_a_connection_raises() -> None:
