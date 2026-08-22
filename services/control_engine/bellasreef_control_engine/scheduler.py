@@ -136,6 +136,18 @@ class LightingScheduler:
     def channel_ids(self) -> tuple[str, ...]:
         return tuple(p.channel_id for p in self._profiles)
 
+    def set_profiles(self, profiles: list[ChannelProfile]) -> None:
+        """Swap the schedule set in place. Emission history is deliberately kept:
+        a changed curve is a moved target the slew converges to; a removed
+        assignment falls into the synthetic-channel path and converges to
+        SAFE_DUTY; a held channel keeps its hold memory. Clearing history here
+        would make every schedule edit a cold start — a visible pop for no reason.
+        """
+        ids = [p.channel_id for p in profiles]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate channel_id in profiles")
+        self._profiles = profiles
+
     def due(self, now: datetime, overrides: Mapping[str, HeldTarget] | None = None) -> list[Intent]:
         """Intents that should be published at ``now``.
 
