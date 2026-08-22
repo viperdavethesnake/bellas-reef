@@ -270,6 +270,7 @@ source = { editable = "db" }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "bellasreef-contracts" },
     { name = "bellasreef-service" },
     { name = "sqlalchemy" },
 ]
@@ -278,6 +279,7 @@ dependencies = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "bellasreef-contracts", editable = "contracts/python" },
     { name = "bellasreef-service", editable = "services/shared" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
 ]
