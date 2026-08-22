@@ -768,6 +768,62 @@ class AlertEpisode(Base):
     )
 
 
+class LightingSchedule(Base):
+    """A named lighting curve: a set of points from midnight to midnight, for
+    an individual PWM channel or group of PWM channels (David's ruling,
+    docs/superpowers/specs/2026-08-19-lighting-schedules-design.md).
+
+    ``points`` mirrors ``bellasreef_contracts.schedules.ScheduleDefinition``
+    at rest — a JSONB array of ``{at, duty}``. Validation (≥2 points,
+    ascending unique times, duty in [0, 1]) lives once in contracts and runs
+    at the API boundary; the storage layer is not a second copy of it.
+
+    ``anchor`` is ``'clock'`` only in v1; the solar/lunar values are
+    schema-now, rejected at validation until lighting v2's solar maths lands
+    — the same reservation ``bellasreef_contracts.schedules.Anchor`` makes.
+    """
+
+    __tablename__ = "lighting_schedules"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    points: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    zone: Mapped[str] = mapped_column(String(64), nullable=False, server_default=text("'UTC'"))
+    anchor: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'clock'"))
+    locale: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ScheduleAssignment(Base):
+    """Which schedule drives a channel. One row per channel: assigning
+    replaces rather than adds, so ``channel_id`` is the primary key.
+
+    Named ``schedule_assignments`` / ``ScheduleAssignment`` deliberately, not
+    the bare "assignment" — that word already belongs to the engine's
+    channel-adoption ``AssignmentLedger``, and reusing it here would collide
+    (spec §Data model).
+
+    ``schedule_id`` is ``ON DELETE RESTRICT``: deleting a schedule that is
+    still driving a channel is refused, not cascaded — the forgetDevice
+    lesson (deleting a referenced row must be a rejection, not a 500;
+    d2b35e3), applied here before it could recur.
+    """
+
+    __tablename__ = "schedule_assignments"
+
+    channel_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("lighting_schedules.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class HubIdentity(Base):
     """Who this hub is, decided once and never again.
 
