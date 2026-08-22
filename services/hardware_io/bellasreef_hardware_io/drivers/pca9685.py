@@ -53,9 +53,11 @@ would eventually reinvent it.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Final, Protocol
+from uuid import uuid4
 
-from bellasreef_contracts import ActuatorLevel, ActuatorRegistration, PwmLevel
+from bellasreef_contracts import ActuatorLevel, ActuatorRegistration, ChipState, PwmLevel
 from bellasreef_service import get_logger
 
 from bellasreef_hardware_io.drivers.dimming import light_registration, snap_duty
@@ -220,10 +222,22 @@ class Pca9685Device:
     they configure them independently is how two of them end up disagreeing.
     """
 
-    def __init__(self, bus: I2CBus, address: int = 0x40) -> None:
+    def __init__(self, bus: I2CBus, address: int = 0x40, *, bus_no: int = 1) -> None:
         self._bus = bus
         self._address = address
+        #: Which I²C bus this chip is on. Not used for any register access —
+        #: the caller already opened ``bus`` on it — only to name the chip in
+        #: :meth:`chip_state`'s instance string, matching
+        #: ``capabilities.discover_pca9685``'s ``bus`` detail.
+        self._bus_no = bus_no
         self._initialised = False
+        #: Captured by :meth:`initialise` at its own PRE_SCALE readback, and
+        #: by :meth:`ensure_initialised` respectively. Both ``None`` until the
+        #: chip has actually been initialised; :meth:`chip_state` refuses to
+        #: assemble a message from either being unset rather than fabricate a
+        #: "0" that looks like a measurement.
+        self._pre_scale_read_back: int | None = None
+        self._initialised_at: datetime | None = None
 
     async def ensure_initialised(self) -> None:
         """:meth:`initialise` exactly once per chip, however many channels open.
@@ -237,6 +251,7 @@ class Pca9685Device:
             return
         await self.initialise()
         self._initialised = True
+        self._initialised_at = datetime.now(UTC)
 
     async def initialise(self) -> None:
         """Put the chip into the configuration this project has decided on.
@@ -267,6 +282,10 @@ class Pca9685Device:
                 "The prescaler is only writable while SLEEP is set; a write to a "
                 "running chip is silently discarded."
             )
+        # Captured for chip_state(): the assertion above already proved this
+        # equals PCA9685_PRE_SCALE, so this is a record of the measurement
+        # having been taken, not a new fact.
+        self._pre_scale_read_back = read_back
 
         mode2 = self._bus.read_byte_data(self._address, _MODE2)
         mode2 = (mode2 & ~_M2_OUTDRV) if OPEN_DRAIN else (mode2 | _M2_OUTDRV)
@@ -311,6 +330,43 @@ class Pca9685Device:
         """
         self._bus.write_i2c_block_data(self._address, _ALL_LED_ON_L, [0x00, 0x00, 0x00, _FULL])
 
+    def chip_state(self) -> ChipState:
+        """What this chip is configured as, right now — chip state on the
+        wire (spec 2026-08-19, ruled 2026-08-18: option A, a per-chip
+        Hardware surface, not identity in a capability's ``detail``).
+
+        No I/O: every value here was already captured by
+        :meth:`ensure_initialised` / :meth:`initialise`, which is why calling
+        this before the chip has been initialised is a programming error
+        rather than a missing reading — app.py only calls it after
+        ``open()`` (which initialises the chip) has succeeded.
+        """
+        if self._pre_scale_read_back is None or self._initialised_at is None:
+            raise RuntimeError(
+                "chip_state() called before the chip was initialised — "
+                "ensure_initialised() must run first"
+            )
+        return ChipState(
+            message_id=uuid4(),
+            emitted_at=datetime.now(UTC),
+            source="hardware-io",
+            hardware_source="pca9685",
+            instance=f"{hex(self._address)}@{self._bus_no}",
+            initialised=True,
+            initialised_at=self._initialised_at,
+            facts={
+                "address": hex(self._address),
+                "bus": self._bus_no,
+                "pre_scale": PCA9685_PRE_SCALE,
+                "frequency_hz": round(PCA9685_OSC_HZ / (4096 * (PCA9685_PRE_SCALE + 1)), 1),
+                "oscillator_hz": PCA9685_OSC_HZ,
+                "invrt": INVRT_ON,
+                "open_drain": OPEN_DRAIN,
+                "channels": _CHANNELS,
+                "pre_scale_read_back": self._pre_scale_read_back,
+            },
+        )
+
 
 class Pca9685Channel:
     """One PWM channel, as an :class:`ActuatorDriver`.
@@ -340,6 +396,16 @@ class Pca9685Channel:
     @property
     def actuator_id(self) -> str:
         return self._actuator_id
+
+    @property
+    def device(self) -> Pca9685Device:
+        """The chip this channel shares with up to fifteen others.
+
+        Public so app.py can reach :meth:`Pca9685Device.chip_state` at the
+        bring-up moment — the channel is what ``_build_from_registry`` has in
+        hand right after ``open()``, not the chip.
+        """
+        return self._device
 
     @property
     def safe_state(self) -> ActuatorLevel:

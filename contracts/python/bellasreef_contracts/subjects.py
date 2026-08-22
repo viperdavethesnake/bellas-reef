@@ -22,6 +22,7 @@ __all__ = [
     "assignment",
     "audit",
     "capability",
+    "chip",
     "cmd",
     "heartbeat",
     "parse_device_id",
@@ -102,6 +103,20 @@ def capability(source: str) -> str:
     return f"{ROOT}.capability.{source}"
 
 
+def chip(source: str, instance: str) -> str:
+    """Subject for one hardware source instance's retained ChipState.
+
+    Instances carry characters NATS reserves ('.' in "1f00098000.pwm" would
+    split the token), so the instance token swaps '.' for '-'. The MESSAGE's
+    ``instance`` field keeps the raw string; the subject is an address, not
+    the datum.
+    """
+    validate_token(source, field="source")
+    if not instance:
+        raise ValueError("chip subject needs a source and an instance")
+    return f"{ROOT}.chip.{source}.{instance.replace('.', '-')}"
+
+
 def assignment(device_id: str) -> str:
     """One device's binding, as the operator declared it.
 
@@ -162,6 +177,7 @@ def parse_device_id(subject: str) -> str:
 # Wildcard subscriptions. Consumers filter with these; they are contract too.
 ALL_ALERTS: Final = f"{ROOT}.alert.>"
 ALL_CAPABILITIES: Final = f"{ROOT}.capability.>"
+ALL_CHIPS: Final = f"{ROOT}.chip.>"
 ALL_ASSIGNMENTS: Final = f"{ROOT}.assignment.>"
 ALL_SILENCE: Final = f"{ROOT}.silence.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"

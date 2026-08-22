@@ -37,6 +37,7 @@ __all__ = [
     "PINCTRL",
     "RP1_PWM0_DEVICE",
     "RP1_PWM_COMPATIBLE",
+    "W1_BUS_MASTER",
     "W1_DEVICES",
     "discover_pca9685",
     "discover_pwm",
@@ -47,6 +48,12 @@ __all__ = [
 ]
 
 W1_DEVICES = Path("/sys/bus/w1/devices")
+
+#: This board has one 1-Wire master (CLAUDE.md, verified host facts). Shared
+#: with app.py's ChipState publish at announce time, so the bus-master name
+#: in a capability channel's ``detail`` and the one in the chip's ``facts``
+#: cannot drift apart into two spellings of the same fact.
+W1_BUS_MASTER: Final = "w1_bus_master1"
 
 #: /usr/bin, verified with ``command -v`` on the host 2026-08-13 — NOT
 #: /usr/sbin, where a plan pinned it without checking and discovery failed
@@ -204,7 +211,7 @@ def discover_w1(root: Path = W1_DEVICES) -> CapabilityAnnouncement | None:
     channels = [
         CapabilityChannel(
             channel=path.name,
-            detail={"family": "28", "bus_master": "w1_bus_master1"},
+            detail={"family": "28", "bus_master": W1_BUS_MASTER},
         )
         for path in sorted(root.iterdir())
         if path.name.startswith("28-")

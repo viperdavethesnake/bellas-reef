@@ -42,9 +42,12 @@ log = get_logger(__name__)
 __all__ = [
     "DEFAULT_PERIOD_NS",
     "PWM_CHIP_ROOT",
+    "RP1_PWM_CHANNELS",
     "PiPwmChannel",
     "RealSysfs",
     "SysfsWriter",
+    "chip_device_identity",
+    "chip_identity_and_facts",
     "duty_to_ns",
 ]
 
@@ -103,6 +106,49 @@ class RealSysfs:
         return os.access(path, os.W_OK)
 
 
+#: The RP1 PWM0 block's channel count, fixed by the silicon (CLAUDE.md,
+#: verified host facts: all four channels reach a header pin on this board).
+#: Distinct from ``npwm`` as read live from sysfs by capabilities.py's
+#: discovery — this is the fact reported in the chip's ChipState table, not
+#: a discovery bound, and the two are expected to agree on this hub.
+RP1_PWM_CHANNELS: Final = 4
+
+
+def chip_device_identity(chip_root: Path) -> str:
+    """The pwmchip's device-tree identity, e.g. ``"1f00098000.pwm"``.
+
+    Resolved exactly as ``capabilities.find_pwm_chip`` resolves it: the
+    pwmchip index has moved between kernel releases (CLAUDE.md), so the
+    stable name is what the chip's ``device`` symlink points at, never the
+    ``pwmchipN`` directory name itself.
+    """
+    return (chip_root / "device").resolve().name
+
+
+def chip_identity_and_facts(
+    chip_root: Path, period_ns: int, polarity: str
+) -> tuple[str, dict[str, str | int | float | bool]]:
+    """This chip's instance identity and its ChipState facts, together.
+
+    One resolve of the ``device`` symlink, not two — it is both the
+    ``device`` fact and the message's ``instance`` string. Chip-level, not
+    per-channel: today every RP1 channel that lights a tank shares one
+    period and one polarity convention, so the channel that opens first
+    describes the chip for the rest of the process's life (see app.py's
+    publish-once keying).
+    """
+    device = chip_device_identity(chip_root)
+    facts: dict[str, str | int | float | bool] = {
+        "chip": chip_root.name,
+        "device": device,
+        "period_ns": period_ns,
+        "frequency_hz": round(1e9 / period_ns, 1),
+        "polarity": polarity,
+        "channels": RP1_PWM_CHANNELS,
+    }
+    return device, facts
+
+
 def duty_to_ns(duty: float, period_ns: int) -> int:
     """Duty as a nanosecond on-time, with the undefined-band rule applied.
 
@@ -152,6 +198,22 @@ class PiPwmChannel:
     @property
     def actuator_id(self) -> str:
         return self._actuator_id
+
+    @property
+    def chip_root(self) -> Path:
+        """Which pwmchip this channel lives on. Public so app.py can build
+        the chip's ChipState at the bring-up moment — see
+        ``chip_identity_and_facts``."""
+        return self._chip
+
+    @property
+    def period_ns(self) -> int:
+        return self._period_ns
+
+    @property
+    def polarity(self) -> str:
+        """The sysfs string this channel's polarity attribute was set to."""
+        return "inversed" if self._inverted else "normal"
 
     @property
     def safe_state(self) -> ActuatorLevel:
