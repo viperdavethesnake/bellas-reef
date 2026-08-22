@@ -358,7 +358,10 @@ class ChipStateRow(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
 
     #: ``pi-pwm`` | ``pca9685`` | ``w1-bus`` — same vocabulary as
-    #: ``Capability.source``.
+    #: ``Capability.source``. Deliberately no CHECK constraint here (unlike
+    #: ``Capability``'s ``capability_source_valid``): a new hardware source
+    #: should not need a migration to be storable. The wire's
+    #: ``CapabilitySource`` literal in contracts is the real gate.
     source: Mapped[str] = mapped_column(String(16), nullable=False)
 
     #: Stable identifier for the chip within its source: an I²C address@bus,

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime
 from typing import Any
 
 import nats
@@ -275,7 +274,10 @@ class ChipConsumer:
                 initialised=state.initialised,
                 initialised_at=state.initialised_at,
                 facts=dict(state.facts),
-                announced_at=datetime.now(UTC),
+                # The message's own emitted_at, not receipt time: LAST_PER_SUBJECT
+                # redelivers every retained message on API restart, so receipt time
+                # would claim hardware-io "announced" at every API restart.
+                announced_at=state.emitted_at,
             )
             log.info(
                 "chip state stored",

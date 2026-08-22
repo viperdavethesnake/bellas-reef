@@ -294,7 +294,7 @@ class ChipStateView(BaseModel):
     #: What kind of chip this is — "pca9685", "pi-pwm", etc.
     source: str
     #: Stable within its source: an I2C address, a pwmchip identity — however
-    #: `bellasreef.state.chip.<source>.<instance>` names the one that spoke.
+    #: `bellasreef.chip.<source>.<instance>` names the one that spoke.
     instance: str
     initialised: bool
     #: When `initialised` first went true. Null until it does; a chip that has
@@ -880,7 +880,7 @@ def build_app(
         try:
             yield
         finally:
-            for component in (registry, chips, telemetry, audit_writer):
+            for component in (registry, capabilities, chips, telemetry, audit_writer):
                 if component is not None:
                     await component.close()
 

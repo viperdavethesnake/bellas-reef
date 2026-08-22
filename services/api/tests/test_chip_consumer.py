@@ -91,7 +91,10 @@ def test_valid_message_upserts_with_the_message_fields() -> None:
     assert call["initialised"] is True
     assert call["initialised_at"] == state.initialised_at
     assert call["facts"] == {"pre_scale": 12, "invrt": False}
-    assert isinstance(call["announced_at"], datetime)
+    # announced_at is the message's own emitted_at, not receipt time: LAST_PER_SUBJECT
+    # redelivers every retained message on API restart, so receipt time would claim
+    # hardware-io "announced" at every API restart.
+    assert call["announced_at"] == state.emitted_at
     assert call["announced_at"].tzinfo is not None
     assert msg.acked
 
