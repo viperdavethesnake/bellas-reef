@@ -59,3 +59,10 @@ def test_chip_subject_sanitizes_dots() -> None:
 def test_chip_subject_rejects_empty() -> None:
     with pytest.raises(ValueError):
         subjects.chip("pca9685", "")
+
+
+def test_chip_subject_validates_source() -> None:
+    # Unlike instance, source is a real token — it must pass validate_token()
+    # like every other subject builder's tokens (§1 of the subject spec).
+    with pytest.raises(subjects.SubjectError):
+        subjects.chip("Bad.Source", "0x40@1")

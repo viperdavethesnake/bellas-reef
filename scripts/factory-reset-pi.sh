@@ -214,10 +214,10 @@ else
     warn "could not check the alembic revision on ${PI_HOST} (transport failure: ${alembic_out}) — check manually with 'docker compose exec -T api sh -c \"cd /app/db && alembic current\"'"
 fi
 
-# All six JetStream streams — hardware-io's provision() (spine.py) logs one
+# All seven JetStream streams — hardware-io's provision() (spine.py) logs one
 # structured "stream created" line per entry in STREAMS (BR_CMD, BR_STATE,
-# BR_REGISTRY, BR_CAPABILITY, BR_ASSIGNMENT, BR_AUDIT) at startup, against a
-# freshly wiped nats-data volume this always reads "created", never
+# BR_REGISTRY, BR_CAPABILITY, BR_CHIP, BR_ASSIGNMENT, BR_AUDIT) at startup,
+# against a freshly wiped nats-data volume this always reads "created", never
 # "updated". Logs are JSON with compact separators (bellasreef_service.
 # logging.JsonFormatter), so the substring match is exact. `|| true` runs on
 # the REMOTE side deliberately: grep -c still prints "0" on no match but
@@ -227,19 +227,19 @@ fi
 # the ssh boundary, is what keeps this to one line. Retried up to 60s:
 # hardware-io needs a few seconds after container start to connect and
 # provision.
-step "confirming all six JetStream streams were recreated"
+step "confirming all seven JetStream streams were recreated"
 STREAM_DEADLINE=$(($(date +%s) + 60))
 stream_count=0
 while :; do
     stream_count="$(ssh "$PI_HOST" "docker logs bellasreef-hardware-io-1 2>&1 | grep -c '\"msg\":\"stream created\"' || true" 2>/dev/null)"
     stream_count="${stream_count:-0}"
-    [[ "$stream_count" -ge 6 ]] && break
+    [[ "$stream_count" -ge 7 ]] && break
     [[ "$(date +%s)" -ge $STREAM_DEADLINE ]] && break
     sleep 3
 done
-[[ "$stream_count" -ge 6 ]] \
-    || die "hardware-io logged only ${stream_count} of 6 expected 'stream created' lines (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY, BR_ASSIGNMENT, BR_AUDIT) within 60s of the redeploy — JetStream provisioning did not complete"
-echo "  all 6 JetStream streams recreated"
+[[ "$stream_count" -ge 7 ]] \
+    || die "hardware-io logged only ${stream_count} of 7 expected 'stream created' lines (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY, BR_CHIP, BR_ASSIGNMENT, BR_AUDIT) within 60s of the redeploy — JetStream provisioning did not complete"
+echo "  all 7 JetStream streams recreated"
 
 # Capabilities announced — same log-substring approach, same remote-side
 # `|| true`, same bounded retry; a timeout here is now a real finding (die),

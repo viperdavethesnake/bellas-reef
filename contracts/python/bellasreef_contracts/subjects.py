@@ -111,7 +111,8 @@ def chip(source: str, instance: str) -> str:
     ``instance`` field keeps the raw string; the subject is an address, not
     the datum.
     """
-    if not source or not instance:
+    validate_token(source, field="source")
+    if not instance:
         raise ValueError("chip subject needs a source and an instance")
     return f"{ROOT}.chip.{source}.{instance.replace('.', '-')}"
 
