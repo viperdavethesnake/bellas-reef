@@ -493,3 +493,62 @@ class TestOverrideTransition:
 
     def test_snap_is_accepted(self) -> None:
         run(lambda: _insert(self._override_sql(), **self._row(transition="snap")))
+
+
+class TestLightingSchedules:
+    """Migration 0019
+    (docs/superpowers/specs/2026-08-19-lighting-schedules-design.md
+    §Data model): ``lighting_schedules`` / ``schedule_assignments``.
+    """
+
+    @staticmethod
+    def _points() -> str:
+        # Minimal valid curve: two points, ascending, midnight-to-midnight.
+        return '[{"at": "08:00:00", "duty": 0.2}, {"at": "20:00:00", "duty": 0.0}]'
+
+    @staticmethod
+    async def _insert_schedule(name: str) -> uuid.UUID:
+        eng = engine()
+        try:
+            async with eng.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "INSERT INTO lighting_schedules (id, name, points) VALUES "
+                        "(:id, :name, CAST(:points AS JSONB)) RETURNING id"
+                    ),
+                    {"id": uuid.uuid4(), "name": name, "points": TestLightingSchedules._points()},
+                )
+                return uuid.UUID(str(result.scalar_one()))
+        finally:
+            await eng.dispose()
+
+    @staticmethod
+    async def _insert_assignment(channel_id: str, schedule_id: uuid.UUID) -> None:
+        await _insert(
+            "INSERT INTO schedule_assignments (channel_id, schedule_id) "
+            "VALUES (:channel_id, :schedule_id)",
+            channel_id=channel_id,
+            schedule_id=schedule_id,
+        )
+
+    def test_schedule_name_unique(self) -> None:
+        run(lambda: self._insert_schedule("This One"))
+        with pytest.raises(IntegrityError, match="uq_lighting_schedules_name"):
+            run(lambda: self._insert_schedule("This One"))
+
+    def test_deleting_assigned_schedule_restricted(self) -> None:
+        sid = run(lambda: self._insert_schedule("That One"))
+        run(lambda: self._insert_assignment("pi-pwm-0", sid))
+        # ON DELETE RESTRICT — the forgetDevice lesson, pre-applied here.
+        with pytest.raises(
+            IntegrityError, match="fk_schedule_assignments_schedule_id_lighting_schedules"
+        ):
+            run(lambda: _insert("DELETE FROM lighting_schedules WHERE id = :id", id=sid))
+
+    def test_one_schedule_per_channel(self) -> None:
+        a = run(lambda: self._insert_schedule("A"))
+        b = run(lambda: self._insert_schedule("B"))
+        run(lambda: self._insert_assignment("pi-pwm-1", a))
+        # channel_id is the PK; assign-replace is an upsert, not a second row.
+        with pytest.raises(IntegrityError, match="pk_schedule_assignments"):
+            run(lambda: self._insert_assignment("pi-pwm-1", b))

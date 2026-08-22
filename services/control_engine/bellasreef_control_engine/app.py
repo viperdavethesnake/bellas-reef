@@ -22,18 +22,17 @@ through an event we have no way to reason about.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Final
 from uuid import UUID
 
-from bellasreef_contracts import SensorReading
+from bellasreef_contracts import ScheduleDefinition, SensorReading
 from bellasreef_db.alerts import PostgresAlertStore
 from bellasreef_db.overrides import ActiveOverride, OverrideStore
+from bellasreef_db.schedules import ScheduleStore
 from bellasreef_service import (
     Health,
     LivenessGuard,
@@ -51,22 +50,11 @@ from bellasreef_control_engine.profiles import ChannelProfile
 from bellasreef_control_engine.publisher import CommandPublisher
 from bellasreef_control_engine.scheduler import HeldTarget, Intent, LightingScheduler
 
-__all__ = ["ControlEngine", "load_profiles", "main"]
+__all__ = ["ControlEngine", "main"]
 
 log = get_logger(__name__)
 
 SERVICE: Final = "control-engine"
-
-
-def load_profiles(path: Path) -> list[ChannelProfile]:
-    """Read lighting profiles from JSON.
-
-    Validation failures raise. A controller that started with half a schedule
-    because one channel failed to parse would light a tank to a shape nobody
-    designed.
-    """
-    raw = json.loads(path.read_text())
-    return [ChannelProfile.model_validate(entry) for entry in raw]
 
 
 class _Metrics:
@@ -108,6 +96,16 @@ class _Metrics:
             ["actuator_id"],
             registry=registry,
         )
+        self.lighting_schedules = Gauge(
+            "bellasreef_lighting_schedules",
+            "Number of channel schedules currently applied from Postgres",
+            registry=registry,
+        )
+        self.schedule_reload_errors = Counter(
+            "bellasreef_schedule_reload_errors_total",
+            "Schedule store read failures during the per-tick reload",
+            registry=registry,
+        )
 
 
 class ControlEngine:
@@ -123,6 +121,7 @@ class ControlEngine:
         override_store: OverrideStore | None = None,
         alert_store: PostgresAlertStore | None = None,
         threshold_refresh_s: float = 30.0,
+        schedule_store: ScheduleStore | None = None,
     ) -> None:
         self.registry = CollectorRegistry()
         self.metrics = _Metrics(self.registry)
@@ -157,6 +156,10 @@ class ControlEngine:
         self._thresholds: dict[str, Thresholds] = {}
         self._threshold_refresh_s = threshold_refresh_s
         self._thresholds_read_at = 0.0
+
+        self.schedules = schedule_store
+        self._last_curves: dict[str, ScheduleDefinition] = {}
+        self._schedule_read_failing = False
 
         self.liveness = LivenessGuard(timeout_s=liveness_timeout_s)
         self.httpd = MetricsServer(probe=self.health, registry=self.registry, port=metrics_port)
@@ -487,9 +490,49 @@ class ControlEngine:
                 held[fresh.target] = fresh
         self._held = held
 
+    async def _reload_schedules(self) -> None:
+        """Same contract as _reload_overrides: Postgres is the source of truth and
+        the tick re-reads it, so an edit the API made is live within one tick with
+        no push channel to desync — the archive's schedules died of exactly that.
+        On a read error, keep the last good set: a flapping database must not
+        strip the tank's schedule.
+
+        ``ChannelProfile.from_definition`` lives inside this same try/except,
+        not just the store read: its ``channel_id`` field carries a pattern
+        constraint, and a row with a channel_id that violates it (the API
+        validates on write, but a row can predate that check, or be written
+        by anything else that talks to this table) would otherwise raise
+        outside any handler here and kill the tick loop. Degrading exactly
+        like a store read failure — keep the last good profile set, count it,
+        warn once per outage — is defense in depth for a check that already
+        exists at the API, not the only place it exists.
+        """
+        if self.schedules is None:
+            return
+        try:
+            curves = await self.schedules.assigned_curves()
+            profiles = (
+                [ChannelProfile.from_definition(cid, d) for cid, d in sorted(curves.items())]
+                if curves != self._last_curves
+                else None
+            )
+        except Exception:
+            self.metrics.schedule_reload_errors.inc()
+            if not self._schedule_read_failing:  # one log per outage, not per tick
+                self._schedule_read_failing = True
+                log.warning("schedule reload failed; keeping last good set", exc_info=True)
+            return
+        self._schedule_read_failing = False
+        if profiles is not None:
+            self.scheduler.set_profiles(profiles)
+            self._last_curves = curves
+            self.metrics.lighting_schedules.set(len(profiles))
+            log.info("schedules reloaded", extra={"channels": sorted(curves)})
+
     async def _tick(self, now: datetime) -> None:
         await self._expire_overrides()
         await self._reload_overrides()
+        await self._reload_schedules()
         await self._sweep_silence(now)
         held = {t: HeldTarget(o.duty, o.transition) for t, o in self._held.items()}
         intents = self.scheduler.due(now, held)
@@ -614,25 +657,23 @@ class ControlEngine:
 async def _amain() -> int:
     configure_logging(service=SERVICE, level=os.environ.get("BELLASREEF_LOG_LEVEL", "INFO"))
 
-    profile_path = os.environ.get("BELLASREEF_LIGHTING_PROFILES")
-    profiles = load_profiles(Path(profile_path)) if profile_path else []
-    if not profiles:
-        log.warning("no lighting profiles configured; the engine will schedule nothing")
-
     slew_raw = os.environ.get("BELLASREEF_MAX_DUTY_DELTA_PER_S")
     dsn = os.environ.get("BELLASREEF_DATABASE_URL")
-    # One engine, two stores. Building two would open two connection pools to
-    # the same database for no reason.
+    # One engine, three stores. Building separate engines per store would open
+    # separate connection pools to the same database for no reason.
     db = create_async_engine(dsn, future=True) if dsn else None
+    if db is None:
+        log.warning("no database configured; the engine will schedule nothing")
 
     engine = ControlEngine(
-        profiles,
+        [],
         nats_url=os.environ.get("BELLASREEF_NATS_URL"),
         liveness_timeout_s=float(os.environ.get("BELLASREEF_LIVENESS_TIMEOUT_S", "15")),
         metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9102")),
         max_duty_delta_per_s=float(slew_raw) if slew_raw else None,
         override_store=OverrideStore(db) if db is not None else None,
         alert_store=PostgresAlertStore(db) if db is not None else None,
+        schedule_store=ScheduleStore(db) if db is not None else None,
     )
 
     loop = asyncio.get_running_loop()

@@ -13,6 +13,7 @@ from bellasreef_db.models import (
     DosingTransaction,
 )
 from bellasreef_db.overrides import ActiveOverride, ClockUntrustedError, OverrideStore, Transition
+from bellasreef_db.schedules import ScheduleInUseError, ScheduleStore, StoredSchedule
 
 __all__ = [
     "ActiveOverride",
@@ -28,5 +29,8 @@ __all__ = [
     "DosingTransaction",
     "OverrideStore",
     "PostgresAlertStore",
+    "ScheduleInUseError",
+    "ScheduleStore",
+    "StoredSchedule",
     "Transition",
 ]

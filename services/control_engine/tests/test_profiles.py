@@ -12,6 +12,7 @@ from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
+from bellasreef_contracts.schedules import ScheduleDefinition, SchedulePoint
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from pydantic import ValidationError
 
@@ -113,6 +114,25 @@ class TestTimezonePolicy:
         p = profile(("08:00", 0.0), ("12:00", 1.0))
         with pytest.raises(ValueError, match="timezone-aware"):
             p.duty_at(datetime(2026, 6, 1, 10, 0))  # noqa: DTZ001
+
+
+def test_ramp_point_is_the_contracts_model() -> None:
+    # One source of truth: the engine's point IS the wire point (spec §5).
+    assert RampPoint is SchedulePoint
+
+
+def test_from_definition_builds_equivalent_profile() -> None:
+    d = ScheduleDefinition.model_validate(
+        {
+            "name": "This One",
+            "zone": "America/Los_Angeles",
+            "points": [{"at": "08:00", "duty": 0.0}, {"at": "13:00", "duty": 1.0}],
+        }
+    )
+    p = ChannelProfile.from_definition("pi-pwm-0", d)
+    assert p.channel_id == "pi-pwm-0"
+    assert p.zone == "America/Los_Angeles"
+    assert p.points == d.points
 
 
 class TestValidation:

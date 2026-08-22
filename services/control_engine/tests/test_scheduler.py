@@ -371,3 +371,127 @@ class TestSlewArrival:
         assert rel.duty == pytest.approx(0.0)
         s.mark_emitted(rel, t)
         assert s.due(t + timedelta(seconds=1), {}) == []
+
+    def test_release_to_curve_final_step_inside_deadband_still_lands(self) -> None:
+        """Same bug class as the two tests above, aimed at the one leg
+        neither covers: a RAMP release back onto a profiled channel's
+        non-zero resting duty (0.61, not SAFE_DUTY). Numbers mirror
+        test_final_slew_step_inside_deadband_still_lands — the arrival
+        step's residual (0.0044) sits inside the default 0.005 deadband, so
+        without the arrival bypass this stalls at 0.6056 until refresh."""
+        curve = flat("blue", 0.61)
+        s = LightingScheduler([curve], max_duty_delta_per_s=0.01)  # default deadband 0.005
+
+        # A ramp hold at 0.0 settles immediately on the very first (cold, dt=0)
+        # tick, holding the channel away from the curve's resting duty until
+        # it is released.
+        [held] = s.due(T0, {"blue": ramp_hold(0.0)})
+        assert held.duty == pytest.approx(0.0)
+        s.mark_emitted(held, T0)
+
+        t_release = T0 + timedelta(seconds=1)
+        [released] = s.due(t_release, {})
+        assert released.reason == "converge"
+        s.mark_emitted(released, t_release)
+
+        t_almost = t_release + timedelta(seconds=59.56)
+        [almost] = s.due(t_almost, {})
+        assert almost.duty == pytest.approx(0.6056)
+        assert almost.reason == "converge"
+        s.mark_emitted(almost, t_almost)
+
+        t_arrive = t_almost + timedelta(seconds=1)
+        [arrived] = s.due(t_arrive, {})
+        assert arrived.duty == pytest.approx(0.61)
+        assert arrived.reason == "converge"
+        s.mark_emitted(arrived, t_arrive)
+
+        # at the curve's resting duty: quiet until refresh
+        assert s.due(t_arrive + timedelta(seconds=1), {}) == []
+
+
+def flat(channel: str, duty: float) -> ChannelProfile:
+    """A two-point curve that holds one duty all day — the min-length-2 rule
+    without needing a real diurnal shape for these tests."""
+    return ChannelProfile(
+        channel_id=channel,
+        anchor="clock",
+        points=(RampPoint(at=time(0), duty=duty), RampPoint(at=time(12), duty=duty)),
+    )
+
+
+class TestSetProfiles:
+    """set_profiles swaps the schedule set live; emission history is kept on
+    purpose (spec: a changed curve is a moved target, not a cold start)."""
+
+    def test_set_profiles_curve_edit_converges_not_jumps(self) -> None:
+        v1 = flat("blue", 0.2)
+        v2 = flat("blue", 0.8)
+        s = LightingScheduler([v1], max_duty_delta_per_s=0.01)
+        first = s.due(T0)[0]
+        assert first.reason == "initial"
+        s.mark_emitted(first, T0)
+
+        # let the cold start fully settle at 0.2 before editing the curve —
+        # the first tick itself is dt=0 and slew-limited short of the target,
+        # which would confound this test with the cold-start slew instead of
+        # the curve-edit slew this test is actually about.
+        settle_at = T0 + timedelta(seconds=30)
+        settled = s.due(settle_at)[0]
+        assert settled.duty == pytest.approx(0.2)
+        s.mark_emitted(settled, settle_at)
+
+        s.set_profiles([v2])
+
+        [moved] = s.due(settle_at + timedelta(seconds=5))
+        assert moved.reason == "converge"
+        # a moved target, converging under the slew — not a jump straight to 0.8
+        assert 0.2 < moved.duty < 0.8
+
+    def test_set_profiles_unassign_converges_to_dark(self) -> None:
+        s = LightingScheduler([flat("blue", 0.5)], max_duty_delta_per_s=0.1, deadband=0.005)
+        first = s.due(T0)[0]
+        s.mark_emitted(first, T0)
+
+        # settle at 0.5 first, same reasoning as the curve-edit test above
+        settle_at = T0 + timedelta(seconds=10)
+        settled = s.due(settle_at)[0]
+        assert settled.duty == pytest.approx(0.5)
+        s.mark_emitted(settled, settle_at)
+
+        s.set_profiles([])  # dropped: falls into the synthetic constant-SAFE_DUTY path
+
+        t = settle_at
+        previous = settled.duty
+        for _ in range(6):  # 0.5 at 0.1/s over 1 s steps, plus a float-residual arrival step
+            t = t + timedelta(seconds=1)
+            [intent] = s.due(t)
+            assert intent.duty < previous  # walking down, not popped straight to 0
+            previous = intent.duty
+            s.mark_emitted(intent, t)
+
+        assert previous == pytest.approx(0.0)
+        assert s.due(t + timedelta(seconds=1)) == []  # converged: quiet
+
+    def test_set_profiles_preserves_hold_memory(self) -> None:
+        v1 = flat("blue", 0.2)
+        v2 = flat("blue", 0.9)
+        s = LightingScheduler([v1])
+        [held] = s.due(T0, {"blue": snap(1.0)})
+        assert (held.duty, held.reason, held.hold) == (1.0, "hold", "snap")
+        s.mark_emitted(held, T0)
+
+        s.set_profiles([v2])
+
+        # the hold still outranks: swapping the curve underneath it changes nothing
+        assert s.due(T1, {"blue": snap(1.0)}) == []
+
+        # release: snap-returns to the NEW curve's resting value, not v1's
+        [released] = s.due(T2, {})
+        assert (released.reason, released.hold) == ("release", None)
+        assert released.duty == pytest.approx(0.9)
+
+    def test_set_profiles_duplicate_channel_rejected(self) -> None:
+        s = LightingScheduler([ramp("blue")])
+        with pytest.raises(ValueError, match="duplicate channel_id"):
+            s.set_profiles([ramp("blue"), ramp("blue")])
