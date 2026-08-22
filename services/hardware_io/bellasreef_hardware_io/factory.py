@@ -128,7 +128,11 @@ def build_from_assignments(
                 if key not in chips:
                     if open_i2c is None:
                         raise TopologyError("no I²C bus provided to the factory")
-                    chips[key] = Pca9685Device(open_i2c(bus_no), address)  # type: ignore[operator]
+                    chips[key] = Pca9685Device(
+                        open_i2c(bus_no),  # type: ignore[operator]
+                        address,
+                        bus_no=bus_no,
+                    )
                 actuators.append(
                     BuiltActuator(
                         Pca9685Channel(chips[key], int(binding["channel"]), assignment.device_id),

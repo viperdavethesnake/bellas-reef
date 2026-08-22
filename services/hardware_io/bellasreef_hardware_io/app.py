@@ -29,21 +29,29 @@ from bellasreef_contracts import (
     ActuatorRegistration,
     ActuatorState,
     CapabilityAnnouncement,
+    ChipState,
     DeviceAssignment,
     Heartbeat,
     SensorReading,
     SensorRegistration,
     StateReason,
 )
-from bellasreef_contracts.driver import SensorSample
+from bellasreef_contracts.driver import ActuatorDriver, SensorSample
 from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from pydantic import ValidationError
 
-from bellasreef_hardware_io.capabilities import discover_pca9685, discover_pwm, discover_w1
+from bellasreef_hardware_io.capabilities import (
+    W1_BUS_MASTER,
+    discover_pca9685,
+    discover_pwm,
+    discover_w1,
+)
 from bellasreef_hardware_io.drivers.onewire import DS18B20
+from bellasreef_hardware_io.drivers.pca9685 import Pca9685Channel
+from bellasreef_hardware_io.drivers.pipwm import PiPwmChannel, chip_identity_and_facts
 from bellasreef_hardware_io.factory import build_from_assignments
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
@@ -195,6 +203,12 @@ class HardwareIO:
         self._assignments: dict[str, _AssignmentFingerprint] = {}
         self._beat_seq = 0
         self._sensor_deadlines: dict[str, float] = {}
+        #: (hardware_source, instance) pairs whose ChipState has already been
+        #: published this process. See ``_publish_chip_state_once`` — a chip
+        #: is configured once, at first bring-up, and stays that way for the
+        #: life of the process; re-publish-on-refault is a future
+        #: bus-fault story (spec 2026-08-19).
+        self._published_chip_instances: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -244,6 +258,8 @@ class HardwareIO:
                 )
                 continue
 
+            await self._publish_actuator_chip_state(built.driver)
+
             self.supervisor.register(built.registration, built.driver)
             self._registrations.append(built.registration)
 
@@ -255,6 +271,61 @@ class HardwareIO:
                 "actuators": len(actuators),
             },
         )
+
+    async def _publish_actuator_chip_state(self, driver: ActuatorDriver) -> None:
+        """The owning chip's ChipState, once per chip, right after its
+        channel's ``open()`` succeeds.
+
+        Dispatches on driver type because that is what this call site has in
+        hand at the bring-up moment: the channel, not the chip. A third PWM
+        source adds a branch here, the same way factory.py adds one to build
+        it. Actuator types with no chip concept (a bare relay, say) fall
+        through and publish nothing — there is no chip state to report.
+        """
+        if isinstance(driver, Pca9685Channel):
+            await self._publish_chip_state_once(driver.device.chip_state())
+        elif isinstance(driver, PiPwmChannel):
+            now = datetime.now(UTC)
+            instance, facts = chip_identity_and_facts(
+                driver.chip_root, driver.period_ns, driver.polarity
+            )
+            await self._publish_chip_state_once(
+                ChipState(
+                    message_id=uuid4(),
+                    emitted_at=now,
+                    source=SERVICE,
+                    hardware_source="pi-pwm",
+                    instance=instance,
+                    initialised=True,
+                    initialised_at=now,
+                    facts=facts,
+                )
+            )
+
+    async def _publish_chip_state_once(self, state: ChipState) -> None:
+        """Publish one ChipState, once per (hardware_source, instance) per
+        process.
+
+        Best-effort, exactly like ``_publish_state``: a publish failure here
+        must never fail the actuator's ``open()`` or capability discovery —
+        only marked "published" on success, so a later channel opening the
+        same chip gets a retry rather than a permanent silence.
+        """
+        key = (state.hardware_source, state.instance)
+        if key in self._published_chip_instances:
+            return
+        if self.spine is None:
+            return
+        try:
+            await self.spine.publish_chip_state(state)
+        except Exception:
+            log.warning(
+                "failed to publish chip state",
+                extra={"hardware_source": state.hardware_source, "instance": state.instance},
+                exc_info=True,
+            )
+            return
+        self._published_chip_instances.add(key)
 
     async def _announce_capabilities(self) -> None:
         """Tell the registry what this hub's hardware can offer.
@@ -287,6 +358,28 @@ class HardwareIO:
                 if announcement is None:
                     continue
                 await self.spine.publish_capabilities(announcement)
+                if name == "w1-bus":
+                    # The bus itself needs no configuration — "initialised"
+                    # here means "present", not "set up", unlike the two PWM
+                    # sources. Published at announce time rather than at a
+                    # per-probe open(): a 1-Wire probe has no open() step of
+                    # its own, and the bus is the chip, not any one probe.
+                    now = datetime.now(UTC)
+                    await self._publish_chip_state_once(
+                        ChipState(
+                            message_id=uuid4(),
+                            emitted_at=now,
+                            source=SERVICE,
+                            hardware_source="w1-bus",
+                            instance=W1_BUS_MASTER,
+                            initialised=True,
+                            initialised_at=now,
+                            facts={
+                                "bus_master": W1_BUS_MASTER,
+                                "probes": len(announcement.channels),
+                            },
+                        )
+                    )
             except Exception:
                 log.exception("capability discovery failed", extra={"hardware_source": name})
                 continue
