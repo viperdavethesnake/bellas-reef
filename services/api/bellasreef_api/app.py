@@ -278,6 +278,34 @@ class CapabilityView(BaseModel):
         return self.bound_to is not None
 
 
+class ChipStateView(BaseModel):
+    """What one chip last reported about itself, not what it does for the tank.
+
+    A capability is *what channels this hardware offers*; this is *what the
+    chip's own registers say* — prescaler, measured oscillator, INVRT, whether
+    `ensure_initialised()` has run. The Hardware leaf's data source (System
+    tab, option A, ruled 2026-08-18): a per-chip surface, not a key folded
+    into `CapabilityView.detail` (that field is identity, per #38) and not a
+    field on the adopted device row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: What kind of chip this is — "pca9685", "pi-pwm", etc.
+    source: str
+    #: Stable within its source: an I2C address, a pwmchip identity — however
+    #: `bellasreef.state.chip.<source>.<instance>` names the one that spoke.
+    instance: str
+    initialised: bool
+    #: When `initialised` first went true. Null until it does; a chip that has
+    #: never completed `ensure_initialised()` has no such moment yet.
+    initialised_at: datetime | None = None
+    #: Whatever the chip's own registers say — prescale, measured oscillator,
+    #: INVRT, and the like. Shape varies by source; the view does not pin it.
+    facts: dict[str, str | int | float | bool]
+    announced_at: datetime
+
+
 #: Which announced source a driver type binds against. A DS18B20 is a probe on
 #: the w1-bus rather than a source of its own, so the two names differ and the
 #: mapping has to be explicit.
@@ -917,6 +945,26 @@ def build_app(
         binds it.
         """
         return [CapabilityView(**row) for row in await store.list_capabilities()]
+
+    @app.get(
+        "/api/v1/hardware",
+        response_model=list[ChipStateView],
+        tags=["devices"],
+        operation_id="listHardware",
+        responses={401: AUTH_401},
+    )
+    async def list_hardware(
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> list[ChipStateView]:
+        """What each chip last reported about itself.
+
+        The Hardware leaf's data source (System tab, option A): per-chip
+        register-level facts — prescaler, measured oscillator, INVRT,
+        whether initialisation has run — as last announced by hardware-io.
+        Ordered by source then instance; the API is the ordering authority,
+        same reasoning as `/api/v1/capabilities`.
+        """
+        return [ChipStateView(**row) for row in await store.list_chip_state()]
 
     @app.get("/api/v1/info", response_model=Info, tags=["discovery"], operation_id="info")
     async def info() -> Info:
