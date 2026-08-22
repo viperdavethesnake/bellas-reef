@@ -35,6 +35,14 @@ from bellasreef_contracts.messages import (
     StateReason,
     Transport,
 )
+from bellasreef_contracts.schedules import (
+    Anchor,
+    Locale,
+    OnMiss,
+    ScheduleDefinition,
+    SchedulePoint,
+    validate_curve,
+)
 
 __all__ = [
     "LIGHT_HEARTBEAT_TIMEOUT_S",
@@ -49,6 +57,7 @@ __all__ = [
     "AlertBound",
     "AlertClass",
     "AlertState",
+    "Anchor",
     "BinaryLevel",
     "CapabilityAnnouncement",
     "CapabilityChannel",
@@ -57,11 +66,16 @@ __all__ = [
     "DeviceAssignment",
     "DeviceId",
     "Heartbeat",
+    "Locale",
+    "OnMiss",
     "PwmLevel",
+    "ScheduleDefinition",
+    "SchedulePoint",
     "SensorAlert",
     "SensorReading",
     "SensorRegistration",
     "SensorSilence",
     "StateReason",
     "Transport",
+    "validate_curve",
 ]
