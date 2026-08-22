@@ -35,12 +35,15 @@ from time import monotonic
 from typing import Annotated, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
-from bellasreef_contracts import DeviceAssignment
+from bellasreef_contracts import Anchor, DeviceAssignment, Locale, ScheduleDefinition, SchedulePoint
 from bellasreef_db import (
     AlertRecord,
     ClockUntrustedError,
     OverrideStore,
     PostgresAlertStore,
+    ScheduleInUseError,
+    ScheduleStore,
+    StoredSchedule,
     Transition,
 )
 from bellasreef_service import configure_logging, get_logger
@@ -54,7 +57,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from bellasreef_api.audit import NatsAuditSink
@@ -563,6 +566,31 @@ class OverrideView(BaseModel):
     transition: Transition
 
 
+class ScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=64)
+    zone: str = "UTC"
+    anchor: Anchor = "clock"
+    locale: Locale | None = None
+    points: list[SchedulePoint] = Field(min_length=2)
+
+
+class ScheduleView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: UUID
+    name: str
+    zone: str
+    anchor: Anchor
+    locale: Locale | None
+    points: list[SchedulePoint]
+    assigned_channels: list[str]
+
+
+class ScheduleAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schedule_id: UUID
+
+
 @dataclass
 class _PendingTokens:
     """Approved-but-uncollected refresh tokens, held in memory only.
@@ -657,6 +685,21 @@ def _alert_view(row: AlertRecord) -> "AlertView":
     )
 
 
+def _schedule_view(stored: StoredSchedule) -> "ScheduleView":
+    """Widen a store row to the wire shape: the definition's fields plus the
+    id and the channels currently pointed at it."""
+    d = stored.definition
+    return ScheduleView(
+        id=stored.id,
+        name=d.name,
+        zone=d.zone,
+        anchor=d.anchor,
+        locale=d.locale,
+        points=list(d.points),
+        assigned_channels=list(stored.assigned_channels),
+    )
+
+
 #: What each ``ON DELETE RESTRICT`` table onto ``devices`` is called in a 409
 #: reason, singular and plural. Keys are the store's table names.
 _HOLDER_NOUNS: Final[dict[str, tuple[str, str]]] = {
@@ -691,6 +734,7 @@ def build_app(
 ) -> FastAPI:
     store = Store(engine)
     overrides = OverrideStore(engine, clock_trusted=clock_trusted)
+    schedules = ScheduleStore(engine)
     alerts = PostgresAlertStore(engine)
     reader = HistoryReader(vm_url) if vm_url else None
     bridge = StreamBridge(nats_url, overrides) if nats_url else None
@@ -2053,6 +2097,221 @@ def build_app(
             category="command",
         )
         return {"status": "released"}
+
+    # --------------------------------------------------- lighting schedules
+
+    def _parse_curve(body: ScheduleRequest) -> ScheduleDefinition:
+        """Construct the validated curve first, separately from the store call.
+
+        pydantic's ``ValidationError`` subclasses ``ValueError``, so if this
+        were folded into the store's try/except a bad curve and a duplicate
+        name would land in the same branch — one is 422 (the request itself
+        is malformed), the other 409 (the request is fine, the name is
+        taken). Validating here, before the store is ever called, keeps the
+        two apart.
+        """
+        try:
+            return ScheduleDefinition(
+                name=body.name,
+                zone=body.zone,
+                anchor=body.anchor,
+                locale=body.locale,
+                points=tuple(body.points),
+            )
+        except ValidationError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    @app.get(
+        "/api/v1/lighting/schedules",
+        response_model=list[ScheduleView],
+        tags=["lighting"],
+        operation_id="listSchedules",
+        responses={401: AUTH_401},
+    )
+    async def list_schedules(
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> list[ScheduleView]:
+        return [_schedule_view(s) for s in await schedules.list()]
+
+    @app.post(
+        "/api/v1/lighting/schedules",
+        response_model=ScheduleView,
+        tags=["lighting"],
+        operation_id="createSchedule",
+        responses={
+            401: AUTH_401,
+            409: {"description": "A schedule with this name already exists."},
+            422: {"description": "The curve does not validate."},
+        },
+    )
+    async def create_schedule(
+        body: ScheduleRequest, actor: Annotated[UUID, Depends(current_client)]
+    ) -> ScheduleView:
+        """Create a named lighting curve. Not clock-gated: storing config
+        needs no trusted clock, unlike an override's deadline."""
+        definition = _parse_curve(body)
+        try:
+            stored = await schedules.create(definition)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        await sink(
+            "schedule.created",
+            {"schedule_id": str(stored.id), "name": stored.definition.name, "actor": str(actor)},
+            category="config",
+        )
+        return _schedule_view(stored)
+
+    @app.get(
+        "/api/v1/lighting/schedules/{schedule_id}",
+        response_model=ScheduleView,
+        tags=["lighting"],
+        operation_id="getSchedule",
+        responses={401: AUTH_401, 404: {"description": "Unknown schedule."}},
+    )
+    async def get_schedule(
+        schedule_id: UUID, _: Annotated[UUID, Depends(current_client)]
+    ) -> ScheduleView:
+        try:
+            stored = await schedules.get(schedule_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no schedule {schedule_id}") from exc
+        return _schedule_view(stored)
+
+    @app.put(
+        "/api/v1/lighting/schedules/{schedule_id}",
+        response_model=ScheduleView,
+        tags=["lighting"],
+        operation_id="updateSchedule",
+        responses={
+            401: AUTH_401,
+            404: {"description": "Unknown schedule."},
+            409: {"description": "A schedule with this name already exists."},
+            422: {"description": "The curve does not validate."},
+        },
+    )
+    async def update_schedule(
+        schedule_id: UUID,
+        body: ScheduleRequest,
+        actor: Annotated[UUID, Depends(current_client)],
+    ) -> ScheduleView:
+        """Replace a schedule's definition in full. There is no partial
+        update — a curve is one coherent set of points, and PATCHing one
+        point in isolation could leave the rest un-revalidated."""
+        definition = _parse_curve(body)
+        try:
+            stored = await schedules.update(schedule_id, definition)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no schedule {schedule_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        await sink(
+            "schedule.updated",
+            {"schedule_id": str(stored.id), "name": stored.definition.name, "actor": str(actor)},
+            category="config",
+        )
+        return _schedule_view(stored)
+
+    @app.delete(
+        "/api/v1/lighting/schedules/{schedule_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        tags=["lighting"],
+        operation_id="deleteSchedule",
+        responses={
+            204: {"description": "Deleted."},
+            401: AUTH_401,
+            404: {"description": "Unknown schedule."},
+            409: {"description": "Still assigned to a channel; unassign it first."},
+        },
+    )
+    async def delete_schedule(
+        schedule_id: UUID, actor: Annotated[UUID, Depends(current_client)]
+    ) -> Response:
+        try:
+            stored = await schedules.get(schedule_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no schedule {schedule_id}") from exc
+        try:
+            await schedules.delete(schedule_id)
+        except ScheduleInUseError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no schedule {schedule_id}") from exc
+        await sink(
+            "schedule.deleted",
+            {"schedule_id": str(schedule_id), "name": stored.definition.name, "actor": str(actor)},
+            category="config",
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.put(
+        "/api/v1/lighting/channels/{channel_id}/schedule",
+        response_model=ScheduleView,
+        tags=["lighting"],
+        operation_id="assignSchedule",
+        responses={
+            401: AUTH_401,
+            404: {"description": "Unknown schedule."},
+            409: {"description": "The channel is registered observe_only and accepts no commands."},
+        },
+    )
+    async def assign_schedule(
+        channel_id: str,
+        body: ScheduleAssignRequest,
+        actor: Annotated[UUID, Depends(current_client)],
+    ) -> ScheduleView:
+        """Point a channel at a named curve, replacing whatever it had.
+
+        Authority-gated the same way ``create_override`` is: an
+        ``observe_only`` channel accepts no commands, live or scheduled. An
+        **unknown** channel is allowed — scheduling before adoption is legal,
+        and the engine holds the curve until the channel is adopted (spec
+        2026-08-19).
+        """
+        _, authority = await store.control_authority_of(channel_id)
+        if authority == "observe_only":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{channel_id!r} is registered observe_only and accepts no commands",
+            )
+        try:
+            await schedules.assign(channel_id, body.schedule_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"no schedule {body.schedule_id}"
+            ) from exc
+        await sink(
+            "schedule.assigned",
+            {"channel_id": channel_id, "schedule_id": str(body.schedule_id), "actor": str(actor)},
+            category="config",
+        )
+        return _schedule_view(await schedules.get(body.schedule_id))
+
+    @app.delete(
+        "/api/v1/lighting/channels/{channel_id}/schedule",
+        tags=["lighting"],
+        operation_id="unassignSchedule",
+        responses={
+            401: AUTH_401,
+            404: {"description": "Nothing assigned to this channel."},
+        },
+    )
+    async def unassign_schedule(
+        channel_id: str, actor: Annotated[UUID, Depends(current_client)]
+    ) -> dict[str, str]:
+        schedule_id = next(
+            (s.id for s in await schedules.list() if channel_id in s.assigned_channels),
+            None,
+        )
+        if schedule_id is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"nothing assigned to {channel_id!r}")
+        await schedules.unassign(channel_id)
+        await sink(
+            "schedule.unassigned",
+            {"channel_id": channel_id, "schedule_id": str(schedule_id), "actor": str(actor)},
+            category="config",
+        )
+        return {"status": "unassigned"}
 
     # ------------------------------------------------------------- stream
 

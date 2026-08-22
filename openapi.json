@@ -1052,6 +1052,37 @@
         "title": "Info",
         "type": "object"
       },
+      "Locale": {
+        "additionalProperties": false,
+        "description": "A reef whose day shape the schedule is modelled on.\n\nSchema-now, v2-build: carried and validated in v1, consumed by the solar\nmaths in lighting v2.",
+        "properties": {
+          "lat": {
+            "maximum": 90.0,
+            "minimum": -90.0,
+            "title": "Lat",
+            "type": "number"
+          },
+          "lon": {
+            "maximum": 180.0,
+            "minimum": -180.0,
+            "title": "Lon",
+            "type": "number"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "lat",
+          "lon"
+        ],
+        "title": "Locale",
+        "type": "object"
+      },
       "OverrideContext": {
         "additionalProperties": false,
         "description": "The active manual hold on an actuator, if any.\n\nCarried on every state frame because the time-and-scheduling contract\nrequires override state to be loudly visible: a client showing a channel at\n0% must be able to say whether that is the schedule or a hold, and when the\nhold ends.",
@@ -1347,6 +1378,142 @@
           "client_id"
         ],
         "title": "ReadyFrame",
+        "type": "object"
+      },
+      "ScheduleAssignRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "schedule_id": {
+            "format": "uuid",
+            "title": "Schedule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schedule_id"
+        ],
+        "title": "ScheduleAssignRequest",
+        "type": "object"
+      },
+      "SchedulePoint": {
+        "additionalProperties": false,
+        "description": "One anchor in a curve: at this local time, this duty.",
+        "properties": {
+          "at": {
+            "format": "time",
+            "title": "At",
+            "type": "string"
+          },
+          "duty": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Duty",
+            "type": "number"
+          }
+        },
+        "required": [
+          "at",
+          "duty"
+        ],
+        "title": "SchedulePoint",
+        "type": "object"
+      },
+      "ScheduleRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "default": "clock",
+            "enum": [
+              "clock",
+              "solar_natural",
+              "solar_custom"
+            ],
+            "title": "Anchor",
+            "type": "string"
+          },
+          "locale": {
+            "$ref": "#/components/schemas/Locale"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/SchedulePoint"
+            },
+            "minItems": 2,
+            "title": "Points",
+            "type": "array"
+          },
+          "zone": {
+            "default": "UTC",
+            "title": "Zone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "points"
+        ],
+        "title": "ScheduleRequest",
+        "type": "object"
+      },
+      "ScheduleView": {
+        "additionalProperties": false,
+        "properties": {
+          "anchor": {
+            "enum": [
+              "clock",
+              "solar_natural",
+              "solar_custom"
+            ],
+            "title": "Anchor",
+            "type": "string"
+          },
+          "assigned_channels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Assigned Channels",
+            "type": "array"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "locale": {
+            "$ref": "#/components/schemas/Locale"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/SchedulePoint"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "zone": {
+            "title": "Zone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "zone",
+          "anchor",
+          "locale",
+          "points",
+          "assigned_channels"
+        ],
+        "title": "ScheduleView",
         "type": "object"
       },
       "SensorAlert": {
@@ -1653,7 +1820,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "4.0.0"
+    "version": "4.1.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2594,6 +2761,429 @@
         "summary": "Info",
         "tags": [
           "discovery"
+        ]
+      }
+    },
+    "/api/v1/lighting/channels/{channel_id}/schedule": {
+      "delete": {
+        "operationId": "unassignSchedule",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Unassignschedule",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Nothing assigned to this channel."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unassign Schedule",
+        "tags": [
+          "lighting"
+        ]
+      },
+      "put": {
+        "description": "Point a channel at a named curve, replacing whatever it had.\n\nAuthority-gated the same way ``create_override`` is: an\n``observe_only`` channel accepts no commands, live or scheduled. An\n**unknown** channel is allowed \u2014 scheduling before adoption is legal,\nand the engine holds the curve until the channel is adopted (spec\n2026-08-19).",
+        "operationId": "assignSchedule",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleAssignRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown schedule."
+          },
+          "409": {
+            "description": "The channel is registered observe_only and accepts no commands."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Assign Schedule",
+        "tags": [
+          "lighting"
+        ]
+      }
+    },
+    "/api/v1/lighting/schedules": {
+      "get": {
+        "operationId": "listSchedules",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleView"
+                  },
+                  "title": "Response Listschedules",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Schedules",
+        "tags": [
+          "lighting"
+        ]
+      },
+      "post": {
+        "description": "Create a named lighting curve. Not clock-gated: storing config\nneeds no trusted clock, unlike an override's deadline.",
+        "operationId": "createSchedule",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "409": {
+            "description": "A schedule with this name already exists."
+          },
+          "422": {
+            "description": "The curve does not validate."
+          }
+        },
+        "summary": "Create Schedule",
+        "tags": [
+          "lighting"
+        ]
+      }
+    },
+    "/api/v1/lighting/schedules/{schedule_id}": {
+      "delete": {
+        "operationId": "deleteSchedule",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown schedule."
+          },
+          "409": {
+            "description": "Still assigned to a channel; unassign it first."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Schedule",
+        "tags": [
+          "lighting"
+        ]
+      },
+      "get": {
+        "operationId": "getSchedule",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown schedule."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Schedule",
+        "tags": [
+          "lighting"
+        ]
+      },
+      "put": {
+        "description": "Replace a schedule's definition in full. There is no partial\nupdate \u2014 a curve is one coherent set of points, and PATCHing one\npoint in isolation could leave the rest un-revalidated.",
+        "operationId": "updateSchedule",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "Unknown schedule."
+          },
+          "409": {
+            "description": "A schedule with this name already exists."
+          },
+          "422": {
+            "description": "The curve does not validate."
+          }
+        },
+        "summary": "Update Schedule",
+        "tags": [
+          "lighting"
         ]
       }
     },
