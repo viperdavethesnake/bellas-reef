@@ -26,6 +26,7 @@ from bellasreef_contracts import (
     ActuatorRegistration,
     ActuatorState,
     CapabilityAnnouncement,
+    ChipState,
     DeviceAssignment,
     Heartbeat,
     SensorReading,
@@ -75,6 +76,7 @@ AUDIT_STREAM: Final = "BR_AUDIT"
 REGISTRY_STREAM: Final = "BR_REGISTRY"
 CAPABILITY_STREAM: Final = "BR_CAPABILITY"
 ASSIGNMENT_STREAM: Final = "BR_ASSIGNMENT"
+CHIP_STREAM: Final = "BR_CHIP"
 
 STREAMS: Final = (
     StreamConfig(
@@ -115,6 +117,19 @@ STREAMS: Final = (
     StreamConfig(
         name=CAPABILITY_STREAM,
         subjects=[subjects.ALL_CAPABILITIES],
+        retention=RetentionPolicy.LIMITS,
+        storage=StorageType.FILE,
+        max_msgs_per_subject=1,
+    ),
+    # Chip state: how each hardware source instance is configured, as opposed
+    # to what it offers (capabilities) or what has been done with it
+    # (assignments). Retained last-value per subject, same reasoning as the
+    # two above — re-initialisation after a bus fault republishes, and a
+    # consumer that starts late still learns the current configuration
+    # instead of waiting for the next restart to find out.
+    StreamConfig(
+        name=CHIP_STREAM,
+        subjects=[subjects.ALL_CHIPS],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
         max_msgs_per_subject=1,
@@ -311,6 +326,20 @@ class Spine:
         await self._nc.publish(
             subjects.capability(announcement.hardware_source),
             announcement.model_dump_json().encode(),
+        )
+
+    async def publish_chip_state(self, state: ChipState) -> None:
+        """Announce how one hardware source instance is configured.
+
+        Retained last-value per (source, instance): re-initialisation after a
+        bus fault republishes, and a consumer that starts late reads the
+        current configuration instead of waiting for the next restart.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+        await self._nc.publish(
+            subjects.chip(state.hardware_source, state.instance),
+            state.model_dump_json().encode(),
         )
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
