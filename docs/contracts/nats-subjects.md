@@ -34,9 +34,20 @@ called by every builder.
 | `bellasreef.heartbeat.<component>` | `Heartbeat` | core pub/sub **only** | every service |
 | `bellasreef.audit.<category>` | audit envelope | **JetStream** `BR_AUDIT` | any |
 | `bellasreef.registry.<id>` | `ActuatorRegistration` | core pub/sub | hardware-io |
+| `bellasreef.chip.<source>.<instance>` | `ChipState` | **JetStream** `BR_CHIP` | hardware-io |
 
 `<class>` is the actuator class (`binary`, `pwm`). `<type>` is the sensor type
-token (`temp`, `ph`, …).
+token (`temp`, `ph`, …). `<source>` is the hardware source (`pi-pwm`,
+`pca9685`, `w1-bus`) and `<instance>` identifies one instance of that
+source — a chip's I²C address, a PWM block's device path, a bus master name.
+
+`<instance>` is the one token in this table that does not pass through
+`validate_token()` (§1): it can legitimately carry characters NATS reserves,
+such as the `.` in `1f00098000.pwm` (the RP1 PWM0 block's device path), which
+would otherwise split the subject into an extra level. `subjects.chip()`
+swaps `.` for `-` in the subject token only — the `ChipState.instance` field
+on the payload keeps the original string. The subject is an address, not the
+datum.
 
 ### Why some subjects are deliberately not durable
 
@@ -123,6 +134,49 @@ StreamConfig(
 
 One message per subject means a restarting service can fetch the current state
 of every actuator without asking hardware-io and without replaying history.
+
+### `BR_CHIP` — retained per-instance chip state
+
+```python
+StreamConfig(
+    name="BR_CHIP",
+    subjects=["bellasreef.chip.>"],
+    retention=RetentionPolicy.LIMITS,
+    storage=StorageType.FILE,
+    max_msgs_per_subject=1,  # exactly the current configuration, nothing older
+)
+```
+
+Same shape as `BR_STATE`: one retained message per subject, so a client that
+starts late learns how each chip is configured without waiting for
+hardware-io to restart. `ChipState` is a fact about the *chip* — frequency,
+polarity, output mode, whether `initialise()` has run — not about any one
+channel, which is why the key is `(hardware_source, instance)` rather than
+the device id every other stream in this document keys on.
+
+hardware-io publishes at three bring-up moments, one per hardware source
+type: for a PCA9685, after `Pca9685Device.initialise()` runs on the first
+channel that opens it; for the RP1 PWM block, on its own first channel's
+`open()`; for a 1-Wire bus master, at capability-announce time, since a probe
+has no `open()` step of its own and "initialised" there means "the bus is
+present". Each moment is keyed on `(hardware_source, instance)`, not on the
+source alone, so a second chip of the same type — a second PCA9685 on the bus,
+say — publishes its own message rather than being skipped as a duplicate.
+Publication is best-effort, like `_publish_state`: a failure is logged and
+never raised into `open()` or capability discovery, and only a successful
+publish is remembered, so a later channel on the same chip gets a retry rather
+than permanent silence. Each `(hardware_source, instance)` is published once
+per process — the stream and message both support a later republish (e.g.
+after re-initialising past a bus fault), but hardware-io does not yet trigger
+one; that is a follow-up, not a gap in this contract.
+
+`ChipState` and `BR_CHIP` are the wire half of the design in
+`docs/superpowers/specs/2026-08-19-chip-state-on-the-wire-design.md`
+(ruled 2026-08-18: option A, a per-chip Hardware surface, not a key in a
+capability's `detail` and not a field on the adopted device row). The API
+consumer, its migration, and the iOS Hardware leaf are later PRs per that
+spec's Order — this stream and its publishers are the whole of what ships
+here.
 
 ### `BR_AUDIT` — audit transport
 
@@ -217,6 +271,17 @@ protects consumers of the wire, and the wire did not move; the only
 implementers of the Protocol are `hardware-io`'s two drivers and its fakes,
 updated in the same commit. Clients see only the number: the API's `/info`
 reports it, and iOS re-pins its vendored spec to match. Ruled 2026-08-18.
+
+**contracts 4.2.0 adds `ChipState`, the `bellasreef.chip.<source>.<instance>`
+subject, and `BR_CHIP`** (§2, §3), published by hardware-io at three bring-up
+moments (pca9685, pi-pwm, w1-bus — see §3). A new message type and a new
+subject; nothing existing changes, so this is MINOR under the table above —
+same class of change as 3.x's additive subjects, even though `<instance>` is
+the first token to legitimately bypass `validate_token()` (§1, §2). The API
+consumer (`GET /api/v1/hardware`) and the iOS Hardware leaf are separate PRs,
+per `docs/superpowers/specs/2026-08-19-chip-state-on-the-wire-design.md`'s
+Order; this bump covers only what ships here — the message, the subject, the
+stream, and the three publishers.
 
 ### Pre-release exception (expires at the first tagged release)
 
