@@ -72,7 +72,12 @@ from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
 from bellasreef_api.history import DEFAULT_BUCKETS, MAX_BUCKETS, HistoryReader
-from bellasreef_api.registry import AssignmentPublisher, CapabilityConsumer, RegistryConsumer
+from bellasreef_api.registry import (
+    AssignmentPublisher,
+    CapabilityConsumer,
+    ChipConsumer,
+    RegistryConsumer,
+)
 from bellasreef_api.security import (
     ACCESS_TOKEN_TTL_S,
     TokenError,
@@ -773,6 +778,7 @@ def build_app(
 
     registry = RegistryConsumer(nats_url, store) if nats_url else None
     capabilities = CapabilityConsumer(nats_url, store) if nats_url else None
+    chips = ChipConsumer(nats_url, store) if nats_url else None
     assignments = AssignmentPublisher(nats_url) if nats_url else None
     telemetry = (
         TelemetryWriter(nats_url, vm_url, store, durable_suffix=durable_suffix)
@@ -833,6 +839,7 @@ def build_app(
         for name, component in (
             ("registry consumer", registry),
             ("capability consumer", capabilities),
+            ("chip consumer", chips),
             ("telemetry writer", telemetry),
             ("audit writer", audit_writer),
         ):
@@ -845,7 +852,7 @@ def build_app(
         try:
             yield
         finally:
-            for component in (registry, telemetry, audit_writer):
+            for component in (registry, chips, telemetry, audit_writer):
                 if component is not None:
                     await component.close()
 
@@ -861,6 +868,7 @@ def build_app(
     app.state.background = {
         "registry consumer": registry,
         "capability consumer": capabilities,
+        "chip consumer": chips,
         "telemetry writer": telemetry,
         "audit writer": audit_writer,
     }

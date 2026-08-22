@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import UTC, datetime
 from typing import Any
 
 import nats
 from bellasreef_contracts import (
     CapabilityAnnouncement,
+    ChipState,
     DeviceAssignment,
     SensorRegistration,
     subjects,
@@ -177,6 +179,112 @@ class CapabilityConsumer:
             log.exception(
                 "could not store capabilities",
                 extra={"hardware_source": announcement.hardware_source},
+            )
+        with contextlib.suppress(Exception):
+            await msg.ack()
+
+
+class ChipConsumer:
+    """Subscribes to per-chip state and stores what each chip reports.
+
+    Shape copied verbatim from :class:`CapabilityConsumer` — same retry loop,
+    same push subscription. **Ephemeral, not durable** (ruled 2026-08-22): the
+    chip-state PR2 spec's "durable registry-chips" parenthetical is
+    superseded, because a durable is shared broker state and a JetStream
+    workqueue permits exactly one consumer per filter subject — the exact
+    contention class that has already cost this repo a lost-monitoring
+    outage (see CLAUDE.md's environment-boundary rule). LAST_PER_SUBJECT
+    gives a late-starting API the current state of every chip without one.
+    """
+
+    RETRY_S = 5.0
+
+    def __init__(self, url: str, store: Store) -> None:
+        self._url = url
+        self._store = store
+        self._nc: Client | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._subscribed = False
+
+    @property
+    def is_running(self) -> bool:
+        return self._subscribed and self._nc is not None and self._nc.is_connected
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._subscribe_forever())
+
+    async def _subscribe_forever(self) -> None:
+        while True:
+            try:
+                await self._subscribe()
+                return
+            except asyncio.CancelledError:
+                raise
+            except NotFoundError:
+                log.info(
+                    "chip stream not provisioned yet; waiting",
+                    extra={"retry_in_s": self.RETRY_S},
+                )
+            except Exception:
+                log.exception("chip consumer could not subscribe; retrying")
+            await asyncio.sleep(self.RETRY_S)
+
+    async def _subscribe(self) -> None:
+        if self._nc is None or not self._nc.is_connected:
+            self._nc = await nats.connect(self._url)
+        js = self._nc.jetstream()
+        # LAST_PER_SUBJECT for the same reason as capabilities: hardware-io
+        # announces a chip's state once, at its own startup (or on a config
+        # change), so a plain subscription would see nothing on an API that
+        # restarted afterwards.
+        await js.subscribe(
+            subjects.ALL_CHIPS,
+            cb=self._on_message,
+            config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+        )
+        self._subscribed = True
+        log.info("chip consumer subscribed", extra={"subject": subjects.ALL_CHIPS})
+
+    async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._nc is not None:
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
+
+    async def _on_message(self, msg: Msg) -> None:
+        try:
+            state = ChipState.model_validate_json(msg.data)
+        except ValidationError:
+            log.warning(
+                "chip message did not validate; ignored",
+                extra={"subject": msg.subject},
+            )
+            with contextlib.suppress(Exception):
+                await msg.ack()
+            return
+
+        try:
+            await self._store.upsert_chip_state(
+                source=state.hardware_source,
+                instance=state.instance,
+                initialised=state.initialised,
+                initialised_at=state.initialised_at,
+                facts=dict(state.facts),
+                announced_at=datetime.now(UTC),
+            )
+            log.info(
+                "chip state stored",
+                extra={"hardware_source": state.hardware_source, "instance": state.instance},
+            )
+        except Exception:  # broad by design: a bad row must not kill the consumer
+            log.exception(
+                "could not store chip state",
+                extra={"hardware_source": state.hardware_source, "instance": state.instance},
             )
         with contextlib.suppress(Exception):
             await msg.ack()
