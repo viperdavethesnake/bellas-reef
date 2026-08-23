@@ -178,14 +178,14 @@ class _FakeOverrideStore(OverrideStore):
 
     async def release(
         self, override_id: UUID, reason: ReleaseReason, *, now: datetime | None = None
-    ) -> bool:
+    ) -> str | None:
         self._maybe_fail("release")
         self.released.append((override_id, reason))
         for target, override in list(self.rows.items()):
             if override.id == override_id:
                 del self.rows[target]
-                return True
-        return False
+                return target
+        return None
 
 
 class _FakeScheduleStore(ScheduleStore):

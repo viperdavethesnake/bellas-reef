@@ -2238,11 +2238,17 @@ def build_app(
     async def release_override(
         override_id: UUID, actor: Annotated[UUID, Depends(current_client)]
     ) -> dict[str, str]:
-        if not await overrides.release(override_id, "manual"):
+        target = await overrides.release(override_id, "manual")
+        if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or already released")
         await sink(
             "override.released",
-            {"override_id": str(override_id), "reason": "manual", "actor": str(actor)},
+            {
+                "override_id": str(override_id),
+                "target": target,
+                "reason": "manual",
+                "actor": str(actor),
+            },
             category="command",
         )
         return {"status": "released"}
