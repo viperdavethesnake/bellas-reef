@@ -951,6 +951,10 @@ def build_app(
     async def _count_requests(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
+        # Counts every response this handler returns, including the 401/404/409s
+        # HTTPException maps to. A truly unhandled exception propagates past
+        # call_next instead of returning here, so it reaches ServerErrorMiddleware
+        # outside this counter rather than landing as a counted 5xx.
         response = await call_next(request)
         metrics_requests.labels(request.method, f"{response.status_code // 100}xx").inc()
         return response

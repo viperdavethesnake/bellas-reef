@@ -41,7 +41,13 @@ _VM = "BELLASREEF_TEST_VM_URL"
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get(_PG) and os.environ.get(_NATS) and os.environ.get(_VM)),
-    reason=f"{_PG}, {_NATS} and {_VM} must all be set",
+    # Must contain "not set" — conftest.py's _ENV_SKIP_MARKER matches on that
+    # exact substring to decide a skip was declared rather than incidental.
+    # The old "must all be set" phrasing didn't, so this whole file
+    # env-skipped silently: `pytest_sessionfinish` never saw it as a skip
+    # worth reporting, and the gate passed locally with none of these tests
+    # run at all.
+    reason=f"{_PG}, {_NATS} or {_VM} not set",
 )
 
 
