@@ -85,6 +85,16 @@ def _load_libc() -> ctypes.CDLL | None:
 #: is what actually excludes macOS, where libc exists but has no adjtimex.
 _libc = _load_libc()
 
+if _libc is not None and hasattr(_libc, "adjtimex"):
+    # ctypes' untyped default (treat every arg as a C int and the return as a
+    # C int) happens to work here, but this symbol feeds a safety-adjacent
+    # decision even in shadow mode — pin the real signature rather than lean
+    # on the default. Guarded: on macOS (or any libc without adjtimex) this
+    # block never runs, and kernel_clock_synchronised()'s own hasattr check
+    # is what excludes it there.
+    _libc.adjtimex.restype = ctypes.c_int
+    _libc.adjtimex.argtypes = [ctypes.POINTER(_Timex)]
+
 
 def kernel_clock_synchronised() -> bool | None:
     """Ask the kernel, not systemd: adjtimex(2) is visible from inside a
