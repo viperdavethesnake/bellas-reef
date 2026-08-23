@@ -349,6 +349,24 @@ def test_row_resolves_device_id_across_publisher_dialects() -> None:
         assert row["device_id"] == "pca9685-0", key
 
 
+def test_row_device_id_precedence_actuator_id_beats_device_id() -> None:
+    """hardware-io's own key wins over the API's, per _DEVICE_KEYS order —
+    not just "some key is picked", the earlier-listed one specifically."""
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"actuator_id": "pi-pwm-0", "device_id": "pca9685-0"}).encode(),
+    )
+    assert row["device_id"] == "pi-pwm-0"
+
+
+def test_row_device_id_precedence_device_id_beats_target() -> None:
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"device_id": "pca9685-0", "target": "led-blue"}).encode(),
+    )
+    assert row["device_id"] == "pca9685-0"
+
+
 def test_alert_category_is_no_longer_remapped() -> None:
     row = _writer()._to_row("bellasreef.audit.alert", json.dumps({"device_id": "d"}).encode())
     assert row["category"] == "alert"
@@ -364,4 +382,23 @@ def test_unparseable_timestamp_falls_back_to_drain_time() -> None:
     row = _writer()._to_row(
         "bellasreef.audit.command", json.dumps({"observed_at": "not-a-date"}).encode()
     )
-    assert isinstance(row["occurred_at"], datetime)
+    occurred_at = row["occurred_at"]
+    assert isinstance(occurred_at, datetime)
+    # Not just "a datetime" — the actual drain-time fallback, not some other
+    # value that happens to satisfy isinstance.
+    assert abs((datetime.now(UTC) - occurred_at).total_seconds()) < 60
+
+
+def test_naive_timestamp_falls_back_to_drain_time() -> None:
+    """A naive ``occurred_at`` is a publisher bug — see _event_time's
+    docstring. Guessing a zone would fabricate precision that isn't there, so
+    this must land on drain time exactly like an unparseable string, not on
+    the naive value reinterpreted as UTC."""
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"occurred_at": "2020-01-01T00:00:00"}).encode(),
+    )
+    occurred_at = row["occurred_at"]
+    assert isinstance(occurred_at, datetime)
+    assert occurred_at.tzinfo is not None
+    assert abs((datetime.now(UTC) - occurred_at).total_seconds()) < 60
