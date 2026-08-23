@@ -520,9 +520,20 @@ class CommandConsumer:
                 # hardware event, not a reason to unwind the process — that
                 # turned one off-bus chip into a crash-loop, because the
                 # un-acked workqueue message redelivered into every restart.
-                # Nak with a delay: a transient fault succeeds on redelivery;
-                # a persistent one burns max_deliver and then the command's
-                # own 30s TTL refuses successors as expired.
+                # Nak with a delay instead: a transient fault succeeds on one
+                # of the redeliveries. A persistent one does not converge on
+                # the command's own TTL — max_deliver (3, ~1s nak cadence)
+                # exhausts in a few seconds, long before a 30s TTL would ever
+                # matter, and JetStream then stops redelivering the message
+                # at all. It sits unacked on BR_CMD until the stream's own
+                # max_age (1 hour, DiscardPolicy.OLD) reaps it — that is the
+                # actual convergence to silence, not an expiry check. The
+                # log.critical call below fires once per delivery attempt, so
+                # up to three of them are the standing record of that
+                # abandonment; no separate audit event is emitted for
+                # delivery-exhaustion itself, because a pull consumer exposes
+                # no per-message "this was the last attempt" hook to hang one
+                # off of, and at this scale the log record is enough.
                 log.critical(
                     "driver failed applying a command; message nak'd for redelivery",
                     extra={"actuator_id": command.actuator_id},

@@ -157,6 +157,32 @@ def test_pipwm_resolves_the_chip_at_most_once_per_build(monkeypatch: pytest.Monk
     assert {a.registration.actuator_id for a in actuators} == {"pi-pwm-1", "pi-pwm-2"}
 
 
+def test_pipwm_resolution_failure_is_also_cached_across_a_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure half of the same sentinel: a chip that never resolves must
+    not be re-probed for every pi-pwm assignment in the build. Both
+    assignments skip (each raises its own TopologyError, caught individually
+    by the per-assignment except clause), but find_pwm_chip only ever runs
+    once — the second assignment reuses the first's "nothing resolved"
+    answer instead of reading /sys/class/pwm again."""
+    calls = 0
+
+    def counting_find_pwm_chip() -> Path | None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(factory_module, "find_pwm_chip", counting_find_pwm_chip)
+
+    actuators, _ = build_from_assignments(
+        [_pipwm("pi-pwm-1", adopted=True), _pipwm("pi-pwm-2", adopted=True)]
+    )
+
+    assert calls == 1
+    assert actuators == []
+
+
 # ------------------------------------------------------------ pca9685 lifecycle
 
 
