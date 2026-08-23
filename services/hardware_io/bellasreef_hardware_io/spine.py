@@ -645,7 +645,12 @@ class CommandConsumer:
         exiting the process mid-refusal (2026-08-23 finding 5), while the
         state publishes next door were already wrapped."""
         try:
-            await self._spine.publish_audit("command", {"event": event_type, **detail})
+            # detail spread last: no publisher stamps its own "actor" in
+            # detail today, but if one ever does, its explicit value should
+            # win over this constant rather than being silently overwritten.
+            await self._spine.publish_audit(
+                "command", {"event": event_type, "actor": "hardware-io", **detail}
+            )
         except Exception:
             log.warning(
                 "audit publish failed; event dropped",

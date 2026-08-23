@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,8 +18,11 @@ from bellasreef_contracts import (
     DeviceAssignment,
     PwmLevel,
     ScheduleDefinition,
+    SensorAlert,
+    SensorReading,
     StateReason,
 )
+from bellasreef_control_engine.alerts import AlertSupervisor, Thresholds
 from bellasreef_control_engine.app import ControlEngine
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
@@ -1368,3 +1371,52 @@ class TestScheduleReload:
         # further commands.
         asyncio.run(engine._tick(t0 + timedelta(seconds=41)))
         assert len(fake.published) == settled_count
+
+
+class _FakeAlertStore:
+    """In-memory ``AlertStore``. Replicated from tests/test_alerts.py's
+    FakeStore — same shape, no cross-import."""
+
+    async def open_bounds(self) -> Mapping[str, frozenset[str]]:
+        return {}
+
+    async def raise_episode(self, alert: SensorAlert) -> None:
+        pass
+
+    async def clear_episode(self, alert: SensorAlert) -> None:
+        pass
+
+
+async def _noop_publish_alert(subject: str, alert: SensorAlert) -> None:
+    """AlertSupervisor's own publish (the live sensor.alert message) — not
+    the audit trail, which _on_reading below publishes separately via
+    ``engine.publisher.publish_audit``."""
+
+
+def test_on_reading_stamps_the_alert_audit_actor() -> None:
+    """Finding 8 (2026-08-23 review): the alert-audit dict built in
+    ``_on_reading`` carried no ``actor``, so the writer's fallback default
+    attributed it to whichever service happened to be the writer's guess —
+    never the engine that actually raised it."""
+    engine = ControlEngine([profile()], metrics_port=0)
+    fake = _FakePublisher()
+    engine.publisher = fake
+    engine.alerts = AlertSupervisor(_FakeAlertStore(), _noop_publish_alert)
+    engine._thresholds = {"ds18b20-x": Thresholds(minimum=24.0, maximum=27.0, clear_margin=0.5)}
+
+    reading = SensorReading(
+        message_id=uuid4(),
+        emitted_at=datetime.now(UTC),
+        source="hardware-io",
+        sensor_id="ds18b20-x",
+        sensor_type="temp",
+        value=23.0,  # below the 24.0 minimum: a breach
+        unit="degC",
+        quality="ok",
+    )
+
+    asyncio.run(engine._on_reading(reading))
+
+    ((category, event),) = fake.audits
+    assert category == "alert"
+    assert event["actor"] == "control-engine"

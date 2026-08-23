@@ -13,6 +13,7 @@ rather than a broker.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +21,8 @@ from uuid import uuid4
 
 import pytest
 from bellasreef_contracts import ChipState, Heartbeat, subjects
-from bellasreef_hardware_io.spine import CHIP_STREAM, STREAMS, Spine
+from bellasreef_hardware_io import InterlockSupervisor, SafetyEvent
+from bellasreef_hardware_io.spine import CHIP_STREAM, STREAMS, CommandConsumer, Spine
 from nats.js.api import RetentionPolicy, StorageType
 
 
@@ -188,3 +190,68 @@ def test_subscribe_heartbeats_without_a_connection_raises() -> None:
 
     with pytest.raises(RuntimeError, match="spine not connected"):
         run(scenario)
+
+
+class _FakeJs:
+    """Records every publish, in place of a real JetStream context — the
+    ``spine.js`` property surface ``CommandConsumer._audit`` touches."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, bytes, dict[str, str] | None]] = []
+
+    async def publish(
+        self, subject: str, payload: bytes, *, headers: dict[str, str] | None = None
+    ) -> None:
+        self.published.append((subject, payload, headers))
+
+
+async def _noop_on_event(event: SafetyEvent) -> None:
+    pass
+
+
+def _consumer(spine: Spine) -> CommandConsumer:
+    supervisor = InterlockSupervisor(on_event=_noop_on_event)
+    return CommandConsumer(spine, supervisor)
+
+
+def test_audit_stamps_the_hardware_io_actor() -> None:
+    """Finding 8 (2026-08-23 review): the merged audit dict carried no
+    ``actor``, so the writer's fallback default attributed every hardware-io
+    refusal to whichever service happened to be its guess — never
+    hardware-io itself, which is the one that actually refused it."""
+
+    async def scenario() -> dict[str, object]:
+        spine = Spine("nats://example.invalid:4222")
+        fake_js = _FakeJs()
+        spine._js = fake_js  # type: ignore[assignment]
+        consumer = _consumer(spine)
+
+        await consumer._audit("command_refused", {"actuator_id": "ato-pump"})
+
+        _subject, payload, _headers = fake_js.published[0]
+        return dict(json.loads(payload))
+
+    event = run(scenario)
+    assert event["actor"] == "hardware-io"
+    assert event["event"] == "command_refused"
+    assert event["actuator_id"] == "ato-pump"
+
+
+def test_audit_lets_an_explicit_actor_in_detail_win() -> None:
+    """The merge order (``detail`` spread last) is the honest one: nothing
+    sets ``actor`` in ``detail`` today, but if something ever did, it must
+    not be silently overwritten by the constant."""
+
+    async def scenario() -> dict[str, object]:
+        spine = Spine("nats://example.invalid:4222")
+        fake_js = _FakeJs()
+        spine._js = fake_js  # type: ignore[assignment]
+        consumer = _consumer(spine)
+
+        await consumer._audit("malformed_command", {"actor": "someone-else"})
+
+        _subject, payload, _headers = fake_js.published[0]
+        return dict(json.loads(payload))
+
+    event = run(scenario)
+    assert event["actor"] == "someone-else"
