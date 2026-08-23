@@ -513,7 +513,23 @@ class CommandConsumer:
                 await msg.term()
                 continue
 
-            outcome = await self._supervisor.apply(command)
+            try:
+                outcome = await self._supervisor.apply(command)
+            except Exception:
+                # A driver fault (chip off the bus, transient I2C error) is a
+                # hardware event, not a reason to unwind the process — that
+                # turned one off-bus chip into a crash-loop, because the
+                # un-acked workqueue message redelivered into every restart.
+                # Nak with a delay: a transient fault succeeds on redelivery;
+                # a persistent one burns max_deliver and then the command's
+                # own 30s TTL refuses successors as expired.
+                log.critical(
+                    "driver failed applying a command; message nak'd for redelivery",
+                    extra={"actuator_id": command.actuator_id},
+                    exc_info=True,
+                )
+                await msg.nak(delay=1.0)
+                continue
             outcomes.append(outcome)
 
             if outcome == "applied":
@@ -611,7 +627,20 @@ class CommandConsumer:
         self._heal_cause = None
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
-        await self._spine.publish_audit("command", {"event": event_type, **detail})
+        """Best-effort: an audit publish failure is logged, never raised.
+
+        The ack/term deciding the message's fate must happen regardless — a
+        JetStream hiccup on the audit stream was escaping drain_once and
+        exiting the process mid-refusal (2026-08-23 finding 5), while the
+        state publishes next door were already wrapped."""
+        try:
+            await self._spine.publish_audit("command", {"event": event_type, **detail})
+        except Exception:
+            log.warning(
+                "audit publish failed; event dropped",
+                extra={"event": event_type},
+                exc_info=True,
+            )
 
     async def _publish_applied_state(self, command: ActuatorCommand) -> None:
         """Tell the wire what an applied command actually did.
