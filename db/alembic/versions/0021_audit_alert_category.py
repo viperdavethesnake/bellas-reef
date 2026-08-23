@@ -22,7 +22,7 @@ depends_on: None = None
 
 
 def upgrade() -> None:
-    op.drop_constraint("category_valid", "audit_log")
+    op.drop_constraint("category_valid", "audit_log", type_="check")
     op.create_check_constraint(
         "category_valid",
         "audit_log",
@@ -34,7 +34,7 @@ def downgrade() -> None:
     # Refuses if 'alert' rows exist — append-only table, rows cannot be
     # rewritten, and silently re-filing them under 'safety' would repeat the
     # bug this migration fixes.
-    op.drop_constraint("category_valid", "audit_log")
+    op.drop_constraint("category_valid", "audit_log", type_="check")
     op.create_check_constraint(
         "category_valid",
         "audit_log",
