@@ -499,7 +499,7 @@ class AuditLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "category IN ('command', 'config', 'auth', 'state', 'safety', 'calibration')",
+            "category IN ('command', 'config', 'auth', 'state', 'safety', 'calibration', 'alert')",
             name="category_valid",
         ),
     )

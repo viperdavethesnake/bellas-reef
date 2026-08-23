@@ -60,7 +60,9 @@ _INSERT = text(
 #: audit_log.category has a CHECK constraint; anything outside this set would be
 #: rejected by the database, so it is normalised here rather than discovered as
 #: a failed insert on a message we then cannot retry usefully.
-_VALID_CATEGORIES = frozenset({"command", "config", "auth", "state", "safety", "calibration"})
+_VALID_CATEGORIES = frozenset(
+    {"command", "config", "auth", "state", "safety", "calibration", "alert"}
+)
 
 
 class AuditWriter:
