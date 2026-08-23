@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from bellasreef_api.security import hash_refresh_token, new_refresh_token, new_signing_secret
 
-__all__ = ["ChannelHeldError", "ClientRow", "PairingOutcome", "Store"]
+__all__ = ["ChannelHeldError", "ClientRow", "DeviceIdConflictError", "PairingOutcome", "Store"]
 
 #: auth.md §2: a pairing request lives 5 minutes.
 PAIRING_TTL_S = 300
@@ -60,6 +60,24 @@ class ChannelHeldError(Exception):
     def __init__(self, holder: str) -> None:
         self.holder = holder
         super().__init__(f"channel now held by {holder!r}")
+
+
+class DeviceIdConflictError(RuntimeError):
+    """Raised by :meth:`Store.bind_device` when the proposed ``device_id``
+    already names a device bound to different hardware.
+
+    The create path's ``ON CONFLICT (device_id) DO NOTHING`` protects the
+    primary key, but a caller was never told when it fired: ``light-left``
+    bound to channel 2, then POSTed onto free channel 3, hit the conflict,
+    wrote nothing, and the endpoint still reported ``created=True`` and
+    published an assignment that contradicted Postgres (2026-08-23 finding
+    9). The channel-holder check upstream vouches for the *channel* being
+    free; this is the other axis — the *id* is already taken.
+    """
+
+    def __init__(self, device_id: str) -> None:
+        self.device_id = device_id
+        super().__init__(f"device_id already in use: {device_id!r}")
 
 
 class DeviceReferencedError(Exception):
@@ -426,7 +444,7 @@ class Store:
             created = existing is None
 
             if created:
-                await conn.execute(
+                result = await conn.execute(
                     text(
                         "INSERT INTO devices ("
                         "  id, device_id, kind, driver_id, sensor_type, poll_interval_s, "
@@ -474,6 +492,15 @@ class Store:
                         ),
                     },
                 )
+                if result.rowcount == 0:
+                    # The channel-holder check upstream vouched for the CHANNEL;
+                    # this is the other axis — the proposed id already names a
+                    # device bound elsewhere. DO NOTHING wrote nothing, and
+                    # returning created=True here published an assignment that
+                    # contradicted Postgres (2026-08-23 finding 9). The
+                    # transaction context rolls back on this raise, so nothing
+                    # from this call is left partially written.
+                    raise DeviceIdConflictError(target)
             else:
                 # Names its columns, and COALESCE on the operator-owned ones: a
                 # seed re-run must not blank a name somebody typed. Same rule as

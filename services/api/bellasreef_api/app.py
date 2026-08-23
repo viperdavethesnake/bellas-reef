@@ -85,7 +85,13 @@ from bellasreef_api.security import (
     issue_access_token,
     verify_access_token,
 )
-from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, DeviceReferencedError, Store
+from bellasreef_api.store import (
+    PAIRING_TTL_S,
+    ChannelHeldError,
+    DeviceIdConflictError,
+    DeviceReferencedError,
+    Store,
+)
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 from bellasreef_api.telemetry import TelemetryWriter
 
@@ -1513,18 +1519,25 @@ def build_app(
             )
 
         binding = {"rom": body.channel} if is_sensor else {"channel": body.channel}
-        device_id, created = await store.bind_device(
-            device_id=body.device_id,
-            kind="sensor" if is_sensor else "actuator",
-            driver_type=body.driver_type,
-            channel=body.channel,
-            binding=binding,
-            role=body.role,
-            display_name=body.display_name,
-            location=body.location,
-            sensor_type="temp" if is_sensor else None,
-            poll_interval_s=body.poll_interval_s if is_sensor else None,
-        )
+        try:
+            device_id, created = await store.bind_device(
+                device_id=body.device_id,
+                kind="sensor" if is_sensor else "actuator",
+                driver_type=body.driver_type,
+                channel=body.channel,
+                binding=binding,
+                role=body.role,
+                display_name=body.display_name,
+                location=body.location,
+                sensor_type="temp" if is_sensor else None,
+                poll_interval_s=body.poll_interval_s if is_sensor else None,
+            )
+        except DeviceIdConflictError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"device_id {exc.device_id!r} already names a device bound to a different "
+                "channel. Rename or forget it first.",
+            ) from exc
 
         # Announced after the row is stored. A binding that is stored and not
         # announced is recoverable; announced and not stored is not.
