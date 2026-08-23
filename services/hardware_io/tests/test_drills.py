@@ -685,6 +685,37 @@ def test_actuators_start_at_safe_state() -> None:
     run(scenario)
 
 
+def test_is_at_safe_state_accessor() -> None:
+    """Sibling of ``is_latched``: a read-only, broker-free accessor onto the
+    guard's own bookkeeping (``_note_level``'s ``at_safe_state``). Added for
+    the 2026-08-23 reconnect-republish fix (app.py's
+    ``_republish_safe_states``), which needs to tell "actually tripped dark"
+    apart from "still holding a commanded, non-safe level" without safety.py
+    taking any dependency on NATS to answer it."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        actuator = FakeActuator("ato-pump", OFF)
+        sup.register(_registration(), actuator)
+        await sup.start()
+        assert sup.is_at_safe_state("ato-pump"), "a freshly started actuator is at safe state"
+
+        await sup.apply(_command("ato-pump", on=True))
+        assert not sup.is_at_safe_state("ato-pump"), (
+            "a held non-safe command must read as not-at-safe-state"
+        )
+
+        await sup.apply(_command("ato-pump", on=False))
+        assert sup.is_at_safe_state("ato-pump"), (
+            "commanding the declared safe level returns the guard to safe"
+        )
+
+        await sup.stop()
+
+    run(scenario)
+
+
 # ------------------------------------------ drill: a command for nothing we own
 
 

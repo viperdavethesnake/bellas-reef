@@ -546,6 +546,125 @@ def test_startup_publish_failure_does_not_raise() -> None:
     run(scenario)
 
 
+# ------------------------------------------------------- reconnect republish
+
+
+def test_republish_safe_states_publishes_only_for_actuators_at_safe_state() -> None:
+    """2026-08-23 NATS-outage drill: a spine outage longer than the heartbeat
+    timeout trips actuators dark, but the trip-state publish fails into the
+    down spine — swallowed by design, observed 22:49:23Z ("failed to publish
+    actuator state ... reason=safe_state" for both actuators). The engine's
+    duty memory is never corrected, so its first post-recovery command
+    re-energizes the dark channel in ONE step at curve duty (observed:
+    0 -> 11.5% in a single lighting:ramp command at 22:50:57Z) instead of
+    slewing up from dark.
+
+    Wired as ``Spine.on_reconnected``, ``_republish_safe_states`` republishes
+    the declared safe_state for exactly the actuators the supervisor reports
+    at safe state right now — light-a here, freshly started and untouched.
+    light-b is commanded on and stays held there: its level is still true on
+    the hardware, so republishing it would be noise, and — per the brief —
+    would risk a spurious dark-dip on a sub-timeout blip that never actually
+    tripped anything.
+    """
+
+    async def scenario() -> list[ActuatorState]:
+        service = HardwareIO(metrics_port=0)
+        # A fresh supervisor with the default clock_trusted=True: this test
+        # applies a command, and HardwareIO's own supervisor takes its clock
+        # trust from the real host clock (clock_is_trusted()) at __init__ —
+        # the same substitution test_heartbeat_loss_publishes_safe_state uses,
+        # for the same reason.
+        service.supervisor = InterlockSupervisor(on_event=service._on_safety_event)
+        dark = FakeActuator("light-a", OFF)
+        held = FakeActuator("light-b", OFF)
+        service.supervisor.register(registration("light-a"), dark)
+        service.supervisor.register(registration("light-b"), held)
+        await service.supervisor.start()
+        service._registrations = [
+            service.supervisor.registration_of("light-a"),
+            service.supervisor.registration_of("light-b"),
+        ]
+
+        await service.supervisor.apply(command("light-b", ON))
+        assert not service.supervisor.is_at_safe_state("light-b")
+        assert service.supervisor.is_at_safe_state("light-a")
+
+        spine = FakeSpinePublisher()
+        service.spine = spine  # type: ignore[assignment]
+
+        await service._republish_safe_states()
+
+        published = list(spine.states)
+        await service.supervisor.stop()
+        return published
+
+    states = run(scenario)
+    assert len(states) == 1
+    assert states[0].actuator_id == "light-a"
+    assert states[0].level == OFF
+    assert states[0].reason == "safe_state"
+    assert states[0].latched is False
+
+
+def test_republish_safe_states_carries_the_current_latch_flag() -> None:
+    async def scenario() -> list[ActuatorState]:
+        service = HardwareIO(metrics_port=0)
+        actuator = FakeActuator("ato-pump", OFF)
+        service.supervisor.register(registration("ato-pump"), actuator)
+        await service.supervisor.start()
+        service._registrations = [service.supervisor.registration_of("ato-pump")]
+
+        # At safe state, but latched by a separate mechanism (mirrors
+        # test_max_runtime_trip_publishes_latched_state's direct latch).
+        service.supervisor._guards["ato-pump"].latched = True
+
+        spine = FakeSpinePublisher()
+        service.spine = spine  # type: ignore[assignment]
+
+        await service._republish_safe_states()
+
+        published = list(spine.states)
+        await service.supervisor.stop()
+        return published
+
+    states = run(scenario)
+    assert len(states) == 1
+    assert states[0].latched is True
+
+
+def test_republish_safe_states_with_no_spine_does_not_publish_or_crash() -> None:
+    async def scenario() -> None:
+        service = HardwareIO(metrics_port=0)
+        actuator = FakeActuator("ato-pump", OFF)
+        service.supervisor.register(registration("ato-pump"), actuator)
+        await service.supervisor.start()
+        service._registrations = [service.supervisor.registration_of("ato-pump")]
+
+        assert service.spine is None
+        await service._republish_safe_states()  # must not raise
+
+        await service.supervisor.stop()
+
+    run(scenario)
+
+
+def test_republish_safe_states_publish_failure_does_not_raise() -> None:
+    async def scenario() -> None:
+        service = HardwareIO(metrics_port=0)
+        actuator = FakeActuator("ato-pump", OFF)
+        service.supervisor.register(registration("ato-pump"), actuator)
+        await service.supervisor.start()
+        service._registrations = [service.supervisor.registration_of("ato-pump")]
+
+        service.spine = FakeSpinePublisher(raises=True)  # type: ignore[assignment]
+        await service._republish_safe_states()  # must not raise
+
+        await service.supervisor.stop()
+
+    run(scenario)
+
+
 # ------------------------------------------------------- autonomous trips
 
 

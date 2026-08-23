@@ -553,6 +553,23 @@ class InterlockSupervisor:
     def is_latched(self, actuator_id: str) -> bool:
         return self._guards[actuator_id].latched
 
+    def is_at_safe_state(self, actuator_id: str) -> bool:
+        """Read-only, broker-free, like ``is_latched`` — a sibling accessor
+        onto ``_note_level``'s ``at_safe_state`` bookkeeping.
+
+        Added for the reconnect-republish fix (2026-08-23 NATS-outage drill):
+        a spine outage longer than the heartbeat timeout trips an actuator to
+        its safe state, but the trip-state publish is swallowed by the down
+        spine, so the engine's duty memory is never corrected — its first
+        post-recovery command then re-energizes the dark channel in one step
+        instead of slewing up from dark. app.py's ``_republish_safe_states``
+        uses this accessor, on reconnect, to republish only the actuators
+        that are actually at safe state right now — an actuator holding a
+        commanded, non-safe level is still doing exactly what it was told,
+        and republishing it would be noise (and, on a sub-timeout blip that
+        never tripped anything, a spurious dark-dip)."""
+        return self._guards[actuator_id].at_safe_state
+
     @property
     def actuator_ids(self) -> tuple[str, ...]:
         return tuple(self._guards)

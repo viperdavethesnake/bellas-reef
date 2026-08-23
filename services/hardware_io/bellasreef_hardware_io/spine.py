@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
@@ -161,6 +161,14 @@ class Spine:
         self._url = url
         self._nc: Client | None = None
         self._js: JetStreamContext | None = None
+        #: Called after the underlying NATS client reconnects. Settable any
+        #: time before :meth:`connect` runs — that is when it gets wired into
+        #: ``reconnected_cb``. Async, unlike control-engine's sibling
+        #: (``CommandPublisher.on_reconnected``, publisher.py), because
+        #: HardwareIO's handler (``_republish_safe_states``) awaits publishes
+        #: rather than just flipping a flag. See :meth:`connect`'s docstring
+        #: for why this exists.
+        self.on_reconnected: Callable[[], Awaitable[None]] | None = None
 
     @property
     def js(self) -> JetStreamContext:
@@ -169,7 +177,36 @@ class Spine:
         return self._js
 
     async def connect(self) -> None:
-        self._nc = await nats.connect(self._url)
+        """Connect, wiring ``on_reconnected`` into nats.py's ``reconnected_cb``.
+
+        2026-08-23 NATS-outage drill: an outage longer than the heartbeat
+        timeout trips actuators to their declared safe state, but the
+        trip-state publish fails into the down spine — swallowed by design.
+        The engine never learns the trip happened, so its duty memory is
+        never corrected, and its first post-recovery command re-energizes the
+        dark channel in ONE step at curve duty (observed: 0 -> 11.5% in a
+        single ``lighting:ramp`` command at 22:50:57Z; at midday this would
+        be 0 -> 100%) instead of slewing up from dark on the path the slew
+        exists for. ``on_reconnected`` — HardwareIO wires it to
+        ``_republish_safe_states`` before this call — republishes the
+        currently-safe actuators once the client is back, correcting the
+        engine's memory so recovery slews from dark again.
+
+        The callback body is guarded: a raise out of ``on_reconnected`` must
+        not escape into nats.py's own reconnect handling. Same guard shape as
+        ``subscribe_heartbeats``'s ``on_beat`` — a bug in the republish path
+        must not be able to take down the reconnect it rides on.
+        """
+
+        async def _on_reconnected() -> None:
+            if self.on_reconnected is None:
+                return
+            try:
+                await self.on_reconnected()
+            except Exception:
+                log.exception("reconnect callback failed")
+
+        self._nc = await nats.connect(self._url, reconnected_cb=_on_reconnected)
         self._js = self._nc.jetstream()
         log.info("spine connected", extra={"url": self._url})
 
