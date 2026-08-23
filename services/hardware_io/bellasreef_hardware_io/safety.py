@@ -198,6 +198,18 @@ class InterlockSupervisor:
                 "the contract validator should have refused it"
             )
         self._guards[registration.actuator_id] = _Guard(registration=registration, driver=driver)
+        guard = self._guards[registration.actuator_id]
+        if self._running:
+            # app.py registers production actuators from the registry AFTER
+            # start() has run (the spine has to be up before the registry can
+            # be read). A guard created then must get the same watcher a
+            # start()-time guard gets, or heartbeat loss protects nothing —
+            # which is exactly what shipped until 2026-08-23.
+            loop = asyncio.get_running_loop()
+            guard.last_beat = loop.time()
+            guard.watch_task = asyncio.create_task(
+                self._watch_heartbeat(guard), name=f"hb-{guard.actuator_id}"
+            )
 
     async def start(self) -> None:
         """Begin watching. Every actuator is driven to its safe state first.

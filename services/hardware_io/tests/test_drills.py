@@ -118,6 +118,24 @@ def run(scenario: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(scenario())
 
 
+async def _null_sink(event: SafetyEvent) -> None:
+    """An on_event sink for tests that only care about actuator state."""
+
+
+async def _wait_until(
+    predicate: Callable[[], bool], *, timeout: float, interval: float = 0.01
+) -> None:
+    """Poll for a condition instead of guessing a fixed sleep.
+
+    Used by the retry tests below, where the exact settle time depends on a
+    patched backoff rather than a declared deadline — the drills above assert
+    on the deadline itself, this asserts on the eventual outcome.
+    """
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(interval)
+
+
 # ------------------------------------------------------------ drill: heartbeat
 
 
@@ -458,6 +476,52 @@ def test_drill_nats_outage_is_indistinguishable_from_a_dead_controller() -> None
         event = await rec.wait_for("heartbeat_timeout", timeout=2.0)
         assert actuator.is_safe()
         assert event.actuator_id == "return-pump"
+        await sup.stop()
+
+    run(scenario)
+
+
+# ------------------------------------------------------- drill: late registration
+
+
+def test_register_after_start_gets_a_watcher() -> None:
+    """A production actuator is registered AFTER start() (app.py builds from the
+    registry only once the spine is up). It must still get a heartbeat watcher —
+    2026-08-23 finding 1: every production actuator had watch_task=None."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        await sup.start()  # zero actuators, mirrors app.run() ordering
+
+        actuator = FakeActuator("late", OFF)
+        sup.register(_registration("late", heartbeat_timeout_s=0.05), actuator)
+        # Drive it out of safe state so the trip is observable.
+        await sup.apply(_command("late", on=True))
+        await asyncio.sleep(0.15)  # > heartbeat_timeout_s with no beats
+
+        assert any(e.reason == "heartbeat_timeout" and e.actuator_id == "late" for e in rec.events)
+        assert actuator.is_safe()
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_late_registration_beats_keep_it_alive() -> None:
+    """Beats arriving via heartbeat() hold off the trip for a late-registered guard."""
+
+    async def scenario() -> None:
+        sup = InterlockSupervisor(on_event=_null_sink)
+        await sup.start()
+
+        actuator = FakeActuator("late", OFF)
+        sup.register(_registration("late", heartbeat_timeout_s=0.1), actuator)
+        await sup.apply(_command("late", on=True))
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+            sup.heartbeat()
+
+        assert not actuator.is_safe()  # still at commanded level, no trip
         await sup.stop()
 
     run(scenario)
