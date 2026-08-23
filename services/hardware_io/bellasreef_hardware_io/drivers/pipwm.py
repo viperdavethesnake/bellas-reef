@@ -14,8 +14,18 @@ Not the deprecated sysfs GPIO interface
 PWM ABI, and the only interface the RP1 PWM block exposes. libgpiod does not
 cover PWM — it is a GPIO character-device library, and hardware PWM is not GPIO.
 
-Measured on the target 2026-08-11: ``pwmchip0`` at ``1f0009c000.pwm`` (RP1),
+Measured on the target 2026-08-15: ``pwmchip0`` at ``1f00098000.pwm``, which is
+RP1 **PWM0**, the block whose four channels the overlay muxes to header pins.
 ``npwm`` 4, kernel 6.18.39.
+
+``1f0009c000.pwm`` is PWM1, the fan header, and appeared here as ``pwmchip1``
+on the same boot. An earlier version of this line named that address as
+``pwmchip0``, which was wrong in both halves: wrong block, and a chip index
+that has moved between kernel releases before. Resolve by device identity, as
+:data:`~bellasreef_hardware_io.capabilities.RP1_PWM0_DEVICE` and
+:func:`~bellasreef_hardware_io.capabilities.find_pwm_chip` do. Nothing was
+broken by the wrong comment because the runtime never read it; the next person
+debugging PWM would have.
 
 The ordering is the hard part
 -----------------------------
