@@ -10,10 +10,13 @@ should not teach it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from bellasreef_contracts import ActuatorRegistration, DeviceAssignment
 from bellasreef_contracts.driver import ActuatorDriver
 from bellasreef_service import get_logger
 
+from bellasreef_hardware_io.capabilities import find_pwm_chip
 from bellasreef_hardware_io.drivers.dimming import light_registration
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.drivers.pca9685 import Pca9685Channel, Pca9685Device
@@ -68,6 +71,7 @@ def build_from_assignments(
     *,
     open_i2c: object | None = None,
     sysfs: SysfsWriter | None = None,
+    pwm_chip_root: Path | None = None,
 ) -> tuple[list[BuiltActuator], list[DS18B20]]:
     """Instantiate exactly what the registry says this hub owns.
 
@@ -95,6 +99,12 @@ def build_from_assignments(
     actuators: list[BuiltActuator] = []
     sensors: list[DS18B20] = []
     chips: dict[tuple[int, int], Pca9685Device] = {}
+    #: Distinguishes "not yet attempted" from "attempted and found nothing" —
+    #: an injected chip counts as already resolved. Without this, a failed
+    #: filesystem resolution (find_pwm_chip() -> None) would be retried on
+    #: every subsequent pi-pwm assignment in the same build instead of once,
+    #: because a None result cannot itself signal "already tried".
+    pwm_chip_resolved = pwm_chip_root is not None
 
     for assignment in deduped:
         if not assignment.adopted:
@@ -115,9 +125,28 @@ def build_from_assignments(
                     )
                 )
             elif assignment.driver_type == "pi-pwm":
+                if not pwm_chip_resolved:
+                    pwm_chip_root = find_pwm_chip()
+                    pwm_chip_resolved = True
+                if pwm_chip_root is None:
+                    # The pwmchipN index has moved between kernel releases
+                    # (CLAUDE.md, verified host facts; spec dd6a68b). Building
+                    # on a guessed pwmchip0 would take lighting duty commands
+                    # on whatever the kernel happened to number that way — a
+                    # fan-header block renumbered to pwmchip0 is exactly the
+                    # failure this refuses.
+                    raise TopologyError(
+                        "no RP1 PWM0 chip resolved by identity; refusing to "
+                        "build on a guessed pwmchip index (spec dd6a68b)"
+                    )
                 actuators.append(
                     BuiltActuator(
-                        PiPwmChannel(int(binding["channel"]), assignment.device_id, sysfs=sysfs),
+                        PiPwmChannel(
+                            int(binding["channel"]),
+                            assignment.device_id,
+                            sysfs=sysfs,
+                            chip_root=pwm_chip_root,
+                        ),
                         light_registration(actuator_id=assignment.device_id, driver_id="rp1-pwm"),
                     )
                 )

@@ -21,11 +21,20 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from bellasreef_contracts import DeviceAssignment
+from bellasreef_hardware_io import factory as factory_module
 from bellasreef_hardware_io.factory import build_from_assignments
+
+#: Any Path stands in for a resolved chip in tests that don't care which one —
+#: only the identity-resolution tests below need a *specific* chip. The
+#: PiPwmChannel constructor performs no filesystem I/O (RealSysfs.__init__
+#: touches nothing either), so a build test needs no fake sysfs at all unless
+#: it goes on to call driver.open()/apply() — none of these do.
+_A_CHIP = Path("/sys/class/pwm/pwmchip0")
 
 
 def _pipwm(device_id: str, *, adopted: bool, channel: str = "0") -> DeviceAssignment:
@@ -53,7 +62,7 @@ def test_the_same_adopted_assignment_twice_builds_exactly_one_device() -> None:
     """The crash scenario: a retained message plus its own republished echo."""
     assignments = [_pipwm("pi-pwm-1", adopted=True), _pipwm("pi-pwm-1", adopted=True)]
 
-    actuators, sensors = build_from_assignments(assignments)
+    actuators, sensors = build_from_assignments(assignments, pwm_chip_root=_A_CHIP)
 
     assert [a.registration.actuator_id for a in actuators] == ["pi-pwm-1"]
     assert sensors == []
@@ -74,7 +83,7 @@ def test_an_unadopted_assignment_followed_by_a_re_adopt_builds_one() -> None:
     """Re-adopt echo order: the later adopted copy is the one that counts."""
     assignments = [_pipwm("pi-pwm-1", adopted=False), _pipwm("pi-pwm-1", adopted=True)]
 
-    actuators, sensors = build_from_assignments(assignments)
+    actuators, sensors = build_from_assignments(assignments, pwm_chip_root=_A_CHIP)
 
     assert [a.registration.actuator_id for a in actuators] == ["pi-pwm-1"]
     assert sensors == []
@@ -88,7 +97,7 @@ def test_dedup_preserves_order_of_last_occurrence_across_distinct_devices() -> N
         _pipwm("pi-pwm-1", adopted=True),
     ]
 
-    actuators, _ = build_from_assignments(assignments)
+    actuators, _ = build_from_assignments(assignments, pwm_chip_root=_A_CHIP)
 
     assert [a.registration.actuator_id for a in actuators] == ["pi-pwm-2", "pi-pwm-1"]
 
@@ -98,6 +107,54 @@ def test_a_collapsed_duplicate_is_logged(caplog: pytest.LogCaptureFixture) -> No
         build_from_assignments([_pipwm("pi-pwm-1", adopted=True), _pipwm("pi-pwm-1", adopted=True)])
 
     assert any("dedup" in r.getMessage() or "duplicate" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------ pi-pwm chip identity
+
+
+def test_pipwm_built_on_the_identity_resolved_chip(tmp_path: Path) -> None:
+    """Finding 3 / spec dd6a68b: the pwmchipN index moves between kernels; a
+    fan-header block renumbered to pwmchip0 would take lighting duty commands
+    with every software check green. The factory must use find_pwm_chip's
+    answer, not the pwmchip0 default."""
+    chip = tmp_path / "pwmchip7"  # deliberately not pwmchip0
+    actuators, _ = build_from_assignments([_pipwm("pi-pwm-1", adopted=True)], pwm_chip_root=chip)
+
+    assert actuators[0].driver.chip_root == chip  # type: ignore[attr-defined]
+
+
+def test_pipwm_skipped_when_no_chip_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hub whose pi-pwm capability never resolved must not fall back to a
+    guessed pwmchip0 — the same skip-and-log contract as any other
+    unbuildable assignment (TopologyError caught by the per-assignment
+    except clause), never a build on an index nobody proved."""
+    monkeypatch.setattr(factory_module, "find_pwm_chip", lambda: None)
+
+    actuators, _ = build_from_assignments([_pipwm("pi-pwm-1", adopted=True)])
+
+    assert actuators == []
+
+
+def test_pipwm_resolves_the_chip_at_most_once_per_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two pi-pwm assignments in one build must trigger exactly one
+    filesystem resolution — the second reuses the first's answer rather than
+    re-reading /sys/class/pwm, and a failed resolution is not retried against
+    every subsequent pi-pwm assignment in the same build either."""
+    calls = 0
+
+    def counting_find_pwm_chip() -> Path:
+        nonlocal calls
+        calls += 1
+        return _A_CHIP
+
+    monkeypatch.setattr(factory_module, "find_pwm_chip", counting_find_pwm_chip)
+
+    actuators, _ = build_from_assignments(
+        [_pipwm("pi-pwm-1", adopted=True), _pipwm("pi-pwm-2", adopted=True)]
+    )
+
+    assert calls == 1
+    assert {a.registration.actuator_id for a in actuators} == {"pi-pwm-1", "pi-pwm-2"}
 
 
 # ------------------------------------------------------------ pca9685 lifecycle
