@@ -263,11 +263,20 @@ class InterlockSupervisor:
         failures: list[Exception] = []
 
         for guard in self._guards.values():
-            for task in (guard.watch_task, guard.runtime_task):
-                if task is not None and not task.done():
+            tasks = [t for t in (guard.watch_task, guard.runtime_task) if t is not None]
+            for task in tasks:
+                if not task.done():
                     task.cancel()
             guard.watch_task = None
             guard.runtime_task = None
+            if tasks:
+                # A cancelled task can still be inside guard.driver.drive_safe()
+                # — retries in _drive_safe_with_retry really sleep and retry
+                # now, so cancellation does not land instantly. Wait for both
+                # tasks to actually unwind before this loop drives the same
+                # guard itself, or the two calls race on a bus ActuatorDriver
+                # makes no reentrancy guarantee about (2026-08-23 review).
+                await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 await self._drive_safe(guard, "shutdown", "supervisor stopping")
             except Exception as exc:
@@ -421,16 +430,33 @@ class InterlockSupervisor:
 
     # ------------------------------------------------------------- internals
 
-    async def _drive_safe(self, guard: _Guard, reason: TripReason, detail: str) -> None:
-        await guard.driver.drive_safe()
+    def _mark_safe(self, guard: _Guard) -> None:
+        """Bookkeeping for a drive_safe() call that just succeeded.
+
+        Split out of `_drive_safe` so `_drive_safe_with_retry` can apply it
+        before its own success emit — see that method for why the emit must
+        not be allowed to feed back into the retry decision.
+        """
         guard.at_safe_state = True
         if guard.runtime_task is not None and not guard.runtime_task.done():
             guard.runtime_task.cancel()
             guard.runtime_task = None
+
+    async def _drive_safe(self, guard: _Guard, reason: TripReason, detail: str) -> None:
+        await guard.driver.drive_safe()
+        self._mark_safe(guard)
         await self._emit(guard, reason, detail)
 
     async def _drive_safe_with_retry(self, guard: _Guard, reason: TripReason, detail: str) -> None:
-        """Drive safe, retrying until it lands or the supervisor stops.
+        """Drive safe, retrying until the drive itself lands or the supervisor stops.
+
+        Only `guard.driver.drive_safe()` decides whether to retry. The success
+        path does its own bookkeeping and emit here, rather than delegating to
+        `_drive_safe`, because that emit runs *after* the drive already
+        succeeded — a sink that raises there is not a drive failure, and
+        folding it into this method's own try/except would misreport it as
+        one (spuriously re-driving an already-safe actuator and auditing a
+        "drive_safe FAILED" that never happened — 2026-08-23 review).
 
         A trip is the one moment this service exists for; a transient driver
         error there must surface as an event and a retry, never as a dead task
@@ -438,8 +464,7 @@ class InterlockSupervisor:
         """
         while True:
             try:
-                await self._drive_safe(guard, reason, detail)
-                return
+                await guard.driver.drive_safe()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -456,6 +481,11 @@ class InterlockSupervisor:
                 if not self._running:
                     return
                 await asyncio.sleep(RETRY_BACKOFF_S)
+                continue
+            self._mark_safe(guard)
+            with contextlib.suppress(Exception):
+                await self._emit(guard, reason, detail)
+            return
 
     async def _emit(
         self, guard: _Guard, reason: TripReason, detail: str, *, reached_safe: bool = True
