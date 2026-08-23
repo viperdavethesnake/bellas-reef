@@ -240,6 +240,20 @@ class ControlEngine:
 
             self._refresh_clock_trust()
 
+            if self.publisher is not None and self._clock_trusted:
+                # The liveness beacon hardware-io's interlocks watch. Silence
+                # is deliberate in exactly two cases: the clock is untrusted
+                # (we cannot honestly timestamp "alive now" — see the module
+                # docstring), or this loop has stalled and stopped iterating.
+                # Both are cases where hardware-io driving actuators to safe
+                # state is the designed response, so a failed publish is
+                # logged and NOT retried here — the next iteration beats
+                # again, and hardware-io's timeout absorbs a transient gap.
+                try:
+                    await self.publisher.heartbeat(self._loop_interval_s)
+                except Exception:
+                    log.warning("heartbeat publish failed", exc_info=True)
+
             if (
                 self.publisher is not None
                 and self.publisher.connected
