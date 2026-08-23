@@ -222,6 +222,13 @@ class AuditWriter:
 
         category = subject.split(".")[-1]
         if category not in _VALID_CATEGORIES:
+            # Every category a publisher legitimately uses is in
+            # _VALID_CATEGORIES (alert included, as of 0021), so reaching
+            # here means the subject's last token is not a category at all —
+            # a malformed or future subject. 'safety' is a parking category
+            # for that, not a claim that a safety event occurred: after 0021,
+            # a stored category='safety' row means "unrecognised subject
+            # token, original in original_category," never "a safety event."
             event = {**event, "original_category": category}
             category = "safety"
 
