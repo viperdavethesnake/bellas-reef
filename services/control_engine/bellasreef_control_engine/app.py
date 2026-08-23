@@ -106,6 +106,11 @@ class _Metrics:
             "Schedule store read failures during the per-tick reload",
             registry=registry,
         )
+        self.override_io_errors = Counter(
+            "bellasreef_override_io_errors_total",
+            "Override store read/write failures absorbed by the tick loop",
+            registry=registry,
+        )
 
 
 class ControlEngine:
@@ -129,6 +134,12 @@ class ControlEngine:
         self.scheduler = LightingScheduler(profiles, max_duty_delta_per_s=max_duty_delta_per_s)
         self.overrides = override_store
         self._held: dict[str, ActiveOverride] = {}
+        # One flag for both override-store I/O paths (_reload_overrides'
+        # read, _expire_overrides' release) — they hit the same store, so a
+        # single outage there should not produce two independent "reload
+        # failed" / "release failed" warning streams. Mirrors
+        # _schedule_read_failing (2026-08-23 finding 7).
+        self._override_read_failing = False
         self.publisher = CommandPublisher(nats_url) if nats_url else None
         self.assignments = AssignmentLedger()
         # Forget on the tombstone EVENT, not on a tick's timing. due() only
@@ -456,16 +467,36 @@ class ControlEngine:
         row this process is watching is released here, against the monotonic
         clock, or by another client — never by a wall-clock comparison the
         engine did not ask for.
+
+        A ``release()`` that raises (the same flapping Postgres connection
+        that ``_reload_overrides`` guards against — 2026-08-23 finding 7)
+        must not unwind ``_tick`` into a crash loop either. The entry is
+        left in ``self._held`` rather than deleted: its monotonic deadline
+        is already past, so ``is_expired()`` keeps returning True and the
+        very next tick retries the same release. Nothing here marks the row
+        done until the store confirms it — deleting it before that would
+        leave the row open in Postgres with nobody retrying, a worse leak
+        than a stuck light.
         """
         if self.overrides is None or not self._held:
             return
         for target, override in list(self._held.items()):
-            if override.is_expired():
+            if not override.is_expired():
+                continue
+            try:
                 await self.overrides.release(override.id, "expired")
-                del self._held[target]
-                self.metrics.suppressed.labels("override_expired").inc()
-                log.info("override expired", extra={"target": target})
-                await self._audit_override_release(override.id, target, "expired")
+            except Exception:
+                self.metrics.override_io_errors.inc()
+                if not self._override_read_failing:  # one log per outage, not per tick
+                    self._override_read_failing = True
+                    log.warning("override release failed; will retry next tick", exc_info=True)
+                continue  # keep it in self._held; is_expired() stays True, so the
+                # next tick retries the release instead of leaking an open row.
+            self._override_read_failing = False
+            del self._held[target]
+            self.metrics.suppressed.labels("override_expired").inc()
+            log.info("override expired", extra={"target": target})
+            await self._audit_override_release(override.id, target, "expired")
 
     async def _audit_override_release(self, override_id: UUID, target: str, reason: str) -> None:
         """One ``override.released`` row, in the same shape the API writes for a
@@ -528,11 +559,29 @@ class ControlEngine:
         ``_expire_overrides`` runs first and has already released anything
         whose monotonic deadline passed, so those rows are no longer
         unreleased by the time this reads and cannot come back.
+
+        On a read error, keep the last good ``self._held`` set — same
+        contract as ``_reload_schedules``: a flapping Postgres connection
+        must not strip every active hold from the tank. Before this, a
+        single dropped connection out of ``list_active()`` raised straight
+        out of here, unwound ``_tick`` into ``_loop`` and crash-looped the
+        engine for the length of the flap (2026-08-23 finding 7) — while
+        ``_reload_schedules`` next door was already wrapped precisely
+        against this.
         """
         if self.overrides is None:
             return
+        try:
+            fresh_rows = await self.overrides.list_active()
+        except Exception:
+            self.metrics.override_io_errors.inc()
+            if not self._override_read_failing:  # one log per outage, not per tick
+                self._override_read_failing = True
+                log.warning("override reload failed; keeping last held set", exc_info=True)
+            return
+        self._override_read_failing = False
         held: dict[str, ActiveOverride] = {}
-        for fresh in await self.overrides.list_active():
+        for fresh in fresh_rows:
             current = self._held.get(fresh.target)
             if current is not None and current.id == fresh.id:
                 held[fresh.target] = current
