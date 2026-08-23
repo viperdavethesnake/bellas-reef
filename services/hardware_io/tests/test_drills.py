@@ -528,6 +528,46 @@ def test_late_registration_beats_keep_it_alive() -> None:
     run(scenario)
 
 
+def test_heartbeat_drill_covers_registry_built_actuators() -> None:
+    """The 2026-08-23 review found the drills passing while the protection was
+    absent: the drill dummy above registers before start() and gets a
+    watcher, while every registry-built actuator registers after and got
+    none — every production actuator had watch_task=None. This drill
+    replicates the production ordering exactly (app.py: start() first,
+    register() from the registry after, beats arriving via the same
+    heartbeat() path the spine callback uses) and asserts both the trip and
+    the recovery contract: safe on heartbeat loss, and still safe once beats
+    resume, until an explicit command says otherwise."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        await sup.start()  # production ordering: spine up, zero actuators yet
+
+        actuator = FakeActuator("prod", OFF)
+        sup.register(_registration("prod", heartbeat_timeout_s=0.05), actuator)
+
+        sup.heartbeat()  # engine alive
+        assert await sup.apply(_command("prod")) == "applied"
+        assert not actuator.is_safe()
+
+        await asyncio.sleep(0.15)  # engine dies: no beats
+        assert actuator.is_safe(), "tripped dark"
+        assert not sup.is_latched("prod"), "heartbeat loss never latches"
+        assert any(e.reason == "heartbeat_timeout" and e.actuator_id == "prod" for e in rec.events)
+
+        sup.heartbeat()  # engine returns
+        await asyncio.sleep(0.1)
+        assert actuator.is_safe(), "did NOT spring back on"
+
+        assert await sup.apply(_command("prod")) == "applied"
+        assert not actuator.is_safe(), "explicit command restores"
+
+        await sup.stop()
+
+    run(scenario)
+
+
 # ------------------------------------------------------------- command gating
 
 
