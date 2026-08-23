@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Final
 from uuid import UUID
 
-from bellasreef_contracts import ScheduleDefinition, SensorReading
+from bellasreef_contracts import ActuatorState, ScheduleDefinition, SensorReading
 from bellasreef_db.alerts import PostgresAlertStore
 from bellasreef_db.overrides import ActiveOverride, OverrideStore
 from bellasreef_db.schedules import ScheduleStore
@@ -186,6 +186,7 @@ class ControlEngine:
             self._wire_reconnect_handling()
             await self.publisher.connect()
             await self.publisher.subscribe_assignments(self.assignments.apply)
+            await self.publisher.subscribe_states(self._on_actuator_state)
             self._assignments_loaded = await self.publisher.load_assignments(self.assignments)
 
         await self._rearm_overrides()
@@ -230,6 +231,42 @@ class ControlEngine:
         """
         self._assignments_loaded = False
 
+    #: State reasons that mean hardware-io moved the actuator on its own —
+    #: the scheduler's emission memory for that channel is no longer true.
+    #: Verified against contracts/python/bellasreef_contracts's StateReason
+    #: literals ("commanded", "safe_state", "interlock_latch",
+    #: "manual_override", "startup") and against what hardware-io actually
+    #: emits (app.py's _publish_startup_states -> "startup",
+    #: _TRIP_STATE_REASON -> "safe_state"/"interlock_latch" for the two trips
+    #: that reach a safe state). "commanded" is excluded: those are echoes of
+    #: our own publishes, and forgetting on them would cold-start every
+    #: channel on every command and defeat the deadband. "manual_override" is
+    #: also excluded: it names a person's action, already communicated
+    #: through this engine's own override machinery — hardware-io never
+    #: emits it, and it is not evidence the scheduler's memory has gone
+    #: stale.
+    _AUTONOMOUS_STATE_REASONS: Final[frozenset[str]] = frozenset(
+        {"startup", "safe_state", "interlock_latch"}
+    )
+
+    def _on_actuator_state(self, state: ActuatorState) -> None:
+        """hardware-io's autonomous transitions invalidate the scheduler's
+        memory of that channel (Finding 6): a restart rebuilds every driver
+        dark, but the scheduler still remembered whatever duty it last
+        emitted — so the next due tick snapped straight to curve duty in one
+        step, skipping the slew entirely. Forgetting puts the channel back in
+        the same cold state ``AssignmentLedger.on_tombstone`` already forces
+        on unadopt/readopt, so the next intent is "initial" rather than a
+        jump from a duty the hardware no longer holds.
+        """
+        if state.reason not in self._AUTONOMOUS_STATE_REASONS:
+            return
+        self.scheduler.forget(state.actuator_id)
+        log.info(
+            "hardware reported an autonomous transition; scheduler memory cleared",
+            extra={"actuator_id": state.actuator_id, "reason": state.reason},
+        )
+
     # ------------------------------------------------------------- main loop
 
     async def _loop(self) -> None:
@@ -239,6 +276,20 @@ class ControlEngine:
             self.metrics.loop_stall.set(self.liveness.age_s())
 
             self._refresh_clock_trust()
+
+            if self.publisher is not None and self._clock_trusted:
+                # The liveness beacon hardware-io's interlocks watch. Silence
+                # is deliberate in exactly two cases: the clock is untrusted
+                # (we cannot honestly timestamp "alive now" — see the module
+                # docstring), or this loop has stalled and stopped iterating.
+                # Both are cases where hardware-io driving actuators to safe
+                # state is the designed response, so a failed publish is
+                # logged and NOT retried here — the next iteration beats
+                # again, and hardware-io's timeout absorbs a transient gap.
+                try:
+                    await self.publisher.heartbeat(self._loop_interval_s)
+                except Exception:
+                    log.warning("heartbeat publish failed", exc_info=True)
 
             if (
                 self.publisher is not None

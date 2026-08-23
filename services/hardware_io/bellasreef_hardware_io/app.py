@@ -645,6 +645,12 @@ class HardwareIO:
         self.commands = CommandConsumer(self.spine, self.supervisor)
         await self.commands.subscribe()
 
+        # The controller's liveness beacon. Subscribed last, after every
+        # actuator is registered and watched: a beat that arrives before the
+        # watchers exist would be stamped and forgotten, and one that arrives
+        # after is exactly what resets their deadlines.
+        await self.spine.subscribe_heartbeats("control-engine", self.supervisor.heartbeat)
+
     async def _beat_and_serve(self) -> None:
         """Publish a heartbeat and take one pass at the command queue."""
         if self.spine is None:
@@ -877,11 +883,14 @@ class HardwareIO:
         # interlock trip. Everything is inside one try, not just the publish.
         try:
             if not event.reached_safe:
-                # I2: a "shutdown" event from a drive_safe() that raised
-                # (safety.py's start()/stop() except branches) is not a
-                # transition — the actuator's real level is unknown, and
-                # publishing anything here would be a guess dressed as a
-                # measurement. Skip rather than fabricate.
+                # I2: an event whose drive_safe() raised is not a transition —
+                # the actuator's real level is unknown, and publishing
+                # anything here would be a guess dressed as a measurement.
+                # That covers start()'s and stop()'s own except branches, and
+                # since 2026-08-23 also a retry failure inside
+                # _drive_safe_with_retry (heartbeat/runtime trips retry rather
+                # than give up, so a single trip can emit this more than
+                # once). Skip rather than fabricate.
                 log.warning(
                     "safety event did not reach a safe state; no state published",
                     extra={"actuator_id": event.actuator_id, "reason": event.reason},

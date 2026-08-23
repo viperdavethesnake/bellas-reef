@@ -12,7 +12,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from bellasreef_contracts import ActuatorCommand, DeviceAssignment, ScheduleDefinition
+from bellasreef_contracts import (
+    ActuatorCommand,
+    ActuatorState,
+    DeviceAssignment,
+    PwmLevel,
+    ScheduleDefinition,
+    StateReason,
+)
 from bellasreef_control_engine.app import ControlEngine
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
@@ -65,6 +72,11 @@ class _FakePublisher(CommandPublisher):
         super().__init__("nats://unused:4222")
         self.published: list[ActuatorCommand] = []
         self.audits: list[tuple[str, dict[str, object]]] = []
+        #: Count of heartbeat() calls that did not fail. See fail_heartbeats.
+        self.heartbeats = 0
+        #: When True, heartbeat() raises instead of counting — proves a
+        #: failed publish is logged and does not kill the loop.
+        self.fail_heartbeats = False
 
     @property
     def connected(self) -> bool:
@@ -75,6 +87,11 @@ class _FakePublisher(CommandPublisher):
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
         self.audits.append((category, dict(event)))
+
+    async def heartbeat(self, interval_s: float) -> None:
+        if self.fail_heartbeats:
+            raise RuntimeError("boom")
+        self.heartbeats += 1
 
 
 class _FakeOverrideStore(OverrideStore):
@@ -189,6 +206,179 @@ def engine_with_fake_store() -> tuple[ControlEngine, list[ActuatorCommand], _Fak
     fake = _FakePublisher()
     engine.publisher = fake
     return engine, fake.published, store
+
+
+def run_loop_iterations(engine: ControlEngine, n: int) -> None:
+    """Drive the real ``_loop`` for exactly ``n`` complete iterations, then
+    stop it.
+
+    Hooks ``liveness.beat()`` — called unconditionally at the very top of
+    every iteration, regardless of clock trust or publisher state — to count
+    iterations and request a stop once ``n`` have completed. Requesting the
+    stop mid-iteration lets that iteration finish (heartbeat included) before
+    ``_loop``'s own ``while not self._stopping.is_set()`` check exits it, so
+    exactly ``n`` iterations run, not ``n - 1``. ``_loop_interval_s`` is
+    zeroed so the inter-iteration wait resolves immediately once stopping is
+    requested, and ``_assignments_loaded`` is preset True so the unrelated
+    JetStream drain path (exercised by TestReconnectReDrain) is not hit here.
+    """
+    engine._loop_interval_s = 0.0
+    engine._assignments_loaded = True
+    count = 0
+    real_beat = engine.liveness.beat
+
+    def counting_beat() -> None:
+        nonlocal count
+        real_beat()
+        count += 1
+        if count >= n:
+            engine.request_stop()
+
+    engine.liveness.beat = counting_beat  # type: ignore[method-assign]
+    asyncio.run(engine._loop())
+
+
+def force_clock_trusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``clock_is_trusted`` for tests that drive the real ``_loop``.
+
+    ``_refresh_clock_trust`` calls the real predicate every iteration, and it
+    shells out to ``timedatectl`` — absent on macOS dev shells, where it falls
+    back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` (unset here, so False). CI sets
+    that env var to "1". Monkeypatching the name as ``app.py`` imports it
+    makes the outcome independent of the host this test happens to run on.
+    """
+    monkeypatch.setattr("bellasreef_control_engine.app.clock_is_trusted", lambda: True)
+
+
+def force_clock_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same as force_clock_trusted, pinned False — see its docstring."""
+    monkeypatch.setattr("bellasreef_control_engine.app.clock_is_trusted", lambda: False)
+
+
+def prime_scheduler_memory(engine: ControlEngine, channel_id: str, *, duty: float) -> None:
+    """Seed the scheduler's emission memory as if a prior tick had commanded
+    ``duty`` on ``channel_id`` — without going through a real ``_tick``."""
+    engine.scheduler._last_duty[channel_id] = duty
+
+
+def make_state(
+    actuator_id: str, *, reason: StateReason, source: str = "hardware-io"
+) -> ActuatorState:
+    """One ActuatorState, shaped like what hardware-io actually publishes.
+    The level itself is irrelevant to _on_actuator_state — only reason and
+    actuator_id are — so a fixed PwmLevel(duty=0.0) stands in for all cases."""
+    now = datetime.now(UTC)
+    return ActuatorState(
+        message_id=uuid4(),
+        emitted_at=now,
+        source=source,
+        actuator_id=actuator_id,
+        level=PwmLevel(duty=0.0),
+        reason=reason,
+        since=now,
+    )
+
+
+class TestHeartbeat:
+    """`_loop` publishes the liveness beacon hardware-io's interlock
+    supervisor watches for (module docstring). Silence is deliberate in
+    exactly two cases: the clock is untrusted, or the loop has stalled."""
+
+    def test_loop_publishes_heartbeat_each_tick(
+        self,
+        engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine, _ = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        force_clock_trusted(monkeypatch)
+
+        run_loop_iterations(engine, 3)
+
+        assert fake.heartbeats == 3
+
+    def test_no_heartbeat_while_clock_untrusted(
+        self,
+        engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine, _ = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        force_clock_untrusted(monkeypatch)
+
+        run_loop_iterations(engine, 3)
+
+        assert fake.heartbeats == 0
+
+    def test_heartbeat_publish_failure_does_not_kill_the_loop(
+        self,
+        engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        engine, _ = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        force_clock_trusted(monkeypatch)
+        fake.fail_heartbeats = True
+
+        run_loop_iterations(engine, 2)  # would raise out of _loop before the fix
+
+        # Every attempt raised, so the counter never incremented — the proof
+        # that the loop survived is that it completed both iterations anyway.
+        assert fake.heartbeats == 0
+        samples = [s for m in engine.metrics.loop_beats.collect() for s in m.samples]
+        beats = sum(s.value for s in samples if s.name == "bellasreef_loop_beats_total")
+        assert beats == 2
+
+
+class TestActuatorStateForgetting:
+    """Finding 6: hardware-io restarts rebuild dark, but the engine's memory
+    said 0.8 — the 300s refresh then snapped a dark channel to curve duty in
+    one step, bypassing the slew. An autonomous state from hardware-io means
+    the scheduler's memory is no longer true."""
+
+    def test_autonomous_safe_state_forgets_the_channel(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "pca9685-0", duty=0.8)
+
+        engine._on_actuator_state(make_state("pca9685-0", reason="safe_state"))
+
+        assert "pca9685-0" not in engine.scheduler._last_duty  # cold again
+
+    def test_startup_and_latch_states_also_forget(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        for reason in ("startup", "interlock_latch"):
+            prime_scheduler_memory(engine, "ch", duty=0.5)
+            engine._on_actuator_state(make_state("ch", reason=reason))
+            assert "ch" not in engine.scheduler._last_duty
+
+    def test_commanded_state_does_not_forget(self) -> None:
+        """'commanded' states are echoes of our own publishes — forgetting on
+        them would cold-start every channel on every command and defeat the
+        deadband."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "ch", duty=0.5)
+
+        engine._on_actuator_state(make_state("ch", reason="commanded"))
+
+        assert engine.scheduler._last_duty.get("ch") == 0.5
+
+    def test_manual_override_state_does_not_forget(self) -> None:
+        """Pins the frozenset's boundary explicitly. 'manual_override' is a
+        real StateReason the contract defines, but it names a person's action
+        — already communicated through this engine's own override machinery
+        — not something hardware-io decided autonomously; hardware-io's
+        _TRIP_STATE_REASON never emits it. Forgetting on it would be wrong
+        for the same reason as 'commanded': it is not evidence the scheduler's
+        memory has gone stale."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "ch", duty=0.5)
+
+        engine._on_actuator_state(make_state("ch", reason="manual_override"))
+
+        assert engine.scheduler._last_duty.get("ch") == 0.5
 
 
 class TestClockTrustGate:

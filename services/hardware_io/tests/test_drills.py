@@ -19,6 +19,7 @@ a laxer test while being wrong on a real tank.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,10 +28,11 @@ from uuid import uuid4
 import pytest
 from bellasreef_contracts import (
     ActuatorCommand,
+    ActuatorLevel,
     ActuatorRegistration,
     BinaryLevel,
 )
-from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent
+from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent, safety
 
 # Timeouts are short so the suite stays fast, and deliberately not round
 # numbers so an implementation that happened to poll on a 50/100 ms cadence
@@ -116,6 +118,24 @@ class Recorder:
 
 def run(scenario: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(scenario())
+
+
+async def _null_sink(event: SafetyEvent) -> None:
+    """An on_event sink for tests that only care about actuator state."""
+
+
+async def _wait_until(
+    predicate: Callable[[], bool], *, timeout: float, interval: float = 0.01
+) -> None:
+    """Poll for a condition instead of guessing a fixed sleep.
+
+    Used by the retry tests below, where the exact settle time depends on a
+    patched backoff rather than a declared deadline — the drills above assert
+    on the deadline itself, this asserts on the eventual outcome.
+    """
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(interval)
 
 
 # ------------------------------------------------------------ drill: heartbeat
@@ -238,6 +258,37 @@ def test_drill_actuator_does_not_spring_back_on_when_heartbeats_return() -> None
             await asyncio.sleep(HEARTBEAT_TIMEOUT_S / 4)
 
         assert actuator.is_safe(), "must stay safe until an explicit command arrives"
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_apply_while_heartbeat_lost_still_applies_but_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-flap stays no-flap: a command mid-trip is still applied, not
+    refused — that is the normal recovery path for a live controller's first
+    post-trip command. But an engine rolled back to a pre-heartbeat build
+    would command this actuator while never beating, and that mixed-version
+    state must not be silent.
+    """
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        actuator = FakeActuator("ato-pump", OFF)
+        sup.register(_registration(), actuator)
+
+        await sup.start()
+        await rec.wait_for("heartbeat_timeout", timeout=2.0)
+        assert actuator.is_safe()
+
+        with caplog.at_level(logging.WARNING, logger="bellasreef_hardware_io.safety"):
+            outcome = await sup.apply(_command(on=True))
+
+        assert outcome == "applied"
+        assert not actuator.is_safe()
+        assert any("heartbeat is lost" in r.message for r in caplog.records)
         await sup.stop()
 
     run(scenario)
@@ -463,6 +514,92 @@ def test_drill_nats_outage_is_indistinguishable_from_a_dead_controller() -> None
     run(scenario)
 
 
+# ------------------------------------------------------- drill: late registration
+
+
+def test_register_after_start_gets_a_watcher() -> None:
+    """A production actuator is registered AFTER start() (app.py builds from the
+    registry only once the spine is up). It must still get a heartbeat watcher —
+    2026-08-23 finding 1: every production actuator had watch_task=None."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        await sup.start()  # zero actuators, mirrors app.run() ordering
+
+        actuator = FakeActuator("late", OFF)
+        sup.register(_registration("late", heartbeat_timeout_s=0.05), actuator)
+        # Drive it out of safe state so the trip is observable.
+        await sup.apply(_command("late", on=True))
+        await asyncio.sleep(0.15)  # > heartbeat_timeout_s with no beats
+
+        assert any(e.reason == "heartbeat_timeout" and e.actuator_id == "late" for e in rec.events)
+        assert actuator.is_safe()
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_late_registration_beats_keep_it_alive() -> None:
+    """Beats arriving via heartbeat() hold off the trip for a late-registered guard."""
+
+    async def scenario() -> None:
+        sup = InterlockSupervisor(on_event=_null_sink)
+        await sup.start()
+
+        actuator = FakeActuator("late", OFF)
+        sup.register(_registration("late", heartbeat_timeout_s=0.1), actuator)
+        await sup.apply(_command("late", on=True))
+        for _ in range(4):
+            await asyncio.sleep(0.05)
+            sup.heartbeat()
+
+        assert not actuator.is_safe()  # still at commanded level, no trip
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_heartbeat_drill_covers_registry_built_actuators() -> None:
+    """The 2026-08-23 review found the drills passing while the protection was
+    absent: the drill dummy above registers before start() and gets a
+    watcher, while every registry-built actuator registers after and got
+    none — every production actuator had watch_task=None. This drill
+    replicates the production ordering exactly (app.py: start() first,
+    register() from the registry after, beats arriving via the same
+    heartbeat() path the spine callback uses) and asserts both the trip and
+    the recovery contract: safe on heartbeat loss, and still safe once beats
+    resume, until an explicit command says otherwise."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        await sup.start()  # production ordering: spine up, zero actuators yet
+
+        actuator = FakeActuator("prod", OFF)
+        sup.register(_registration("prod", heartbeat_timeout_s=0.05), actuator)
+
+        sup.heartbeat()  # engine alive
+        assert await sup.apply(_command("prod")) == "applied"
+        assert not actuator.is_safe()
+
+        await asyncio.sleep(0.15)  # engine dies: no beats
+        assert actuator.is_safe(), "tripped dark"
+        assert not sup.is_latched("prod"), "heartbeat loss never latches"
+        assert any(e.reason == "heartbeat_timeout" and e.actuator_id == "prod" for e in rec.events)
+
+        sup.heartbeat()  # engine returns
+        await asyncio.sleep(0.1)
+        assert actuator.is_safe(), "did NOT spring back on"
+
+        assert await sup.apply(_command("prod")) == "applied"
+        assert not actuator.is_safe(), "explicit command restores"
+
+        await sup.stop()
+
+    run(scenario)
+
+
 # ------------------------------------------------------------- command gating
 
 
@@ -567,5 +704,199 @@ def test_a_command_for_an_unknown_actuator_is_refused_not_fatal() -> None:
 
         # The service survives it, which is the whole point.
         assert await sup.apply(_command("ato-pump")) == "applied"
+
+    run(scenario)
+
+
+# --------------------------------------------------------- drill: driver retry
+
+
+class FlakyActuator(FakeActuator):
+    """Once armed, drive_safe() fails N times, then succeeds.
+
+    Models a transient I2C fault arriving mid-trip — the case a trip exists
+    to survive, not just a healthy driver's happy path. Starts unarmed: every
+    guard gets one unconditional drive_safe() call inside start() (see
+    InterlockSupervisor.start), and a failure there latches the actuator
+    before a command can ever move it out of safe state, which would prevent
+    the runtime-cap and heartbeat trips these tests exist to exercise from
+    ever firing. Arming after start() confines the simulated fault to the
+    trip's own retries.
+    """
+
+    def __init__(self, actuator_id: str, safe_state: ActuatorLevel, *, failures: int) -> None:
+        super().__init__(actuator_id, safe_state)
+        self.failures = failures
+        self.drive_safe_calls = 0
+        self.armed = False
+
+    async def drive_safe(self) -> None:
+        if self.armed:
+            self.drive_safe_calls += 1
+            if self.drive_safe_calls <= self.failures:
+                raise OSError("transient I2C fault")
+        await super().drive_safe()
+
+
+def test_runtime_trip_retries_failed_safe_drive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding 2: a transient driver error during a max-runtime trip must not
+    leave the actuator latched-but-energised with a dead guard task."""
+    monkeypatch.setattr(safety, "RETRY_BACKOFF_S", 0.02)
+
+    async def scenario() -> None:
+        rec = Recorder()
+        # Heartbeat left at the default (0.17s) is comfortably longer than
+        # this scenario needs, so the runtime cap is the only trip in play —
+        # no beater task required, unlike test_drill_max_runtime_trips_and_latches.
+        actuator = FlakyActuator("flaky", OFF, failures=2)
+        sup = InterlockSupervisor(on_event=rec)
+        sup.register(_registration("flaky", max_runtime_s=0.05), actuator)
+        await sup.start()
+        actuator.armed = True
+        await sup.apply(_command("flaky", on=True))
+        await asyncio.sleep(0.1)  # deadline passes; first two drives fail
+
+        # Retry backoff is patched short above so this settles fast.
+        await _wait_until(lambda: actuator.is_safe(), timeout=1.0)
+
+        assert sup.is_latched("flaky")  # the latch stands
+        assert actuator.drive_safe_calls >= 3  # it retried
+        failed = [e for e in rec.events if not e.reached_safe]
+        assert failed  # failures were emitted, not swallowed
+        assert any(e.reason == "max_runtime_exceeded" and e.reached_safe for e in rec.events)
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_heartbeat_watcher_survives_drive_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same shape via the heartbeat path: the watcher keeps watching after a
+    failed drive, and the actuator lands safe once the driver recovers."""
+    monkeypatch.setattr(safety, "RETRY_BACKOFF_S", 0.02)
+
+    async def scenario() -> None:
+        actuator = FlakyActuator("flaky", OFF, failures=1)
+        sup = InterlockSupervisor(on_event=_null_sink)
+        sup.register(_registration("flaky", heartbeat_timeout_s=0.05), actuator)
+        await sup.start()
+        actuator.armed = True
+        await sup.apply(_command("flaky", on=True))
+
+        await _wait_until(lambda: actuator.is_safe(), timeout=1.0)
+        assert not sup.is_latched("flaky")  # heartbeat loss does not latch
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_a_failed_success_emit_does_not_trigger_a_spurious_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-08-23 review, fix 1: the success emit inside a trip runs *after*
+    guard.driver.drive_safe() already succeeded. A sink that raises there is a
+    bookkeeping failure, not a drive failure, and must not re-drive an
+    already-safe actuator or file a "drive_safe FAILED" event about a drive
+    that never failed.
+
+    Deliberately the heartbeat path, not the runtime-cap one: a max-runtime
+    trip's own task is `guard.runtime_task` itself, and _drive_safe's success
+    bookkeeping cancels that task — a self-cancellation whose delivery at the
+    next real suspension point (the retry sleep) would abort a buggy retry
+    loop for reasons that have nothing to do with this fix, masking it. The
+    heartbeat watcher's task is never the one _drive_safe cancels, so this
+    scenario isolates the actual bug.
+    """
+    monkeypatch.setattr(safety, "RETRY_BACKOFF_S", 0.02)
+
+    async def scenario() -> None:
+        emit_attempts = 0
+
+        async def flaky_sink(event: SafetyEvent) -> None:
+            nonlocal emit_attempts
+            # Raise exactly once, on the trip's own success event — never on
+            # a failure event, and never more than once, so a misclassified
+            # retry (the bug) resolves in one extra loop instead of hanging
+            # this test on the default RETRY_BACKOFF_S.
+            if event.reason == "heartbeat_timeout" and event.reached_safe:
+                emit_attempts += 1
+                if emit_attempts == 1:
+                    raise RuntimeError("sink boom")
+
+        actuator = FakeActuator("ato-pump", OFF)
+        sup = InterlockSupervisor(on_event=flaky_sink)
+        sup.register(_registration(heartbeat_timeout_s=0.05), actuator)
+        await sup.start()
+        sup.heartbeat()
+        await sup.apply(_command())
+        # No further heartbeats: the watcher trips at the declared timeout.
+        await asyncio.sleep(0.15)
+
+        assert actuator.is_safe()
+        # One drive at startup, one for the trip. A misclassified emit
+        # failure would show up here as an extra, spurious re-drive of an
+        # actuator that was already safe.
+        assert actuator.safe_calls == 2
+        await sup.stop()
+
+    run(scenario)
+
+
+class SlowActuator(FakeActuator):
+    """drive_safe() takes real time and tracks whether two calls were ever in
+    flight at once.
+
+    A real driver's drive_safe() blocks on the bus for a measurable time (an
+    await point a plain raise-or-return fake never exercises) — without one,
+    two calls into a synchronous-bodied fake could never truly overlap on a
+    single-threaded event loop, which would make the reentrancy race stop()
+    must prevent untestable. Proves 2026-08-23 review fix 2.
+    """
+
+    def __init__(self, actuator_id: str, safe_state: ActuatorLevel, *, delay_s: float) -> None:
+        super().__init__(actuator_id, safe_state)
+        self.delay_s = delay_s
+        self.concurrent_calls = 0
+        self.max_concurrent_calls = 0
+
+    async def drive_safe(self) -> None:
+        self.concurrent_calls += 1
+        self.max_concurrent_calls = max(self.max_concurrent_calls, self.concurrent_calls)
+        try:
+            await asyncio.sleep(self.delay_s)
+            await super().drive_safe()
+        finally:
+            self.concurrent_calls -= 1
+
+
+def test_stop_awaits_a_mid_retry_drive_before_driving_the_guard_itself() -> None:
+    """2026-08-23 review, fix 2: a guard's own runtime/watch task can still be
+    inside guard.driver.drive_safe() when stop() runs. stop() must wait for
+    that call to actually finish before issuing its own drive_safe() on the
+    same guard — two invocations racing on one bus is exactly what
+    ActuatorDriver makes no reentrancy guarantee about. Also covers the
+    paired minor: stop() completes promptly and the actuator ends safe."""
+
+    async def scenario() -> None:
+        actuator = SlowActuator("slow", OFF, delay_s=0.08)
+        sup = InterlockSupervisor(on_event=_null_sink)
+        sup.register(_registration("slow", max_runtime_s=0.02), actuator)
+        await sup.start()
+        await sup.apply(_command("slow", on=True))
+
+        # The runtime deadline fires ~0.02s after apply and immediately
+        # starts a drive_safe() call that will not return until ~0.10s.
+        # Stop partway through that window, while the call is still in
+        # flight, with margin on both sides against scheduler jitter.
+        await asyncio.sleep(0.05)
+        t0 = asyncio.get_running_loop().time()
+        await sup.stop()
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert actuator.is_safe()
+        assert actuator.max_concurrent_calls == 1
+        # Promptly: stop() waits out the in-flight call (up to delay_s) plus
+        # its own shutdown drive (another delay_s) and nothing more — not
+        # RETRY_BACKOFF_S, not a hang. Comfortably under both with margin.
+        assert elapsed < 0.3, f"stop() took {elapsed:.3f}s"
 
     run(scenario)

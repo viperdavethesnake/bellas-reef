@@ -28,13 +28,15 @@ be.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Final, Literal
 
 from bellasreef_contracts import ActuatorCommand, ActuatorLevel, ActuatorRegistration
 from bellasreef_contracts.driver import ActuatorDriver
+from bellasreef_service import get_logger
 
 __all__ = [
     "CommandOutcome",
@@ -42,6 +44,12 @@ __all__ = [
     "SafetyEvent",
     "TripReason",
 ]
+
+log = get_logger(__name__)
+
+#: Seconds between safe-drive retries after a driver failure mid-trip. Module
+#: level so tests can shorten it (see test_drills.py's retry drills).
+RETRY_BACKOFF_S: Final = 1.0
 
 TripReason = Literal[
     "heartbeat_timeout",
@@ -81,15 +89,17 @@ class SafetyEvent:
     detail: str
 
     #: Whether the actuator actually reached (or already was in) a safe state
-    #: as part of this event. True by default: every reason except a failed
-    #: ``drive_safe()`` on the ``shutdown`` path (start()'s and stop()'s own
-    #: except branches, the only two call sites that pass ``False``) either is
-    #: a mere refusal — nothing moved — or, for heartbeat_timeout and
-    #: max_runtime_exceeded, only ever reaches ``_emit`` *after*
-    #: ``drive_safe()`` already succeeded (see ``_drive_safe`` below: a raise
-    #: there skips the emit inside it entirely). A consumer that publishes a
-    #: "safe" state from an event must check this first, or it claims a
-    #: transition that never happened.
+    #: as part of this event. True by default: a refusal (latched,
+    #: command_expired, clock_untrusted, unknown_actuator) never moved anything
+    #: and reports it. A trip (heartbeat_timeout, max_runtime_exceeded) or the
+    #: shutdown path goes through ``_drive_safe`` or, since 2026-08-23,
+    #: ``_drive_safe_with_retry`` — a failed attempt there emits this same
+    #: reason with ``reached_safe=False`` (retrying) before a later attempt, or
+    #: the original synchronous ``_drive_safe`` call in ``start()``/``stop()``,
+    #: succeeds with ``True``. A consumer that publishes a "safe" state from an
+    #: event must check this first, or it claims a transition that never
+    #: happened — including, now, on a reason it used to be able to trust
+    #: unconditionally.
     reached_safe: bool = True
 
 
@@ -198,6 +208,18 @@ class InterlockSupervisor:
                 "the contract validator should have refused it"
             )
         self._guards[registration.actuator_id] = _Guard(registration=registration, driver=driver)
+        guard = self._guards[registration.actuator_id]
+        if self._running:
+            # app.py registers production actuators from the registry AFTER
+            # start() has run (the spine has to be up before the registry can
+            # be read). A guard created then must get the same watcher a
+            # start()-time guard gets, or heartbeat loss protects nothing —
+            # which is exactly what shipped until 2026-08-23.
+            loop = asyncio.get_running_loop()
+            guard.last_beat = loop.time()
+            guard.watch_task = asyncio.create_task(
+                self._watch_heartbeat(guard), name=f"hb-{guard.actuator_id}"
+            )
 
     async def start(self) -> None:
         """Begin watching. Every actuator is driven to its safe state first.
@@ -241,11 +263,20 @@ class InterlockSupervisor:
         failures: list[Exception] = []
 
         for guard in self._guards.values():
-            for task in (guard.watch_task, guard.runtime_task):
-                if task is not None and not task.done():
+            tasks = [t for t in (guard.watch_task, guard.runtime_task) if t is not None]
+            for task in tasks:
+                if not task.done():
                     task.cancel()
             guard.watch_task = None
             guard.runtime_task = None
+            if tasks:
+                # A cancelled task can still be inside guard.driver.drive_safe()
+                # — retries in _drive_safe_with_retry really sleep and retry
+                # now, so cancellation does not land instantly. Wait for both
+                # tasks to actually unwind before this loop drives the same
+                # guard itself, or the two calls race on a bus ActuatorDriver
+                # makes no reentrancy guarantee about (2026-08-23 review).
+                await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 await self._drive_safe(guard, "shutdown", "supervisor stopping")
             except Exception as exc:
@@ -278,25 +309,40 @@ class InterlockSupervisor:
         loop = asyncio.get_running_loop()
         timeout = guard.heartbeat_timeout_s
         while self._running:
-            remaining = (guard.last_beat + timeout) - loop.time()
-            if remaining <= 0:
-                if not guard.heartbeat_lost:
-                    guard.heartbeat_lost = True
-                    await self._drive_safe(
-                        guard,
-                        "heartbeat_timeout",
-                        f"no heartbeat for {timeout}s",
-                    )
-                # Sleep until a beat arrives; do not spin.
-                await guard.beat.wait()
-                guard.beat.clear()
-                guard.heartbeat_lost = False
-                continue
             try:
-                await asyncio.wait_for(guard.beat.wait(), timeout=remaining)
-            except TimeoutError:
-                continue  # deadline reached; loop re-evaluates and trips
-            guard.beat.clear()
+                remaining = (guard.last_beat + timeout) - loop.time()
+                if remaining <= 0:
+                    if not guard.heartbeat_lost:
+                        guard.heartbeat_lost = True
+                        await self._drive_safe_with_retry(
+                            guard,
+                            "heartbeat_timeout",
+                            f"no heartbeat for {timeout}s",
+                        )
+                    # Sleep until a beat arrives; do not spin.
+                    await guard.beat.wait()
+                    guard.beat.clear()
+                    guard.heartbeat_lost = False
+                    continue
+                try:
+                    await asyncio.wait_for(guard.beat.wait(), timeout=remaining)
+                except TimeoutError:
+                    continue  # deadline reached; loop re-evaluates and trips
+                guard.beat.clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # _drive_safe_with_retry already retries a failing driver
+                # forever, so reaching here means something else went wrong in
+                # the loop itself. The watcher must not die to it: a dead
+                # watch task leaves heartbeat loss protecting nothing until
+                # the process restarts (2026-08-23 finding 2, same failure
+                # shape as the retry gap this method now closes).
+                log.exception(
+                    "heartbeat watcher hit an unexpected error; continuing",
+                    extra={"actuator_id": guard.actuator_id},
+                )
+                await asyncio.sleep(RETRY_BACKOFF_S)
 
     # ------------------------------------------------------------- commands
 
@@ -338,6 +384,18 @@ class InterlockSupervisor:
             await self._emit(guard, "latched", f"latched: {guard.latch_detail}")
             return "rejected_latched"
 
+        if guard.heartbeat_lost:
+            # Not a refusal — the no-flap design is deliberate: an actuator
+            # stays safe until something explicitly commands it again, and a
+            # live controller's first post-trip command is the normal
+            # recovery path. But an engine rolled back to a pre-heartbeat
+            # build would command this actuator while never beating, and that
+            # mixed-version state is otherwise invisible on the wire.
+            log.warning(
+                "command applied while heartbeat is lost; re-energizing",
+                extra={"actuator_id": guard.actuator_id},
+            )
+
         await guard.driver.apply(command.level)
         self._note_level(guard, command.level)
         return "applied"
@@ -369,7 +427,11 @@ class InterlockSupervisor:
         guard.latch_detail = (
             f"ran continuously past max_runtime_s={guard.registration.max_runtime_s}"
         )
-        await self._drive_safe(guard, "max_runtime_exceeded", guard.latch_detail)
+        # Latching happens before the drive, not after: refusing commands
+        # while a retry is in flight is correct, and a latch that waited for
+        # drive_safe to succeed would leave the actuator commandable for
+        # however long a flaky driver kept failing.
+        await self._drive_safe_with_retry(guard, "max_runtime_exceeded", guard.latch_detail)
 
     async def clear_latch(self, actuator_id: str, *, operator: str) -> None:
         """Explicit operator action. There is no automatic path out of a latch."""
@@ -380,13 +442,62 @@ class InterlockSupervisor:
 
     # ------------------------------------------------------------- internals
 
-    async def _drive_safe(self, guard: _Guard, reason: TripReason, detail: str) -> None:
-        await guard.driver.drive_safe()
+    def _mark_safe(self, guard: _Guard) -> None:
+        """Bookkeeping for a drive_safe() call that just succeeded.
+
+        Split out of `_drive_safe` so `_drive_safe_with_retry` can apply it
+        before its own success emit — see that method for why the emit must
+        not be allowed to feed back into the retry decision.
+        """
         guard.at_safe_state = True
         if guard.runtime_task is not None and not guard.runtime_task.done():
             guard.runtime_task.cancel()
             guard.runtime_task = None
+
+    async def _drive_safe(self, guard: _Guard, reason: TripReason, detail: str) -> None:
+        await guard.driver.drive_safe()
+        self._mark_safe(guard)
         await self._emit(guard, reason, detail)
+
+    async def _drive_safe_with_retry(self, guard: _Guard, reason: TripReason, detail: str) -> None:
+        """Drive safe, retrying until the drive itself lands or the supervisor stops.
+
+        Only `guard.driver.drive_safe()` decides whether to retry. The success
+        path does its own bookkeeping and emit here, rather than delegating to
+        `_drive_safe`, because that emit runs *after* the drive already
+        succeeded — a sink that raises there is not a drive failure, and
+        folding it into this method's own try/except would misreport it as
+        one (spuriously re-driving an already-safe actuator and auditing a
+        "drive_safe FAILED" that never happened — 2026-08-23 review).
+
+        A trip is the one moment this service exists for; a transient driver
+        error there must surface as an event and a retry, never as a dead task
+        (2026-08-23 finding 2: latched-but-energised with nobody watching).
+        """
+        while True:
+            try:
+                await guard.driver.drive_safe()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The event sink failing must not break the retry loop that is
+                # the actual safety mechanism — app.py already guards its own
+                # sink top-to-bottom, but this one does not depend on that.
+                with contextlib.suppress(Exception):
+                    await self._emit(
+                        guard,
+                        reason,
+                        f"drive_safe FAILED during trip, retrying: {exc!r}",
+                        reached_safe=False,
+                    )
+                if not self._running:
+                    return
+                await asyncio.sleep(RETRY_BACKOFF_S)
+                continue
+            self._mark_safe(guard)
+            with contextlib.suppress(Exception):
+                await self._emit(guard, reason, detail)
+            return
 
     async def _emit(
         self, guard: _Guard, reason: TripReason, detail: str, *, reached_safe: bool = True

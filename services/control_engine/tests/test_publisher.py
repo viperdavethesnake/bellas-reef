@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import pytest
+from bellasreef_contracts import ActuatorState, PwmLevel, StateReason
 from bellasreef_control_engine.publisher import CommandPublisher
 
 
@@ -108,3 +111,76 @@ class TestReconnectWiring:
             await reconnected_cb()  # must not raise
 
         asyncio.run(scenario())
+
+
+class _FakeMsg:
+    def __init__(self, payload: bytes, subject: str) -> None:
+        self.data = payload
+        self.subject = subject
+
+
+class _FakeNc:
+    """Just enough of nats.py's client for subscribe() to capture its
+    callback — same shape as test_assignments.py's fake, duplicated rather
+    than imported since that module's fakes are test-local, not exported."""
+
+    def __init__(self) -> None:
+        self.cb: Callable[[_FakeMsg], Coroutine[Any, Any, None]] | None = None
+
+    async def subscribe(
+        self, subject: str, cb: Callable[[_FakeMsg], Coroutine[Any, Any, None]]
+    ) -> None:
+        self.cb = cb
+
+
+def _state(actuator_id: str, *, reason: StateReason) -> ActuatorState:
+    now = datetime.now(UTC)
+    return ActuatorState(
+        message_id=uuid4(),
+        emitted_at=now,
+        source="hardware-io",
+        actuator_id=actuator_id,
+        level=PwmLevel(duty=0.0),
+        reason=reason,
+        since=now,
+    )
+
+
+class TestSubscribeStates:
+    """subscribe_states copies subscribe_assignments's contract exactly: core
+    pub/sub (no durable to leak — a JetStream publish traverses core subjects
+    too), and parsing/handling guarded separately so a malformed payload or a
+    raising handler cannot kill the subscription."""
+
+    def test_subscribe_states_survives_a_raising_handler(self) -> None:
+        good = _state("pca9685-0", reason="safe_state")
+        msg = _FakeMsg(good.model_dump_json().encode(), "bellasreef.state.pca9685-0")
+
+        def handler(state: ActuatorState) -> None:
+            raise RuntimeError("boom")
+
+        publisher = CommandPublisher("nats://unused:4222")
+        fake_nc = _FakeNc()
+        publisher._nc = fake_nc  # type: ignore[assignment]
+
+        asyncio.run(publisher.subscribe_states(handler))
+
+        assert fake_nc.cb is not None
+        asyncio.run(fake_nc.cb(msg))  # must not raise out of the callback
+
+    def test_subscribe_states_drops_a_malformed_payload_without_calling_the_handler(
+        self,
+    ) -> None:
+        msg = _FakeMsg(b"not json", "bellasreef.state.junk")
+        calls: list[ActuatorState] = []
+
+        publisher = CommandPublisher("nats://unused:4222")
+        fake_nc = _FakeNc()
+        publisher._nc = fake_nc  # type: ignore[assignment]
+
+        asyncio.run(publisher.subscribe_states(calls.append))
+
+        assert fake_nc.cb is not None
+        asyncio.run(fake_nc.cb(msg))  # must not raise; must not reach the handler
+
+        assert calls == []
