@@ -645,6 +645,31 @@ def test_commands_are_refused_when_the_clock_is_not_trusted() -> None:
     run(scenario)
 
 
+def test_supervisor_clock_trust_is_settable() -> None:
+    """Finding 4: trust was evaluated once at __init__ and frozen — a power
+    cut left every command rejected_clock until a manual restart. The
+    supervisor's clock trust must be changeable at runtime, not just at
+    construction. Inverts test_commands_are_refused_when_the_clock_is_not_trusted's
+    fixtures: starts untrusted (refused), then trusts (accepted)."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec, clock_trusted=False)
+        actuator = FakeActuator("doser", OFF)
+        sup.register(_registration("doser"), actuator)
+        await sup.start()
+        sup.heartbeat()
+
+        assert await sup.apply(_command("doser")) == "rejected_clock"
+
+        sup.set_clock_trusted(True)
+
+        assert await sup.apply(_command("doser")) == "applied"
+        await sup.stop()
+
+    run(scenario)
+
+
 def test_actuators_start_at_safe_state() -> None:
     async def scenario() -> None:
         rec = Recorder()

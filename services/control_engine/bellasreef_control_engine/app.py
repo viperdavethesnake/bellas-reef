@@ -56,6 +56,19 @@ log = get_logger(__name__)
 
 SERVICE: Final = "control-engine"
 
+#: Cadence for re-evaluating clock trust off the event loop (see
+#: ``_refresh_clock_trust``). The loop iterates at ~1 Hz; calling
+#: ``clock_is_trusted()`` — which shells out to ``timedatectl`` — every tick
+#: turned that into a blocking subprocess on the same loop that publishes
+#: heartbeats and runs ``_tick``. Gating it to 30 s and moving the call to a
+#: thread (``asyncio.to_thread``) fixes that at the cost of the "suspend
+#: heartbeats on untrusted clock" reaction (module docstring) lagging an
+#: actual clock flip by up to 30 s. That is inside the design's tolerance:
+#: hardware-io's own interlock guards (heartbeat timeout, etc.) already carry
+#: 30 s-scale timeouts, so a few extra seconds of a stale trust flag does not
+#: introduce a new failure window.
+_CLOCK_REFRESH_S: Final = 30.0
+
 
 class _Metrics:
     def __init__(self, registry: CollectorRegistry) -> None:
@@ -106,6 +119,11 @@ class _Metrics:
             "Schedule store read failures during the per-tick reload",
             registry=registry,
         )
+        self.override_io_errors = Counter(
+            "bellasreef_override_io_errors_total",
+            "Override store read/write failures absorbed by the tick loop",
+            registry=registry,
+        )
 
 
 class ControlEngine:
@@ -129,6 +147,19 @@ class ControlEngine:
         self.scheduler = LightingScheduler(profiles, max_duty_delta_per_s=max_duty_delta_per_s)
         self.overrides = override_store
         self._held: dict[str, ActiveOverride] = {}
+        # One flag for both override-store I/O paths (_reload_overrides'
+        # read, _expire_overrides' release, the latter a write) — they hit
+        # the same store, so a single outage there should not produce two
+        # independent "reload failed" / "release failed" warning streams.
+        # Mirrors _schedule_read_failing (2026-08-23 finding 7). Sharing it
+        # is not perfectly precise: within one tick, if an earlier release
+        # succeeds (resetting the flag) and a later one then fails, that
+        # failure re-warns even though the outage, if any, never really
+        # cleared. Accepted as noise, not a bug — the alternative (a flag
+        # per call site) buys precision nobody has asked for at the cost of
+        # the dedup this exists for in the common case, one store having one
+        # health state.
+        self._override_io_failing = False
         self.publisher = CommandPublisher(nats_url) if nats_url else None
         self.assignments = AssignmentLedger()
         # Forget on the tombstone EVENT, not on a tick's timing. due() only
@@ -149,6 +180,9 @@ class ControlEngine:
         self._liveness_timeout_s = liveness_timeout_s
         self._clock_trusted = clock_is_trusted()
         self._clock_was_trusted = self._clock_trusted
+        #: Monotonic deadline for the next off-loop re-evaluation; 0.0 means
+        #: "due immediately", which only matters for tests that force it.
+        self._clock_refresh_due = 0.0
 
         self.alerts: AlertSupervisor | None = None
         self.silence: SilenceWatcher | None = None
@@ -275,7 +309,7 @@ class ControlEngine:
             self.metrics.loop_beats.inc()
             self.metrics.loop_stall.set(self.liveness.age_s())
 
-            self._refresh_clock_trust()
+            await self._refresh_clock_trust()
 
             if self.publisher is not None and self._clock_trusted:
                 # The liveness beacon hardware-io's interlocks watch. Silence
@@ -456,16 +490,36 @@ class ControlEngine:
         row this process is watching is released here, against the monotonic
         clock, or by another client — never by a wall-clock comparison the
         engine did not ask for.
+
+        A ``release()`` that raises (the same flapping Postgres connection
+        that ``_reload_overrides`` guards against — 2026-08-23 finding 7)
+        must not unwind ``_tick`` into a crash loop either. The entry is
+        left in ``self._held`` rather than deleted: its monotonic deadline
+        is already past, so ``is_expired()`` keeps returning True and the
+        very next tick retries the same release. Nothing here marks the row
+        done until the store confirms it — deleting it before that would
+        leave the row open in Postgres with nobody retrying, a worse leak
+        than a stuck light.
         """
         if self.overrides is None or not self._held:
             return
         for target, override in list(self._held.items()):
-            if override.is_expired():
+            if not override.is_expired():
+                continue
+            try:
                 await self.overrides.release(override.id, "expired")
-                del self._held[target]
-                self.metrics.suppressed.labels("override_expired").inc()
-                log.info("override expired", extra={"target": target})
-                await self._audit_override_release(override.id, target, "expired")
+            except Exception:
+                self.metrics.override_io_errors.inc()
+                if not self._override_io_failing:  # one log per outage, not per tick
+                    self._override_io_failing = True
+                    log.warning("override release failed; will retry next tick", exc_info=True)
+                continue  # keep it in self._held; is_expired() stays True, so the
+                # next tick retries the release instead of leaking an open row.
+            self._override_io_failing = False
+            del self._held[target]
+            self.metrics.suppressed.labels("override_expired").inc()
+            log.info("override expired", extra={"target": target})
+            await self._audit_override_release(override.id, target, "expired")
 
     async def _audit_override_release(self, override_id: UUID, target: str, reason: str) -> None:
         """One ``override.released`` row, in the same shape the API writes for a
@@ -528,17 +582,46 @@ class ControlEngine:
         ``_expire_overrides`` runs first and has already released anything
         whose monotonic deadline passed, so those rows are no longer
         unreleased by the time this reads and cannot come back.
+
+        On a read error, keep the last good ``self._held`` set — same
+        contract as ``_reload_schedules``: a flapping Postgres connection
+        must not strip every active hold from the tank. Before this, a
+        single dropped connection out of ``list_active()`` raised straight
+        out of here, unwound ``_tick`` into ``_loop`` and crash-looped the
+        engine for the length of the flap (2026-08-23 finding 7) — while
+        ``_reload_schedules`` next door was already wrapped precisely
+        against this.
+
+        The rebuild — ``fresh.arm()`` and the ``held`` dict it goes into —
+        lives inside the same try/except as the store read, not just after
+        it, mirroring ``_reload_schedules``'s inclusion of
+        ``ChannelProfile.from_definition``: nothing here is expected to
+        raise today, but a future change to ``arm()`` or to what a row can
+        contain must degrade exactly like a read failure (keep the last good
+        set, count it, warn once) rather than reopen the same crash-loop
+        this fix closes. ``self._held`` is only ever reassigned once the
+        whole rebuild has succeeded, so a raise partway through never leaves
+        it half-updated.
         """
         if self.overrides is None:
             return
-        held: dict[str, ActiveOverride] = {}
-        for fresh in await self.overrides.list_active():
-            current = self._held.get(fresh.target)
-            if current is not None and current.id == fresh.id:
-                held[fresh.target] = current
-            else:
-                fresh.arm()
-                held[fresh.target] = fresh
+        try:
+            fresh_rows = await self.overrides.list_active()
+            held: dict[str, ActiveOverride] = {}
+            for fresh in fresh_rows:
+                current = self._held.get(fresh.target)
+                if current is not None and current.id == fresh.id:
+                    held[fresh.target] = current
+                else:
+                    fresh.arm()
+                    held[fresh.target] = fresh
+        except Exception:
+            self.metrics.override_io_errors.inc()
+            if not self._override_io_failing:  # one log per outage, not per tick
+                self._override_io_failing = True
+                log.warning("override reload failed; keeping last held set", exc_info=True)
+            return
+        self._override_io_failing = False
         self._held = held
 
     async def _reload_schedules(self) -> None:
@@ -644,7 +727,25 @@ class ControlEngine:
         command = self.publisher.build_pwm_command(
             intent.channel_id, intent.duty, reason=f"lighting:{intent.reason}", now=now
         )
-        await self.publisher.emit(command)
+        try:
+            await self.publisher.emit(command)
+        except Exception:
+            # A broker blip mid-publish (2026-08-23 finding 8: a PubAck
+            # timeout during a NATS restart used to unwind _tick and
+            # crash-loop the engine, with health reporting "spine ok" for
+            # the whole window because `connected` only checked the handle,
+            # not the client — see CommandPublisher.connected). Suppress and
+            # let the next tick retry: mark_emitted must not run below
+            # (recording an emission the broker never accepted would make
+            # the scheduler skip the next one), and the engine staying alive
+            # is what lets the retry exist at all.
+            self.metrics.suppressed.labels("publish_failed").inc()
+            log.warning(
+                "command publish failed; will retry next tick",
+                extra={"actuator_id": intent.channel_id},
+                exc_info=True,
+            )
+            return
 
         # Only after a successful publish. Recording an emission the broker
         # never accepted would make the scheduler skip the next one.
@@ -652,8 +753,19 @@ class ControlEngine:
         self.metrics.commands.labels(intent.channel_id, intent.reason).inc()
         self.metrics.channel_duty.labels(intent.channel_id).set(intent.duty)
 
-    def _refresh_clock_trust(self) -> None:
-        self._clock_trusted = clock_is_trusted()
+    async def _refresh_clock_trust(self) -> None:
+        """Re-evaluate clock trust, gated to ``_CLOCK_REFRESH_S`` and run off
+        the event loop — see the constant's comment for why. The reaction to
+        a flip (scheduler reset, suspending heartbeats/scheduling) is
+        unchanged; only how often, and how, the predicate itself is called
+        has moved.
+        """
+        now = time.monotonic()
+        if now < self._clock_refresh_due:
+            self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
+            return
+        self._clock_refresh_due = now + _CLOCK_REFRESH_S
+        self._clock_trusted = await asyncio.to_thread(clock_is_trusted)
         self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
 
         if self._clock_trusted != self._clock_was_trusted:

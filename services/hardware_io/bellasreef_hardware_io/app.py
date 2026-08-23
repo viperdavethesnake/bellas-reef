@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 import signal
-import subprocess
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -37,6 +36,7 @@ from bellasreef_contracts import (
     StateReason,
 )
 from bellasreef_contracts.driver import ActuatorDriver, SensorSample
+from bellasreef_service.clock import clock_is_trusted
 from bellasreef_service.httpd import Health, MetricsServer
 from bellasreef_service.logging import configure_logging, get_logger
 from bellasreef_service.watchdog import LivenessGuard
@@ -72,31 +72,15 @@ FREEZE_DRILL_ENV: Final = "BELLASREEF_ENABLE_FREEZE_DRILL"
 _PUBLISH_TIMEOUT_S: Final = 2.0
 
 
-def clock_is_trusted() -> bool:
-    """Whether the host clock can be believed.
-
-    This board has no RTC battery, so after a power cut the clock is wrong until
-    chrony catches up. Anything time-driven must refuse to act until this is
-    true — see the systemd unit's ``After=time-sync.target``.
-
-    Falls back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` where ``timedatectl`` is
-    unreachable (inside a container). That override is explicit on purpose:
-    silently assuming a good clock is exactly the failure being guarded against.
-    """
-    try:
-        out = subprocess.run(
-            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return os.environ.get("BELLASREEF_ASSUME_CLOCK_TRUSTED") == "1"
-
-    if out.returncode != 0:
-        return os.environ.get("BELLASREEF_ASSUME_CLOCK_TRUSTED") == "1"
-    return out.stdout.strip().lower() == "yes"
+#: Cadence for re-evaluating clock trust off the event loop (see
+#: ``_refresh_clock_trust_async``). 30 s is fast enough that "re-evaluated at
+#: runtime" is true in practice — chrony steps an RTC-less board's clock good
+#: within seconds of the network coming up after a power cut — and slow enough
+#: that ``clock_is_trusted()``'s ``timedatectl`` subprocess is not run every
+#: loop tick (finding 4, 2026-08-23: the old code called it once at __init__
+#: and never again; the fix must not trade that bug for a per-tick blocking
+#: subprocess instead).
+_CLOCK_REFRESH_S: Final = 30.0
 
 
 #: Everything about an assignment that changes what this process built:
@@ -181,6 +165,9 @@ class HardwareIO:
 
         self._loop_interval_s = loop_interval_s
         self._clock_trusted = clock_is_trusted()
+        #: Monotonic deadline for the next off-loop re-evaluation; 0.0 means
+        #: "due immediately", which only matters for tests that force it.
+        self._clock_refresh_due = 0.0
 
         self.supervisor = InterlockSupervisor(
             on_event=self._on_safety_event, clock_trusted=self._clock_trusted
@@ -690,7 +677,7 @@ class HardwareIO:
             self.metrics.loop_beats.inc()
             self.metrics.loop_stall.set(self.liveness.age_s())
 
-            self._refresh_clock_trust()
+            await self._refresh_clock_trust_async()
             await self._beat_and_serve()
             await self._poll_due_sensors(now)
             self._refresh_latch_metrics()
@@ -829,7 +816,33 @@ class HardwareIO:
                 exc_info=True,
             )
 
-    def _refresh_clock_trust(self) -> None:
+    async def _refresh_clock_trust_async(self) -> None:
+        """Re-evaluate clock trust, gated to ``_CLOCK_REFRESH_S`` and run off
+        the event loop.
+
+        Finding 4 (2026-08-23): the previous code evaluated
+        ``clock_is_trusted()`` once at ``__init__`` and never again, so a
+        power cut that left the clock wrong until chrony caught up also left
+        every command rejected_clock until the process was manually
+        restarted. Fixing that by calling the predicate every loop tick would
+        trade it for a worse bug: ``clock_is_trusted()`` shells out to
+        ``timedatectl``, and running that synchronously on this loop every
+        tick would block the same loop that beats the liveness watchdog and
+        drains commands — so the check is both gated to a cadence and moved
+        to a thread.
+        """
+        now = time.monotonic()
+        if now < self._clock_refresh_due:
+            self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
+            return
+        self._clock_refresh_due = now + _CLOCK_REFRESH_S
+        trusted = await asyncio.to_thread(clock_is_trusted)
+        if trusted != self._clock_trusted:
+            log.warning(
+                "clock trust changed", extra={"clock_trusted": trusted, "event": "clock_trust"}
+            )
+            self._clock_trusted = trusted
+            self.supervisor.set_clock_trusted(trusted)
         self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
 
     def _refresh_latch_metrics(self) -> None:

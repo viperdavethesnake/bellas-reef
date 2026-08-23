@@ -513,7 +513,34 @@ class CommandConsumer:
                 await msg.term()
                 continue
 
-            outcome = await self._supervisor.apply(command)
+            try:
+                outcome = await self._supervisor.apply(command)
+            except Exception:
+                # A driver fault (chip off the bus, transient I2C error) is a
+                # hardware event, not a reason to unwind the process — that
+                # turned one off-bus chip into a crash-loop, because the
+                # un-acked workqueue message redelivered into every restart.
+                # Nak with a delay instead: a transient fault succeeds on one
+                # of the redeliveries. A persistent one does not converge on
+                # the command's own TTL — max_deliver (3, ~1s nak cadence)
+                # exhausts in a few seconds, long before a 30s TTL would ever
+                # matter, and JetStream then stops redelivering the message
+                # at all. It sits unacked on BR_CMD until the stream's own
+                # max_age (1 hour, DiscardPolicy.OLD) reaps it — that is the
+                # actual convergence to silence, not an expiry check. The
+                # log.critical call below fires once per delivery attempt, so
+                # up to three of them are the standing record of that
+                # abandonment; no separate audit event is emitted for
+                # delivery-exhaustion itself, because a pull consumer exposes
+                # no per-message "this was the last attempt" hook to hang one
+                # off of, and at this scale the log record is enough.
+                log.critical(
+                    "driver failed applying a command; message nak'd for redelivery",
+                    extra={"actuator_id": command.actuator_id},
+                    exc_info=True,
+                )
+                await msg.nak(delay=1.0)
+                continue
             outcomes.append(outcome)
 
             if outcome == "applied":
@@ -611,7 +638,20 @@ class CommandConsumer:
         self._heal_cause = None
 
     async def _audit(self, event_type: str, detail: dict[str, object]) -> None:
-        await self._spine.publish_audit("command", {"event": event_type, **detail})
+        """Best-effort: an audit publish failure is logged, never raised.
+
+        The ack/term deciding the message's fate must happen regardless — a
+        JetStream hiccup on the audit stream was escaping drain_once and
+        exiting the process mid-refusal (2026-08-23 finding 5), while the
+        state publishes next door were already wrapped."""
+        try:
+            await self._spine.publish_audit("command", {"event": event_type, **detail})
+        except Exception:
+            log.warning(
+                "audit publish failed; event dropped",
+                extra={"event": event_type},
+                exc_info=True,
+            )
 
     async def _publish_applied_state(self, command: ActuatorCommand) -> None:
         """Tell the wire what an applied command actually did.

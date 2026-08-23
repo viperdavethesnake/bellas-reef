@@ -45,6 +45,10 @@ class FakeActuator:
         unexported RP1 channel whose udev rule never ran, a PCA9685 that
         answers no I²C — which the app must skip without taking the rest of
         the hub down with it.
+    ``apply_raises``
+        ``apply`` raises this exception instead of applying. Models a chip
+        that physically drops off the bus mid-command (the PCA9685 on
+        2026-08-15) — the command consumer must nak, not crash.
     """
 
     def __init__(
@@ -67,6 +71,7 @@ class FakeActuator:
         self.fail_safe_raises: bool = False
         self.apply_delay_s: float = 0.0
         self.open_raises: bool = False
+        self.apply_raises: BaseException | None = None
 
     @property
     def driver_id(self) -> str:
@@ -88,6 +93,8 @@ class FakeActuator:
     async def apply(self, level: ActuatorLevel) -> None:
         if self.apply_delay_s:
             await asyncio.sleep(self.apply_delay_s)
+        if self.apply_raises is not None:
+            raise self.apply_raises
         self.applied.append(level)
         if not self.stuck:
             self.level = level

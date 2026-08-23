@@ -715,6 +715,45 @@ def test_an_unbound_devices_channel_is_none() -> None:
     assert run(scenario)["channel"] is None
 
 
+def test_binding_an_existing_device_id_to_a_new_channel_409s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 9: `led-blue` bound to channel 0; POSTing it onto free channel 1
+    hit ON CONFLICT DO NOTHING, wrote nothing, returned created=True, and
+    published an assignment contradicting Postgres.
+    """
+    RecordingPublisher.published = []
+    monkeypatch.setattr("bellasreef_api.app.AssignmentPublisher", RecordingPublisher)
+
+    async def scenario() -> tuple[int, str, int, str]:
+        engine = await fresh_engine()
+        await announce(engine, "pi-pwm", "0")
+        await announce(engine, "pi-pwm", "1")
+        c, headers = await client_for(engine, nats_url="nats://127.0.0.1:4222")
+        try:
+            await bind_light(c, headers, "led-blue", "0")
+            response = await bind_light(c, headers, "led-blue", "1")
+            still = await get_device(c, headers, "led-blue")
+            return (
+                response.status_code,
+                response.json()["detail"],
+                await device_count(engine),
+                still["channel"],
+            )
+        finally:
+            await c.aclose()
+            await engine.dispose()
+
+    code, detail, count, channel = run(scenario)
+    assert code == 409
+    assert "led-blue" in detail
+    assert count == 1, "no partial write: the second attempt created nothing"
+    assert channel == "0", "the registry still says channel 0, not the free channel 1"
+    # Only the first, legitimate bind published — the rejected one published
+    # nothing, so hardware-io never saw an assignment contradicting Postgres.
+    assert len(RecordingPublisher.published) == 1
+
+
 def test_unbinding_frees_the_channel_to_be_bound_again() -> None:
     """The lockout this endpoint closes.
 

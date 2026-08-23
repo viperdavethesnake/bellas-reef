@@ -77,12 +77,24 @@ class _FakePublisher(CommandPublisher):
         #: When True, heartbeat() raises instead of counting — proves a
         #: failed publish is logged and does not kill the loop.
         self.fail_heartbeats = False
+        #: Backs `connected` — settable so tests can simulate the spine
+        #: being down (Task 3, 2026-08-23 finding 8) without a real client.
+        self._connected = True
+        #: One-shot exception for emit() to raise, then clear itself. See
+        #: fail_emits_with.
+        self._emit_exception: Exception | None = None
 
     @property
     def connected(self) -> bool:
-        return True
+        return self._connected
+
+    def fail_emits_with(self, exc: Exception) -> None:
+        self._emit_exception = exc
 
     async def emit(self, command: ActuatorCommand) -> None:
+        if self._emit_exception is not None:
+            exc, self._emit_exception = self._emit_exception, None
+            raise exc
         self.published.append(command)
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
@@ -110,6 +122,19 @@ class _FakeOverrideStore(OverrideStore):
         #: The store's idea of wall time. None means the real clock; a test
         #: sets it to simulate chrony stepping the clock under a running engine.
         self.wall_now: datetime | None = None
+        #: One-shot method-name -> exception to raise on the *next* call to
+        #: that method, then clear itself. Simulates a single dropped
+        #: Postgres connection (Task 2, 2026-08-23 finding 7) without having
+        #: to fail every subsequent call too.
+        self._next_failure: dict[str, Exception] = {}
+
+    def fail_next(self, method: str, exc: Exception) -> None:
+        self._next_failure[method] = exc
+
+    def _maybe_fail(self, method: str) -> None:
+        exc = self._next_failure.pop(method, None)
+        if exc is not None:
+            raise exc
 
     def _clock(self, now: datetime | None) -> datetime:
         return now or self.wall_now or datetime.now(UTC)
@@ -145,11 +170,13 @@ class _FakeOverrideStore(OverrideStore):
     async def list_active(self) -> list[ActiveOverride]:
         # Same contract as the Postgres one: a plain read of what is unreleased,
         # touching neither the rows nor any deadline.
+        self._maybe_fail("list_active")
         return [self._fresh(o) for o in self.rows.values()]
 
     async def release(
         self, override_id: UUID, reason: ReleaseReason, *, now: datetime | None = None
     ) -> bool:
+        self._maybe_fail("release")
         self.released.append((override_id, reason))
         for target, override in list(self.rows.items()):
             if override.id == override_id:
@@ -241,11 +268,13 @@ def run_loop_iterations(engine: ControlEngine, n: int) -> None:
 def force_clock_trusted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin ``clock_is_trusted`` for tests that drive the real ``_loop``.
 
-    ``_refresh_clock_trust`` calls the real predicate every iteration, and it
-    shells out to ``timedatectl`` — absent on macOS dev shells, where it falls
-    back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` (unset here, so False). CI sets
-    that env var to "1". Monkeypatching the name as ``app.py`` imports it
-    makes the outcome independent of the host this test happens to run on.
+    ``_refresh_clock_trust`` calls the real predicate on its first call (the
+    30 s cadence gate starts due immediately, see ``_CLOCK_REFRESH_S``), and
+    it shells out to ``timedatectl`` — absent on macOS dev shells, where it
+    falls back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` (unset here, so False).
+    CI sets that env var to "1". Monkeypatching the name as ``app.py``
+    imports it makes the outcome independent of the host this test happens to
+    run on.
     """
     monkeypatch.setattr("bellasreef_control_engine.app.clock_is_trusted", lambda: True)
 
@@ -259,6 +288,55 @@ def prime_scheduler_memory(engine: ControlEngine, channel_id: str, *, duty: floa
     """Seed the scheduler's emission memory as if a prior tick had commanded
     ``duty`` on ``channel_id`` — without going through a real ``_tick``."""
     engine.scheduler._last_duty[channel_id] = duty
+
+
+def prime_expired_hold(
+    engine: ControlEngine, store: _FakeOverrideStore, target: str
+) -> ActiveOverride:
+    """Seed both the store and ``engine._held`` with an override already
+    armed and past its monotonic deadline, as ``_rearm_overrides`` or a
+    prior tick's ``_reload_overrides`` would have left it. Mirrors the
+    deadline-forcing trick in
+    ``test_expiry_bookkeeping_still_releases_and_audits_the_row``.
+
+    Must land in ``store.rows`` too, not only ``_held``: a real release
+    failure leaves the row genuinely still active in Postgres, so
+    ``_reload_overrides``' next ``list_active()`` would see it. Seeding
+    only ``_held`` would make that read come back empty and wipe the retry
+    candidate that ``_expire_overrides`` just decided to keep — a test
+    artefact, not the outage being simulated.
+    """
+    override = ActiveOverride(
+        id=uuid4(),
+        target=target,
+        duty=0.5,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    override.arm(monotonic_now=-1_000_000.0, wall_now=datetime.now(UTC))
+    store.rows[target] = override
+    engine._held[target] = override
+    return override
+
+
+def prime_due_intent(engine: ControlEngine, channel_id: str, *, duty: float) -> None:
+    """Make ``scheduler.due()`` surface an ``Intent`` for ``channel_id`` at
+    ``duty`` on the very next ``_tick`` — adopting the channel and holding
+    it via an override, the same no-profile-needed path
+    ``TestHeldUnprofiledChannelPublishes`` uses."""
+    engine.assignments.apply(_assignment(channel_id, adopted=True))
+    engine._held[channel_id] = ActiveOverride(
+        id=uuid4(),
+        target=channel_id,
+        duty=duty,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+
+def scheduler_has_no_emission_recorded(engine: ControlEngine, channel_id: str) -> bool:
+    """True when ``mark_emitted`` has never run for ``channel_id`` — the
+    scheduler's own emission memory, checked directly rather than via
+    ``due()`` so the assertion doesn't depend on a second tick."""
+    return channel_id not in engine.scheduler._last_duty
 
 
 def make_state(
@@ -421,6 +499,37 @@ class TestClockTrustGate:
         # _refresh_clock_trust when the flag flips.
         engine.scheduler.reset()
         assert len(engine.scheduler.due(now)) == 1
+
+
+class TestSpineHealthGate:
+    """``health()`` (Task 3, 2026-08-23 finding 8) already consulted
+    ``publisher.connected`` before this fix — the lying part was
+    ``connected`` itself (it asked ``_js is not None``, which stayed True
+    through a RECONNECTING window), not this gate. Fixing the property
+    fixes the health report for free; these lock the existing wiring in
+    with an explicit assertion instead of leaving it implicit."""
+
+    def test_health_is_503_when_the_spine_is_not_connected(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        engine._clock_trusted = True
+        fake = _FakePublisher()
+        fake._connected = False
+        engine.publisher = fake
+
+        health = engine.health()
+
+        assert health.healthy is False
+        assert health.reason == "spine not connected"
+
+    def test_health_is_ok_when_the_spine_is_connected(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        engine._clock_trusted = True
+        engine.publisher = _FakePublisher()
+
+        health = engine.health()
+
+        assert health.healthy is True
+        assert health.reason == "ok"
 
 
 class TestAssignmentGate:
@@ -880,6 +989,150 @@ class TestLiveOverridePickup:
         asyncio.run(engine._tick(datetime.now(UTC)))
 
         assert fake.published == []
+
+
+class TestOverrideStoreOutage:
+    """`_reload_overrides` and `_expire_overrides` (Task 2, 2026-08-23 finding
+    7): one dropped Postgres connection in either the per-tick read
+    (``list_active``) or a release must not unwind `_tick` -> `_loop` ->
+    `run()` and crash-loop the engine — the same contract `_reload_schedules`
+    already had (see TestScheduleReload below)."""
+
+    def test_tick_survives_a_list_active_outage(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """One dropped connection out of ``list_active()`` used to raise
+        straight out of ``_reload_overrides``, stripping all lighting control
+        for the length of the flap."""
+        engine, _published, store = engine_with_fake_store
+        store.fail_next("list_active", ConnectionError("server closed the connection"))
+
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise
+
+        samples = [s for m in engine.metrics.override_io_errors.collect() for s in m.samples]
+        error_total = sum(
+            s.value for s in samples if s.name == "bellasreef_override_io_errors_total"
+        )
+        assert error_total == 1.0
+
+    def test_a_failed_release_keeps_the_hold_for_retry_not_a_leak(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """A release() that raises must not drop the entry from ``_held``:
+        the monotonic deadline is already past, so deleting it here would
+        leave the row open in Postgres with nobody retrying — the entry
+        must stay held and be retried on the very next tick."""
+        engine, _published, store = engine_with_fake_store
+        override = prime_expired_hold(engine, store, "pca9685-0")
+        store.fail_next("release", ConnectionError("server closed the connection"))
+
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise
+
+        assert "pca9685-0" in engine._held  # not silently dropped on a failed release
+        assert store.released == []
+        samples = [s for m in engine.metrics.override_io_errors.collect() for s in m.samples]
+        error_total = sum(
+            s.value for s in samples if s.name == "bellasreef_override_io_errors_total"
+        )
+        assert error_total == 1.0
+
+        # The store recovers: the same expired entry retries cleanly on the
+        # next tick and is finally released, proving this is a retry, not a
+        # permanent leak of the "expired but never closed" kind.
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert "pca9685-0" not in engine._held
+        assert store.released == [(override.id, "expired")]
+
+    def test_tick_survives_both_outages_in_sequence(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+    ) -> None:
+        """The exact scenario from the finding: a read outage on one tick,
+        then a release outage (with an already-expired hold in play) on the
+        next — neither may raise, and the second must retain the hold."""
+        engine, _published, store = engine_with_fake_store
+        store.fail_next("list_active", ConnectionError("server closed the connection"))
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise
+
+        store.fail_next("release", ConnectionError("server closed the connection"))
+        prime_expired_hold(engine, store, "pca9685-0")
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise; hold stays for retry
+
+        assert "pca9685-0" in engine._held  # not silently dropped on a failed release
+
+    def test_warns_once_per_outage_not_once_per_tick(
+        self,
+        engine_with_fake_store: tuple[ControlEngine, list[ActuatorCommand], _FakeOverrideStore],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Mirrors ``TestScheduleReload``'s dedup check for
+        ``_schedule_read_failing``: a store that stays down across several
+        ticks logs the warning once, at the start of the outage, not on
+        every tick it stays down."""
+        engine, _published, store = engine_with_fake_store
+
+        with caplog.at_level(logging.WARNING, logger="bellasreef_control_engine.app"):
+            for _ in range(3):
+                # fail_next is one-shot; re-arming it before every tick
+                # simulates a store that stays down across the whole outage,
+                # the same as a real dropped connection would.
+                store.fail_next("list_active", ConnectionError("server closed the connection"))
+                asyncio.run(engine._tick(datetime.now(UTC)))
+
+        warnings = [r for r in caplog.records if "override reload failed" in r.message]
+        assert len(warnings) == 1  # one log per outage, not per failing tick
+
+
+class TestPublishFailureSuppression:
+    """`_publish` (Task 3, 2026-08-23 finding 8): a PubAck timeout during a
+    NATS restart used to unwind `_tick` and crash-loop the engine, with
+    `health()` reporting "spine ok" the whole window because `connected`
+    only checked the handle, not the client (see TestSpineHealthGate and
+    test_publisher.py's TestConnectedProperty for that half of the fix)."""
+
+    def test_publish_failure_suppresses_instead_of_killing(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        engine, published = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        fake.fail_emits_with(TimeoutError("nats: request timeout"))
+        prime_due_intent(engine, "pca9685-0", duty=0.5)
+
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise
+
+        assert published == []  # nothing landed
+        assert scheduler_has_no_emission_recorded(engine, "pca9685-0")  # mark_emitted skipped
+
+        samples = [s for m in engine.metrics.suppressed.collect() for s in m.samples]
+        suppressed_total = sum(
+            s.value
+            for s in samples
+            if s.name == "bellasreef_commands_suppressed_total"
+            and s.labels.get("cause") == "publish_failed"
+        )
+        assert suppressed_total == 1.0
+
+    def test_publish_recovers_on_the_next_tick(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """The suppression is a retry, not a permanent drop: once the broker
+        answers again, the very next tick's intent is still due (mark_emitted
+        never ran) and lands normally."""
+        engine, published = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        fake.fail_emits_with(TimeoutError("nats: request timeout"))
+        prime_due_intent(engine, "pca9685-0", duty=0.5)
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert published == []
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pca9685-0"]
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
 
 
 class TestReconnectReDrain:

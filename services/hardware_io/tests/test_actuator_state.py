@@ -52,18 +52,22 @@ def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
 class FakeSpinePublisher:
     """Records every ActuatorState handed to publish_state.
 
-    Duck-typed against Spine's async publish surface — only the one method
-    either call site actually uses. ``raises`` lets a test prove a broken
-    spine cannot break actuation or startup; ``attempts`` counts every call
-    even when it raises, so a test can prove a publish was *tried* without
-    depending on it having recorded anything.
+    Duck-typed against Spine's async publish surface — only the methods the
+    call sites actually use. ``raises`` lets a test prove a broken spine
+    cannot break actuation or startup; ``attempts`` counts every call even
+    when it raises, so a test can prove a publish was *tried* without
+    depending on it having recorded anything. ``audit_raises`` is the same
+    idea for ``publish_audit`` — independent of ``raises``, because a broken
+    audit publish must not be conflated with a broken state publish.
     """
 
-    def __init__(self, *, raises: bool = False) -> None:
+    def __init__(self, *, raises: bool = False, audit_raises: bool = False) -> None:
         self.states: list[ActuatorState] = []
         self.raises = raises
         self.attempts = 0
         self.closed = False
+        self.audit_raises = audit_raises
+        self.audits: list[tuple[str, dict[str, object]]] = []
 
     async def publish_state(self, state: ActuatorState) -> None:
         self.attempts += 1
@@ -76,6 +80,11 @@ class FakeSpinePublisher:
             # about shutdown ordering.
             raise RuntimeError("spine not connected")
         self.states.append(state)
+
+    async def publish_audit(self, category: str, event: dict[str, object]) -> None:
+        if self.audit_raises:
+            raise RuntimeError("audit stream unreachable")
+        self.audits.append((category, event))
 
     async def close(self) -> None:
         self.closed = True
@@ -178,6 +187,23 @@ def command(actuator_id: str, level: ActuatorLevel = ON) -> ActuatorCommand:
         level=level,
         idempotency_key=uuid4(),
         expires_at=now + timedelta(seconds=60),
+    )
+
+
+def expired_command(actuator_id: str, level: ActuatorLevel = ON) -> ActuatorCommand:
+    """Already past its own TTL. ``expires_at`` must be strictly after
+    ``emitted_at`` (contract validation), so both sit in the past relative
+    to ``now`` rather than ``emitted_at`` sitting at ``now``."""
+    now = datetime.now(UTC)
+    return ActuatorCommand(
+        message_id=uuid4(),
+        emitted_at=now - timedelta(seconds=10),
+        source="control-engine",
+        actuator_id=actuator_id,
+        actuator_class=level.kind,
+        level=level,
+        idempotency_key=uuid4(),
+        expires_at=now - timedelta(seconds=1),
     )
 
 
@@ -327,12 +353,18 @@ class FakeJsMsg:
         self.metadata = FakeMeta()
         self.acked = False
         self.termed = False
+        self.naked_with_delay: float | None = None
 
     async def ack(self) -> None:
         self.acked = True
 
     async def term(self) -> None:
         self.termed = True
+
+    async def nak(self, delay: float | None = None) -> None:
+        # nats-py's real Msg.nak(delay=...) takes seconds and converts to ns
+        # internally; the fake records the seconds value a test asserts on.
+        self.naked_with_delay = delay
 
 
 class FakePullSubscription:
@@ -385,6 +417,64 @@ def test_drain_once_publishes_state_despite_a_dead_spine() -> None:
     assert acked is True, "a dead spine must not block the ack for a command that ran"
     assert termed is False
     assert attempts == 1, "publish was never attempted"
+
+
+def test_driver_failure_naks_instead_of_killing() -> None:
+    """Finding 5: the PCA9685 physically dropped off bus 1 on 2026-08-15. A
+    driver OSError mid-apply must nak the message, not unwind the process —
+    the un-acked workqueue message was redelivering into every restart."""
+
+    async def scenario() -> tuple[list[str], float | None, bool, bool]:
+        supervisor = InterlockSupervisor(on_event=_swallow)
+        actuator = FakeActuator("pca9685-0", OFF)
+        actuator.apply_raises = OSError("Remote I/O error")
+        supervisor.register(registration("pca9685-0"), actuator)
+        await supervisor.start()
+
+        spine = FakeSpinePublisher()
+        consumer = CommandConsumer(spine, supervisor)  # type: ignore[arg-type]
+
+        cmd = command("pca9685-0", ON)
+        msg = FakeJsMsg(cmd.model_dump_json().encode())
+        consumer._sub = FakePullSubscription([msg])  # type: ignore[assignment]
+
+        outcomes = await consumer.drain_once(timeout=1.0)
+
+        await supervisor.stop()
+        return [str(o) for o in outcomes], msg.naked_with_delay, msg.acked, msg.termed
+
+    outcomes, naked_with_delay, acked, termed = run(scenario)
+    assert outcomes == [], "nothing applied, nothing raised"
+    assert naked_with_delay == 1.0
+    assert not acked
+    assert not termed
+
+
+def test_audit_publish_failure_does_not_lose_the_term() -> None:
+    """A broker blip during a refusal's audit publish must not convert a
+    routine refusal into a service restart. The term still lands."""
+
+    async def scenario() -> tuple[list[str], bool]:
+        supervisor = InterlockSupervisor(on_event=_swallow)
+        actuator = FakeActuator("pca9685-0", OFF)
+        supervisor.register(registration("pca9685-0"), actuator)
+        await supervisor.start()
+
+        spine = FakeSpinePublisher(audit_raises=True)
+        consumer = CommandConsumer(spine, supervisor)  # type: ignore[arg-type]
+
+        cmd = expired_command("pca9685-0")
+        msg = FakeJsMsg(cmd.model_dump_json().encode())
+        consumer._sub = FakePullSubscription([msg])  # type: ignore[assignment]
+
+        outcomes = await consumer.drain_once(timeout=1.0)
+
+        await supervisor.stop()
+        return [str(o) for o in outcomes], msg.termed
+
+    outcomes, termed = run(scenario)
+    assert outcomes == ["rejected_expired"]
+    assert termed
 
 
 # ------------------------------------------------------------------ startup

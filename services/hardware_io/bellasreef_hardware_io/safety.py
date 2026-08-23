@@ -175,6 +175,13 @@ class InterlockSupervisor:
         self._clock_trusted = clock_trusted
         self._running = False
 
+    def set_clock_trusted(self, value: bool) -> None:
+        """The host clock's trust changes at runtime on an RTC-less board —
+        chrony steps it good after a power cut, and freezing the __init__
+        answer left every command rejected_clock until a manual restart
+        (2026-08-23 finding 4)."""
+        self._clock_trusted = value
+
     # ------------------------------------------------------------- lifecycle
 
     def register(self, registration: ActuatorRegistration, driver: ActuatorDriver) -> None:

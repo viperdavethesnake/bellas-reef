@@ -35,7 +35,11 @@ _PG = "BELLASREEF_TEST_DATABASE_URL"
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get(_NATS) and os.environ.get(_PG)),
-    reason=f"{_NATS} and {_PG} must both be set",
+    # Must contain "not set" — conftest.py's _ENV_SKIP_MARKER matches on that
+    # exact substring to decide a skip was declared rather than incidental.
+    # The old "must both be set" phrasing didn't, so this whole file
+    # env-skipped silently with the gate never tripping locally.
+    reason=f"{_NATS} or {_PG} not set",
 )
 
 

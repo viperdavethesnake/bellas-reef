@@ -27,7 +27,7 @@ import os
 import re
 import secrets
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -54,17 +54,19 @@ from bellasreef_db import (
     StoredSchedule,
     Transition,
 )
-from bellasreef_service import configure_logging, get_logger
+from bellasreef_service import Health, MetricsServer, configure_logging, get_logger
 from fastapi import (
     Depends,
     FastAPI,
     Header,
     HTTPException,
+    Request,
     Response,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
+from prometheus_client import CollectorRegistry, Counter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -85,7 +87,13 @@ from bellasreef_api.security import (
     issue_access_token,
     verify_access_token,
 )
-from bellasreef_api.store import PAIRING_TTL_S, ChannelHeldError, DeviceReferencedError, Store
+from bellasreef_api.store import (
+    PAIRING_TTL_S,
+    ChannelHeldError,
+    DeviceIdConflictError,
+    DeviceReferencedError,
+    Store,
+)
 from bellasreef_api.stream import AUTH_TIMEOUT_S, StreamBridge, parse_auth_frame
 from bellasreef_api.telemetry import TelemetryWriter
 
@@ -782,6 +790,7 @@ def build_app(
     vm_url: str | None = None,
     clock_trusted: Callable[[], bool] | None = None,
     durable_suffix: str = "",
+    metrics_port: int = 9103,
 ) -> FastAPI:
     store = Store(engine)
     overrides = OverrideStore(engine, clock_trusted=clock_trusted)
@@ -817,6 +826,38 @@ def build_app(
         AuditWriter(nats_url, engine, durable=f"audit-writer{durable_suffix}") if nats_url else None
     )
 
+    # CLAUDE.md, "Code standards": "Every service: healthcheck endpoint,
+    # structured JSON logs, metrics endpoint. Day 1, not later." The API
+    # shipped without one — this is that endpoint (2026-08-23 review, cleanup
+    # findings). A dedicated CollectorRegistry rather than prometheus_client's
+    # global default, same as hardware-io and control-engine: a second
+    # `build_app` in the same process (tests do this routinely) must not
+    # collide on metric names in a shared registry.
+    metrics_registry = CollectorRegistry()
+    metrics_requests = Counter(
+        "bellasreef_api_requests_total",
+        "HTTP requests served, by method and response status class",
+        ["method", "status_family"],
+        registry=metrics_registry,
+    )
+
+    def _ok_health() -> Health:
+        # The API is stateless — no supervisor loop to stall, no actuators to
+        # latch, no clock trust of its own to report (control-engine and
+        # hardware-io own that question). "Serving requests at all" is the
+        # whole health question here, so the probe is trivially always-ok;
+        # /metrics is what carries anything worth graphing.
+        return Health(
+            healthy=True,
+            reason="ok",
+            loop_stall_s=0.0,
+            clock_trusted=True,
+            actuators=0,
+            latched=(),
+        )
+
+    metrics_server = MetricsServer(probe=_ok_health, registry=metrics_registry, port=metrics_port)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         """Run the registry consumer for the life of the process.
@@ -826,6 +867,12 @@ def build_app(
         entire point of it. Note that the ASGI transport used in tests does not
         run lifespans, so the consumer stays out of the way there.
         """
+        # Unlike the spine components below, the metrics server has no
+        # external dependency to be missing — it is this service's own day-1
+        # requirement — so its start is not wrapped in the "no spine must not
+        # stop the API" broad except those use.
+        await metrics_server.start()
+
         # Mint the hub's identity if this is its first boot. Here rather than
         # in the migration, which also runs on a hub about to have a backup
         # restored into it — stamping an id there would give the restored
@@ -883,6 +930,11 @@ def build_app(
             for component in (registry, capabilities, chips, telemetry, audit_writer):
                 if component is not None:
                     await component.close()
+            # Last out, first in symmetry with the start above: the port must
+            # be free again when the lifespan exits, or a second `build_app`
+            # in the same process (every test in this suite does that) leaks
+            # it into the next one.
+            await metrics_server.stop()
 
     app = FastAPI(
         title="Bella's Reef API",
@@ -891,6 +943,22 @@ def build_app(
         lifespan=lifespan,
     )
     app.state.signing_secret_getter = signing_secret
+    # A test binds port 0 and reads back what the OS actually gave it, the
+    # same way hardware-io's and control-engine's health tests do.
+    app.state.metrics_server = metrics_server
+
+    @app.middleware("http")
+    async def _count_requests(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        # Counts every response this handler returns, including the 401/404/409s
+        # HTTPException maps to. A truly unhandled exception propagates past
+        # call_next instead of returning here, so it reaches ServerErrorMiddleware
+        # outside this counter rather than landing as a counted 5xx.
+        response = await call_next(request)
+        metrics_requests.labels(request.method, f"{response.status_code // 100}xx").inc()
+        return response
+
     # Named so a test can assert these are *running*, not merely constructed.
     # The audit writer spent its whole life constructible and unstarted.
     app.state.background = {
@@ -1513,18 +1581,25 @@ def build_app(
             )
 
         binding = {"rom": body.channel} if is_sensor else {"channel": body.channel}
-        device_id, created = await store.bind_device(
-            device_id=body.device_id,
-            kind="sensor" if is_sensor else "actuator",
-            driver_type=body.driver_type,
-            channel=body.channel,
-            binding=binding,
-            role=body.role,
-            display_name=body.display_name,
-            location=body.location,
-            sensor_type="temp" if is_sensor else None,
-            poll_interval_s=body.poll_interval_s if is_sensor else None,
-        )
+        try:
+            device_id, created = await store.bind_device(
+                device_id=body.device_id,
+                kind="sensor" if is_sensor else "actuator",
+                driver_type=body.driver_type,
+                channel=body.channel,
+                binding=binding,
+                role=body.role,
+                display_name=body.display_name,
+                location=body.location,
+                sensor_type="temp" if is_sensor else None,
+                poll_interval_s=body.poll_interval_s if is_sensor else None,
+            )
+        except DeviceIdConflictError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"device_id {exc.device_id!r} already names a device bound to a different "
+                "channel. Rename or forget it first.",
+            ) from exc
 
         # Announced after the row is stored. A binding that is stored and not
         # announced is recoverable; announced and not stored is not.
@@ -2487,4 +2562,5 @@ def create_app() -> FastAPI:
         audit=sink,
         nats_url=nats_url,
         vm_url=vm_url,
+        metrics_port=int(os.environ.get("BELLASREEF_METRICS_PORT", "9103")),
     )
