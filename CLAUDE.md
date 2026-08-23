@@ -659,6 +659,33 @@ until the probe was moved, then the register was written back to full-off and
 the leg re-run from the app. The stack's "Now" reads the last commanded duty
 and cannot see a CLI write — by design (`read_back()` is None).
 
+**Schedule acceptance — PASSED on hardware 2026-08-23, 11:18 PDT.** The
+lighting-schedules feature (#60 backend, iOS #14) proven end to end on the
+PCA9685 leg: schedule "Not Interesting" (zone America/Los_Angeles, anchor
+clock) created and assigned from the iOS app to `pca9685-0` ("Meter Check",
+adopted fresh after a full device wipe that morning). Engine picked the
+assignment up within a tick, slewed at 0.05/s (`lighting:converge` 45→79 %),
+and arrived on the curve at `lighting:ramp` duty 0.7919. **Meter at LED0:
+2.620 V, against 2.619 V predicted** (0.792 × the measured 3.307 V full
+scale) — 1 mV agreement, Stage-2 method, same probe point. The spec's
+acceptance named `pi-pwm-0`; run on `pca9685-0` instead (the channel David
+adopted), which the cross-silicon agreement row above makes equivalent.
+
+Overrides over the schedule, same sitting (11:19–11:20 PDT), all PASSED:
+
+| Test | Audit row | Meter |
+|---|---|---|
+| Snap hold 15 % | `override.created` duty 0.15, transition snap, 15 min | **0.496 V** = 0.15 × 3.307, exact |
+| Snap release | `override.released`, reason manual | **2.645 V** = curve-now 80.0 % |
+| Ramp hold 15 % + release | duty 0.15 transition ramp; released manual | both legs agreed |
+
+Three-way agreement throughout: audit log, engine publications, meter. The
+released-with-reason rows also close the old E1 audit check. One reading
+mid-test looked like a discrepancy (commanded "20 %", measured 0.496 V);
+the audit said duty 0.15 and David confirmed 15 % was the actual input —
+the stack was exact, the memory wasn't, and the audit log settled it, which
+is the point of having one.
+
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
