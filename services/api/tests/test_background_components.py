@@ -31,6 +31,7 @@ import httpx
 import nats
 import pytest
 from bellasreef_api.app import build_app
+from bellasreef_service.httpd import probe_once
 from sqlalchemy import NullPool, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -150,7 +151,7 @@ async def fresh_engine() -> AsyncEngine:
     return engine
 
 
-def app_for(engine: AsyncEngine, audit: Any | None = None) -> Any:
+def app_for(engine: AsyncEngine, audit: Any | None = None, *, metrics_port: int = 0) -> Any:
     return build_app(
         engine,
         audit=audit or Audit(),
@@ -160,6 +161,10 @@ def app_for(engine: AsyncEngine, audit: Any | None = None) -> Any:
         # unique suffix this test collides with whatever API instance is
         # already running against the same NATS — including the real hub.
         durable_suffix=f"-test-{uuid.uuid4().hex[:8]}",
+        # 0: the OS picks a free port, read back rather than hardcoded, so
+        # this suite cannot collide with a real hub's metrics server (9103)
+        # running on the same machine.
+        metrics_port=metrics_port,
     )
 
 
@@ -214,6 +219,53 @@ def test_a_declared_component_that_never_starts_fails_this_test() -> None:
 
     running = {"never starts": bool(getattr(NeverStarts(), "is_running", False))}
     assert not all(running.values())
+
+
+def test_metrics_server_starts_with_the_app() -> None:
+    """CLAUDE.md day-1 requirement: every service exposes metrics. The API
+    shipped without one (2026-08-23 review, cleanup findings).
+
+    Also the self-check for the other half of that requirement: a metrics
+    server that starts with the lifespan and never stops would leak a listener
+    into every later test in this process. So this drives a real HTTP request
+    through the app, confirms the counter it incremented is on the wire, and
+    then confirms the port is truly released once the lifespan exits — not
+    merely idle.
+    """
+
+    async def scenario() -> tuple[bytes, int]:
+        await clear_audit_consumers()
+        await clear_test_consumers()
+        engine = await fresh_engine()
+        app = app_for(engine)
+        try:
+            async with app.router.lifespan_context(app):
+                server = app.state.metrics_server
+                assert server._server is not None, "the lifespan did not start it"
+                port = server._server.sockets[0].getsockname()[1]
+
+                # Exercise the counting middleware through the real ASGI path,
+                # not by reaching into the registry directly.
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://hub"
+                ) as c:
+                    await c.get("/healthz")
+
+                _, body = await probe_once("127.0.0.1", port, "/metrics")
+
+            # Lifespan has exited. A leaked listener here would eventually
+            # collide with the next test's ephemeral port, or with a real
+            # hub's 9103 if the default ever got used by mistake.
+            with pytest.raises(OSError):
+                await probe_once("127.0.0.1", port, "/metrics")
+        finally:
+            await clear_audit_consumers()
+            await clear_test_consumers()
+            await engine.dispose()
+        return body, port
+
+    body, _ = run(scenario)
+    assert b'bellasreef_api_requests_total{method="GET",status_family="2xx"}' in body
 
 
 @pytest.mark.timeout(120)

@@ -18,6 +18,11 @@ dependencies = [
     # resolved because the workspace dev group happens to pull it in — the
     # built image would have failed at import.
     "httpx>=0.28",
+    # app.py imports prometheus_client directly for the metrics endpoint
+    # (Task 7). Declared here rather than left to resolve transitively
+    # through bellasreef-service, which is exactly the mistake the note
+    # above already records once for httpx.
+    "prometheus-client>=0.21",
 ]
 
 [project.scripts]
