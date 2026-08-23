@@ -27,10 +27,11 @@ from uuid import uuid4
 import pytest
 from bellasreef_contracts import (
     ActuatorCommand,
+    ActuatorLevel,
     ActuatorRegistration,
     BinaryLevel,
 )
-from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent
+from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent, safety
 
 # Timeouts are short so the suite stays fast, and deliberately not round
 # numbers so an implementation that happened to poll on a 50/100 ms cadence
@@ -631,5 +632,86 @@ def test_a_command_for_an_unknown_actuator_is_refused_not_fatal() -> None:
 
         # The service survives it, which is the whole point.
         assert await sup.apply(_command("ato-pump")) == "applied"
+
+    run(scenario)
+
+
+# --------------------------------------------------------- drill: driver retry
+
+
+class FlakyActuator(FakeActuator):
+    """Once armed, drive_safe() fails N times, then succeeds.
+
+    Models a transient I2C fault arriving mid-trip — the case a trip exists
+    to survive, not just a healthy driver's happy path. Starts unarmed: every
+    guard gets one unconditional drive_safe() call inside start() (see
+    InterlockSupervisor.start), and a failure there latches the actuator
+    before a command can ever move it out of safe state, which would prevent
+    the runtime-cap and heartbeat trips these tests exist to exercise from
+    ever firing. Arming after start() confines the simulated fault to the
+    trip's own retries.
+    """
+
+    def __init__(self, actuator_id: str, safe_state: ActuatorLevel, *, failures: int) -> None:
+        super().__init__(actuator_id, safe_state)
+        self.failures = failures
+        self.drive_safe_calls = 0
+        self.armed = False
+
+    async def drive_safe(self) -> None:
+        if self.armed:
+            self.drive_safe_calls += 1
+            if self.drive_safe_calls <= self.failures:
+                raise OSError("transient I2C fault")
+        await super().drive_safe()
+
+
+def test_runtime_trip_retries_failed_safe_drive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding 2: a transient driver error during a max-runtime trip must not
+    leave the actuator latched-but-energised with a dead guard task."""
+    monkeypatch.setattr(safety, "RETRY_BACKOFF_S", 0.02)
+
+    async def scenario() -> None:
+        rec = Recorder()
+        # Heartbeat left at the default (0.17s) is comfortably longer than
+        # this scenario needs, so the runtime cap is the only trip in play —
+        # no beater task required, unlike test_drill_max_runtime_trips_and_latches.
+        actuator = FlakyActuator("flaky", OFF, failures=2)
+        sup = InterlockSupervisor(on_event=rec)
+        sup.register(_registration("flaky", max_runtime_s=0.05), actuator)
+        await sup.start()
+        actuator.armed = True
+        await sup.apply(_command("flaky", on=True))
+        await asyncio.sleep(0.1)  # deadline passes; first two drives fail
+
+        # Retry backoff is patched short above so this settles fast.
+        await _wait_until(lambda: actuator.is_safe(), timeout=1.0)
+
+        assert sup.is_latched("flaky")  # the latch stands
+        assert actuator.drive_safe_calls >= 3  # it retried
+        failed = [e for e in rec.events if not e.reached_safe]
+        assert failed  # failures were emitted, not swallowed
+        assert any(e.reason == "max_runtime_exceeded" and e.reached_safe for e in rec.events)
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_heartbeat_watcher_survives_drive_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same shape via the heartbeat path: the watcher keeps watching after a
+    failed drive, and the actuator lands safe once the driver recovers."""
+    monkeypatch.setattr(safety, "RETRY_BACKOFF_S", 0.02)
+
+    async def scenario() -> None:
+        actuator = FlakyActuator("flaky", OFF, failures=1)
+        sup = InterlockSupervisor(on_event=_null_sink)
+        sup.register(_registration("flaky", heartbeat_timeout_s=0.05), actuator)
+        await sup.start()
+        actuator.armed = True
+        await sup.apply(_command("flaky", on=True))
+
+        await _wait_until(lambda: actuator.is_safe(), timeout=1.0)
+        assert not sup.is_latched("flaky")  # heartbeat loss does not latch
+        await sup.stop()
 
     run(scenario)
