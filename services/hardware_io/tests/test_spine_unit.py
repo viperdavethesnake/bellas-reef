@@ -128,9 +128,13 @@ def _heartbeat(*, sequence: int = 1) -> Heartbeat:
 def test_heartbeat_subscription_feeds_supervisor() -> None:
     """Real payloads through the real parse path, mirroring watch_assignments'
     malformed-payload contract: a bad beat is dropped with a warning and the
-    subscription stays alive for the next one."""
+    subscription stays alive for the next one.
 
-    async def scenario() -> list[int]:
+    Asserted after each delivery, not just at the end, so a future failure
+    names which delivery misbehaved rather than just the final tally.
+    """
+
+    async def scenario() -> None:
         spine = Spine("nats://example.invalid:4222")
         fake_nc = _FakeNc()
         spine._nc = fake_nc  # type: ignore[assignment]
@@ -142,11 +146,37 @@ def test_heartbeat_subscription_feeds_supervisor() -> None:
         cb = fake_nc.subscriptions[subject]
 
         await cb(_FakeMsg(_heartbeat(sequence=1).model_dump_json().encode(), subject))
-        await cb(_FakeMsg(b"not json", subject))  # malformed beat dropped, subscription alive
-        await cb(_FakeMsg(_heartbeat(sequence=2).model_dump_json().encode(), subject))
-        return beats
+        assert beats == [1], "a valid beat must feed the supervisor"
 
-    assert run(scenario) == [1, 1]
+        await cb(_FakeMsg(b"not json", subject))
+        assert beats == [1], "a malformed beat must be dropped, not counted"
+
+        await cb(_FakeMsg(_heartbeat(sequence=2).model_dump_json().encode(), subject))
+        assert beats == [1, 1], "the subscription must survive the malformed beat"
+
+    run(scenario)
+
+
+def test_heartbeat_subscription_survives_a_raising_handler() -> None:
+    """A raising on_beat must not escape the callback and kill the
+    subscription — the failure mode the parsing/handling split guards
+    against (control-engine's subscribe_assignments has the same test)."""
+
+    async def scenario() -> None:
+        spine = Spine("nats://example.invalid:4222")
+        fake_nc = _FakeNc()
+        spine._nc = fake_nc  # type: ignore[assignment]
+
+        def on_beat() -> None:
+            raise RuntimeError("boom")
+
+        await spine.subscribe_heartbeats("control-engine", on_beat)
+
+        subject = subjects.heartbeat("control-engine")
+        cb = fake_nc.subscriptions[subject]
+        await cb(_FakeMsg(_heartbeat().model_dump_json().encode(), subject))  # must not raise
+
+    run(scenario)
 
 
 def test_subscribe_heartbeats_without_a_connection_raises() -> None:

@@ -321,8 +321,12 @@ class Spine:
         would make a dead controller look alive. The callback is synchronous
         and cheap (InterlockSupervisor.heartbeat stamps a monotonic time) —
         nothing here may block the NATS client's task. Malformed payloads are
-        dropped with a warning, same contract as watch_assignments: parsing is
-        guarded so a bad message cannot kill the subscription.
+        dropped with a warning, same contract as watch_assignments. Parsing
+        and handling are guarded separately (mirrors control-engine
+        publisher.py's subscribe_sensors/subscribe_assignments): a raising
+        on_beat must not escape this callback into nats.py's default error
+        path, which logs via stdlib and is invisible to our structured-log
+        grep, and must not kill the subscription.
         """
         if self._nc is None:
             raise RuntimeError("spine not connected")
@@ -333,7 +337,10 @@ class Spine:
             except ValidationError:
                 log.warning("dropping an undecodable heartbeat", extra={"subject": msg.subject})
                 return
-            on_beat()
+            try:
+                on_beat()
+            except Exception:  # broad by design - see docstring
+                log.exception("heartbeat handling failed", extra={"subject": msg.subject})
 
         await self._nc.subscribe(subjects.heartbeat(component), cb=_cb)
         log.info("watching heartbeats", extra={"component": component})
