@@ -201,6 +201,7 @@ class TestOverrideEndpoints:
                 out["after"] = (await c.get("/api/v1/overrides", headers=headers)).json()
             await engine.dispose()
             out["events"] = audit.events
+            out["records"] = audit.records
             return out
 
         out = run(scenario)
@@ -212,6 +213,11 @@ class TestOverrideEndpoints:
         assert out["after"] == []
         assert "override.created" in out["events"]
         assert "override.released" in out["events"]
+        # A manual release only ever holds override_id — without the device it
+        # was on riding along, the row's device_id lands NULL and the exact
+        # hole this branch closes for `_to_row` (finding 8) reopens here.
+        released = next(d for e, d, _ in out["records"] if e == "override.released")
+        assert released["target"] == "led-blue"
 
     def test_releasing_twice_is_a_404(self) -> None:
         async def scenario() -> int:

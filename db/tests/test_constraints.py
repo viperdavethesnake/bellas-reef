@@ -199,6 +199,41 @@ class TestAuditLogIsAppendOnly:
             run(lambda: attempt())
 
 
+class TestAuditLogCategory:
+    """0021: 'alert' joined the CHECK. Standing guard against the constraint
+    drifting back out of sync with `audit_writer._VALID_CATEGORIES` — the
+    exact mismatch that made every alert row land mis-filed as 'safety'
+    before this migration (finding 10)."""
+
+    @staticmethod
+    async def _insert_category(category: str) -> None:
+        eng = engine()
+        try:
+            async with eng.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO audit_log "
+                        "(message_id, occurred_at, category, actor, event) "
+                        "VALUES (:mid, :at, :category, 'test', CAST(:event AS JSONB))"
+                    ),
+                    {
+                        "mid": uuid.uuid4(),
+                        "at": datetime.now(UTC),
+                        "category": category,
+                        "event": '{"k": 1}',
+                    },
+                )
+        finally:
+            await eng.dispose()
+
+    def test_alert_category_is_accepted(self) -> None:
+        run(lambda: self._insert_category("alert"))
+
+    def test_an_unknown_category_is_still_rejected(self) -> None:
+        with pytest.raises(IntegrityError):
+            run(lambda: self._insert_category("not-a-real-category"))
+
+
 class TestDosingJournalEvidence:
     """A row cannot claim to be confirmed without evidence of confirmation."""
 

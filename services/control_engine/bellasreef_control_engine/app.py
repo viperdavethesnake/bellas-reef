@@ -434,6 +434,7 @@ class ControlEngine:
                     {
                         "message_id": str(alert.message_id),
                         "event": f"alert.{alert.state}",
+                        "actor": "control-engine",
                         "device_id": alert.device_id,
                         "bound": alert.bound,
                         "value": alert.value,

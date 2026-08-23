@@ -24,7 +24,7 @@ import contextlib
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
 
 import nats
 from bellasreef_contracts import subjects
@@ -60,7 +60,48 @@ _INSERT = text(
 #: audit_log.category has a CHECK constraint; anything outside this set would be
 #: rejected by the database, so it is normalised here rather than discovered as
 #: a failed insert on a message we then cannot retry usefully.
-_VALID_CATEGORIES = frozenset({"command", "config", "auth", "state", "safety", "calibration"})
+_VALID_CATEGORIES = frozenset(
+    {"command", "config", "auth", "state", "safety", "calibration", "alert"}
+)
+
+#: Preference order for the event's own clock; see `_event_time`.
+_TIMESTAMP_KEYS: Final = ("occurred_at", "emitted_at", "observed_at")
+
+#: Preference order for the device the event names; see `_event_device_id`.
+_DEVICE_KEYS: Final = ("actuator_id", "device_id", "target", "channel_id")
+
+
+def _event_time(event: dict[str, Any]) -> datetime:
+    """The event's own clock, when it carries one. Drain time is a fallback,
+    not a truth: after a writer stall, everything buffered in BR_AUDIT (24h)
+    lands at once, and stamping arrival misorders the record the audit log
+    exists to keep straight."""
+    for key in _TIMESTAMP_KEYS:
+        raw = event.get(key)
+        if isinstance(raw, str):
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            # A naive timestamp is a publisher bug — guessing a zone would
+            # fabricate precision that isn't there, so drain time is the
+            # safer record.
+            if parsed.tzinfo is None:
+                continue
+            return parsed
+    return datetime.now(UTC)
+
+
+def _event_device_id(event: dict[str, Any]) -> str | None:
+    """Publishers name their subject differently: hardware-io says
+    actuator_id, the API says device_id, overrides say target, schedule
+    assignment says channel_id. The column answers 'which device' for all of
+    them or per-device audit queries return nothing."""
+    for key in _DEVICE_KEYS:
+        raw = event.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
 
 
 class AuditWriter:
@@ -181,6 +222,13 @@ class AuditWriter:
 
         category = subject.split(".")[-1]
         if category not in _VALID_CATEGORIES:
+            # Every category a publisher legitimately uses is in
+            # _VALID_CATEGORIES (alert included, as of 0021), so reaching
+            # here means the subject's last token is not a category at all —
+            # a malformed or future subject. 'safety' is a parking category
+            # for that, not a claim that a safety event occurred: after 0021,
+            # a stored category='safety' row means "unrecognised subject
+            # token, original in original_category," never "a safety event."
             event = {**event, "original_category": category}
             category = "safety"
 
@@ -191,10 +239,13 @@ class AuditWriter:
 
         return {
             "message_id": message_id,
-            "occurred_at": datetime.now(UTC),
+            "occurred_at": _event_time(event),
             "category": category,
-            "actor": str(event.get("actor", "hardware-io")),
+            # No publisher stamped an actor here before; defaulting to
+            # "hardware-io" attributed every unstamped row to a service that
+            # never published it. "unknown" is honest about what we don't know.
+            "actor": str(event.get("actor", "unknown")),
             "subject": subject,
-            "device_id": event.get("actuator_id"),
+            "device_id": _event_device_id(event),
             "event": json.dumps(event),
         }

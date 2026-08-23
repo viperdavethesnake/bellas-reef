@@ -306,16 +306,27 @@ class OverrideStore:
 
     async def release(
         self, override_id: UUID, reason: ReleaseReason, *, now: datetime | None = None
-    ) -> bool:
+    ) -> str | None:
+        """Releases the row and returns its ``target``, or ``None`` if nothing
+        matched (unknown id, or already released).
+
+        Returning the target — not just success/failure — is what lets a
+        caller that only holds ``override_id`` (the manual-release API path)
+        stamp its audit row with the device the hold was actually on, instead
+        of leaving ``device_id`` NULL on exactly the event this branch closes
+        that hole for elsewhere.
+        """
         async with self._engine.begin() as conn:
             result = await conn.execute(
                 text(
                     "UPDATE overrides SET released_at = :now, release_reason = :reason "
-                    "WHERE id = :id AND released_at IS NULL"
+                    "WHERE id = :id AND released_at IS NULL "
+                    "RETURNING target"
                 ),
                 {"now": now or datetime.now(UTC), "reason": reason, "id": override_id},
             )
-            return bool(result.rowcount)
+            row = result.first()
+            return str(row[0]) if row is not None else None
 
     async def active_for(self, target: str) -> ActiveOverride | None:
         """The live override on one target, if any."""

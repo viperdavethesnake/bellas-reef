@@ -33,7 +33,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 _NATS = "BELLASREEF_TEST_NATS_URL"
 _PG = "BELLASREEF_TEST_DATABASE_URL"
 
-pytestmark = pytest.mark.skipif(
+#: Applied per-test below, not as a module-level ``pytestmark`` — the
+#: ``_to_row`` tests further down are pure (no NATS, no DB connection ever
+#: opens) and must run without either environment variable set.
+_needs_env = pytest.mark.skipif(
     not (os.environ.get(_NATS) and os.environ.get(_PG)),
     # Must contain "not set" — conftest.py's _ENV_SKIP_MARKER matches on that
     # exact substring to decide a skip was declared rather than incidental.
@@ -112,6 +115,7 @@ async def audit_rows(eng: AsyncEngine) -> int:
         return int((await conn.execute(text("SELECT count(*) FROM audit_log"))).scalar_one())
 
 
+@_needs_env
 @pytest.mark.timeout(180)
 def test_audit_load_with_a_redelivery_overlapping_a_live_batch() -> None:
     """Volume, plus a redelivery landing in the middle of ongoing work.
@@ -185,6 +189,7 @@ def test_audit_load_with_a_redelivery_overlapping_a_live_batch() -> None:
     )
 
 
+@_needs_env
 @pytest.mark.timeout(120)
 def test_append_only_trigger_holds_under_concurrent_writers() -> None:
     """Concurrent transactions inserting while UPDATE/DELETE are attempted.
@@ -242,6 +247,7 @@ def test_append_only_trigger_holds_under_concurrent_writers() -> None:
     assert all("append-only" in e for e in errors)
 
 
+@_needs_env
 @pytest.mark.timeout(120)
 def test_idempotency_key_uniqueness_under_a_real_race() -> None:
     """Concurrent doses sharing an idempotency_key: exactly one may land.
@@ -316,3 +322,83 @@ def test_idempotency_key_uniqueness_under_a_real_race() -> None:
 
     assert winners == 1, f"{winners} concurrent doses were accepted; exactly 1 may be"
     assert stored == 1, f"dosing_journal holds {stored} rows for one idempotency_key"
+
+
+def _writer() -> AuditWriter:
+    """``_to_row`` is pure — building the ``AsyncEngine`` object opens no
+    connection (SQLAlchemy connects lazily on first use), so these tests need
+    neither a live NATS nor a live Postgres. No ``@_needs_env``.
+    """
+    return AuditWriter("nats://unused", create_async_engine("postgresql+asyncpg://unused/unused"))
+
+
+def test_row_keeps_the_event_time_not_the_drain_time() -> None:
+    """Finding 10: after a writer stall, everything buffered in BR_AUDIT (24h
+    retention) persisted misdated to drain time and misordered by
+    ORDER BY occurred_at."""
+    row = _writer()._to_row(
+        "bellasreef.audit.alert",
+        json.dumps({"emitted_at": "2026-08-23T01:02:03+00:00"}).encode(),
+    )
+    assert row["occurred_at"] == datetime(2026, 8, 23, 1, 2, 3, tzinfo=UTC)
+
+
+def test_row_resolves_device_id_across_publisher_dialects() -> None:
+    for key in ("actuator_id", "device_id", "target", "channel_id"):
+        row = _writer()._to_row("bellasreef.audit.command", json.dumps({key: "pca9685-0"}).encode())
+        assert row["device_id"] == "pca9685-0", key
+
+
+def test_row_device_id_precedence_actuator_id_beats_device_id() -> None:
+    """hardware-io's own key wins over the API's, per _DEVICE_KEYS order —
+    not just "some key is picked", the earlier-listed one specifically."""
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"actuator_id": "pi-pwm-0", "device_id": "pca9685-0"}).encode(),
+    )
+    assert row["device_id"] == "pi-pwm-0"
+
+
+def test_row_device_id_precedence_device_id_beats_target() -> None:
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"device_id": "pca9685-0", "target": "led-blue"}).encode(),
+    )
+    assert row["device_id"] == "pca9685-0"
+
+
+def test_alert_category_is_no_longer_remapped() -> None:
+    row = _writer()._to_row("bellasreef.audit.alert", json.dumps({"device_id": "d"}).encode())
+    assert row["category"] == "alert"
+    assert "original_category" not in json.loads(str(row["event"]))
+
+
+def test_actor_default_is_unknown_not_hardware_io() -> None:
+    row = _writer()._to_row("bellasreef.audit.config", b"{}")
+    assert row["actor"] == "unknown"
+
+
+def test_unparseable_timestamp_falls_back_to_drain_time() -> None:
+    row = _writer()._to_row(
+        "bellasreef.audit.command", json.dumps({"observed_at": "not-a-date"}).encode()
+    )
+    occurred_at = row["occurred_at"]
+    assert isinstance(occurred_at, datetime)
+    # Not just "a datetime" — the actual drain-time fallback, not some other
+    # value that happens to satisfy isinstance.
+    assert abs((datetime.now(UTC) - occurred_at).total_seconds()) < 60
+
+
+def test_naive_timestamp_falls_back_to_drain_time() -> None:
+    """A naive ``occurred_at`` is a publisher bug — see _event_time's
+    docstring. Guessing a zone would fabricate precision that isn't there, so
+    this must land on drain time exactly like an unparseable string, not on
+    the naive value reinterpreted as UTC."""
+    row = _writer()._to_row(
+        "bellasreef.audit.command",
+        json.dumps({"occurred_at": "2020-01-01T00:00:00"}).encode(),
+    )
+    occurred_at = row["occurred_at"]
+    assert isinstance(occurred_at, datetime)
+    assert occurred_at.tzinfo is not None
+    assert abs((datetime.now(UTC) - occurred_at).total_seconds()) < 60
