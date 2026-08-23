@@ -19,6 +19,7 @@ a laxer test while being wrong on a real tank.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -257,6 +258,37 @@ def test_drill_actuator_does_not_spring_back_on_when_heartbeats_return() -> None
             await asyncio.sleep(HEARTBEAT_TIMEOUT_S / 4)
 
         assert actuator.is_safe(), "must stay safe until an explicit command arrives"
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_apply_while_heartbeat_lost_still_applies_but_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No-flap stays no-flap: a command mid-trip is still applied, not
+    refused — that is the normal recovery path for a live controller's first
+    post-trip command. But an engine rolled back to a pre-heartbeat build
+    would command this actuator while never beating, and that mixed-version
+    state must not be silent.
+    """
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        actuator = FakeActuator("ato-pump", OFF)
+        sup.register(_registration(), actuator)
+
+        await sup.start()
+        await rec.wait_for("heartbeat_timeout", timeout=2.0)
+        assert actuator.is_safe()
+
+        with caplog.at_level(logging.WARNING, logger="bellasreef_hardware_io.safety"):
+            outcome = await sup.apply(_command(on=True))
+
+        assert outcome == "applied"
+        assert not actuator.is_safe()
+        assert any("heartbeat is lost" in r.message for r in caplog.records)
         await sup.stop()
 
     run(scenario)

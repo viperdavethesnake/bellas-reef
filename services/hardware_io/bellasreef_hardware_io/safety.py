@@ -384,6 +384,18 @@ class InterlockSupervisor:
             await self._emit(guard, "latched", f"latched: {guard.latch_detail}")
             return "rejected_latched"
 
+        if guard.heartbeat_lost:
+            # Not a refusal — the no-flap design is deliberate: an actuator
+            # stays safe until something explicitly commands it again, and a
+            # live controller's first post-trip command is the normal
+            # recovery path. But an engine rolled back to a pre-heartbeat
+            # build would command this actuator while never beating, and that
+            # mixed-version state is otherwise invisible on the wire.
+            log.warning(
+                "command applied while heartbeat is lost; re-energizing",
+                extra={"actuator_id": guard.actuator_id},
+            )
+
         await guard.driver.apply(command.level)
         self._note_level(guard, command.level)
         return "applied"
