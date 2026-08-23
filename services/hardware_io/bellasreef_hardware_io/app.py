@@ -574,6 +574,11 @@ class HardwareIO:
             return
 
         self.spine = Spine(url)
+        # Wired before connect(): the reconnected_cb Spine.connect() hands to
+        # nats.py fires on every reconnect for the life of the connection,
+        # not just the first one, so it must be in place before the client
+        # exists at all.
+        self.spine.on_reconnected = self._republish_safe_states
         await self.spine.connect()
         await self.spine.provision()
 
@@ -776,6 +781,58 @@ class HardwareIO:
                 safe_state,
                 reason="startup",
                 latched=self.supervisor.is_latched(registration.actuator_id),
+            )
+
+    async def _republish_safe_states(self) -> None:
+        """Reconnect callback (wired onto ``spine.on_reconnected`` in
+        ``_connect_spine``, before ``connect()`` runs): correct the engine's
+        duty memory for whatever the spine outage tripped dark while it was
+        down.
+
+        Found by the 2026-08-23 NATS-outage drill on hardware: an outage
+        longer than the heartbeat timeout trips actuators to their declared
+        safe state, but the trip-state publish fails into the down spine —
+        swallowed by design, observed at 22:49:23Z ("failed to publish
+        actuator state ... reason=safe_state" for both actuators). The
+        engine never hears about the trip, so it never forgets its duty
+        memory, and its first post-recovery command re-energizes the dark
+        channel in ONE step at curve duty (observed: 0 -> 11.5% in a single
+        ``lighting:ramp`` command at 22:50:57Z; at midday this would be
+        0 -> 100%) — bypassing the slew on exactly the recovery path the
+        slew exists for.
+
+        ``reason="safe_state"`` is in the engine's own
+        ``_AUTONOMOUS_STATE_REASONS``, so a republished state here makes it
+        forget its duty memory and cold-start the channel under the slew,
+        the same as it would have if the original trip-state publish had
+        landed.
+
+        Only actuators ``supervisor.is_at_safe_state()`` reports true for.
+        One that is NOT at safe state has a held, non-safe level that is
+        still true on the hardware — the engine's memory of it is still
+        correct, so republishing would be noise, and on a blip shorter than
+        the heartbeat timeout (no trip at all) it would manufacture a
+        spurious dark-dip where nothing actually changed.
+        """
+        for registration in self._registrations:
+            actuator_id = registration.actuator_id
+            if not self.supervisor.is_at_safe_state(actuator_id):
+                continue
+            # Non-None by construction, same guard as _publish_startup_states
+            # above — an assert strips under -O, and one bad registration
+            # must not stop the rest of the loop.
+            safe_state = registration.safe_state
+            if safe_state is None:  # pragma: no cover - contract validator guarantees this
+                log.error(
+                    "authoritative registration missing safe_state; no reconnect republish",
+                    extra={"actuator_id": actuator_id},
+                )
+                continue
+            await self._publish_state(
+                actuator_id,
+                safe_state,
+                reason="safe_state",
+                latched=self.supervisor.is_latched(actuator_id),
             )
 
     async def _publish_state(

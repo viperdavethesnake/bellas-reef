@@ -26,6 +26,19 @@ from bellasreef_hardware_io.spine import CHIP_STREAM, STREAMS, CommandConsumer, 
 from nats.js.api import RetentionPolicy, StorageType
 
 
+class _FakeNatsConnection:
+    """Just enough surface for ``Spine.connect()`` to accept it as the return
+    of ``nats.connect()``: ``jetstream()`` and an async ``close()``. Mirrors
+    control-engine's ``test_publisher.py::_FakeNatsClient`` — same wiring
+    test, same shape, other side of the reconnect-callback pattern."""
+
+    def jetstream(self) -> object:
+        return object()
+
+    async def close(self) -> None:
+        pass
+
+
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
     return asyncio.run(scenario())
 
@@ -255,3 +268,123 @@ def test_audit_lets_an_explicit_actor_in_detail_win() -> None:
 
     event = run(scenario)
     assert event["actor"] == "someone-else"
+
+
+# ------------------------------------------------------- reconnect callback
+
+
+def test_connect_registers_a_reconnected_cb_with_nats(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-08-23 NATS-outage drill: hardware-io needs to know when the spine
+    comes back so it can republish safe states (app.py's
+    ``_republish_safe_states``). ``nats.connect`` is monkeypatched out,
+    mirroring control-engine's ``TestReconnectWiring`` for the sibling
+    ``CommandPublisher.connect``."""
+    captured: dict[str, Any] = {}
+
+    async def fake_connect(url: str, **kwargs: Any) -> _FakeNatsConnection:
+        captured["url"] = url
+        captured["reconnected_cb"] = kwargs.get("reconnected_cb")
+        return _FakeNatsConnection()
+
+    monkeypatch.setattr("bellasreef_hardware_io.spine.nats.connect", fake_connect)
+
+    spine = Spine("nats://bench:4222")
+    run(spine.connect)
+
+    assert captured["url"] == "nats://bench:4222"
+    assert captured["reconnected_cb"] is not None
+
+
+def test_on_reconnected_is_settable_before_connect() -> None:
+    """The attribute must exist and be assignable pre-connect — connect() is
+    where it gets handed to nats.py, not where it is created."""
+
+    async def on_reconnected() -> None:
+        pass
+
+    spine = Spine("nats://unused:4222")
+    assert spine.on_reconnected is None
+    spine.on_reconnected = on_reconnected  # must not raise
+
+
+def test_reconnected_cb_invokes_on_reconnected(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_connect(url: str, **kwargs: Any) -> _FakeNatsConnection:
+        captured["reconnected_cb"] = kwargs.get("reconnected_cb")
+        return _FakeNatsConnection()
+
+    monkeypatch.setattr("bellasreef_hardware_io.spine.nats.connect", fake_connect)
+
+    spine = Spine("nats://unused:4222")
+    fired = False
+
+    async def on_reconnected() -> None:
+        nonlocal fired
+        fired = True
+
+    spine.on_reconnected = on_reconnected
+
+    async def scenario() -> None:
+        await spine.connect()
+        reconnected_cb = captured["reconnected_cb"]
+        assert reconnected_cb is not None
+        await reconnected_cb()
+
+    run(scenario)
+    assert fired is True
+
+
+def test_reconnected_with_no_handler_set_is_a_quiet_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spine nobody wired a handler onto (no ``BELLASREEF_NATS_URL`` case's
+    sibling: a spine that connects but whose owner never set
+    ``on_reconnected``) must not blow up when nats.py fires the callback."""
+    captured: dict[str, Any] = {}
+
+    async def fake_connect(url: str, **kwargs: Any) -> _FakeNatsConnection:
+        captured["reconnected_cb"] = kwargs.get("reconnected_cb")
+        return _FakeNatsConnection()
+
+    monkeypatch.setattr("bellasreef_hardware_io.spine.nats.connect", fake_connect)
+
+    spine = Spine("nats://unused:4222")
+
+    async def scenario() -> None:
+        await spine.connect()
+        reconnected_cb = captured["reconnected_cb"]
+        assert reconnected_cb is not None
+        await reconnected_cb()  # must not raise
+
+    run(scenario)
+
+
+def test_reconnected_cb_swallows_a_raising_on_reconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bug in the republish path must not be able to kill nats.py's own
+    reconnect handling — the callback body is guarded, the same shape as
+    ``subscribe_heartbeats``' ``on_beat`` guard."""
+    captured: dict[str, Any] = {}
+
+    async def fake_connect(url: str, **kwargs: Any) -> _FakeNatsConnection:
+        captured["reconnected_cb"] = kwargs.get("reconnected_cb")
+        return _FakeNatsConnection()
+
+    monkeypatch.setattr("bellasreef_hardware_io.spine.nats.connect", fake_connect)
+
+    spine = Spine("nats://unused:4222")
+
+    async def on_reconnected() -> None:
+        raise RuntimeError("boom")
+
+    spine.on_reconnected = on_reconnected
+
+    async def scenario() -> None:
+        await spine.connect()
+        reconnected_cb = captured["reconnected_cb"]
+        assert reconnected_cb is not None
+        await reconnected_cb()  # must not raise
+
+    run(scenario)
