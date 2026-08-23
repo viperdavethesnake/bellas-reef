@@ -56,6 +56,19 @@ log = get_logger(__name__)
 
 SERVICE: Final = "control-engine"
 
+#: Cadence for re-evaluating clock trust off the event loop (see
+#: ``_refresh_clock_trust``). The loop iterates at ~1 Hz; calling
+#: ``clock_is_trusted()`` — which shells out to ``timedatectl`` — every tick
+#: turned that into a blocking subprocess on the same loop that publishes
+#: heartbeats and runs ``_tick``. Gating it to 30 s and moving the call to a
+#: thread (``asyncio.to_thread``) fixes that at the cost of the "suspend
+#: heartbeats on untrusted clock" reaction (module docstring) lagging an
+#: actual clock flip by up to 30 s. That is inside the design's tolerance:
+#: hardware-io's own interlock guards (heartbeat timeout, etc.) already carry
+#: 30 s-scale timeouts, so a few extra seconds of a stale trust flag does not
+#: introduce a new failure window.
+_CLOCK_REFRESH_S: Final = 30.0
+
 
 class _Metrics:
     def __init__(self, registry: CollectorRegistry) -> None:
@@ -167,6 +180,9 @@ class ControlEngine:
         self._liveness_timeout_s = liveness_timeout_s
         self._clock_trusted = clock_is_trusted()
         self._clock_was_trusted = self._clock_trusted
+        #: Monotonic deadline for the next off-loop re-evaluation; 0.0 means
+        #: "due immediately", which only matters for tests that force it.
+        self._clock_refresh_due = 0.0
 
         self.alerts: AlertSupervisor | None = None
         self.silence: SilenceWatcher | None = None
@@ -293,7 +309,7 @@ class ControlEngine:
             self.metrics.loop_beats.inc()
             self.metrics.loop_stall.set(self.liveness.age_s())
 
-            self._refresh_clock_trust()
+            await self._refresh_clock_trust()
 
             if self.publisher is not None and self._clock_trusted:
                 # The liveness beacon hardware-io's interlocks watch. Silence
@@ -737,8 +753,19 @@ class ControlEngine:
         self.metrics.commands.labels(intent.channel_id, intent.reason).inc()
         self.metrics.channel_duty.labels(intent.channel_id).set(intent.duty)
 
-    def _refresh_clock_trust(self) -> None:
-        self._clock_trusted = clock_is_trusted()
+    async def _refresh_clock_trust(self) -> None:
+        """Re-evaluate clock trust, gated to ``_CLOCK_REFRESH_S`` and run off
+        the event loop — see the constant's comment for why. The reaction to
+        a flip (scheduler reset, suspending heartbeats/scheduling) is
+        unchanged; only how often, and how, the predicate itself is called
+        has moved.
+        """
+        now = time.monotonic()
+        if now < self._clock_refresh_due:
+            self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
+            return
+        self._clock_refresh_due = now + _CLOCK_REFRESH_S
+        self._clock_trusted = await asyncio.to_thread(clock_is_trusted)
         self.metrics.clock_trusted.set(1.0 if self._clock_trusted else 0.0)
 
         if self._clock_trusted != self._clock_was_trusted:

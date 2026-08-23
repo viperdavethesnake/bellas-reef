@@ -268,11 +268,13 @@ def run_loop_iterations(engine: ControlEngine, n: int) -> None:
 def force_clock_trusted(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin ``clock_is_trusted`` for tests that drive the real ``_loop``.
 
-    ``_refresh_clock_trust`` calls the real predicate every iteration, and it
-    shells out to ``timedatectl`` — absent on macOS dev shells, where it falls
-    back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` (unset here, so False). CI sets
-    that env var to "1". Monkeypatching the name as ``app.py`` imports it
-    makes the outcome independent of the host this test happens to run on.
+    ``_refresh_clock_trust`` calls the real predicate on its first call (the
+    30 s cadence gate starts due immediately, see ``_CLOCK_REFRESH_S``), and
+    it shells out to ``timedatectl`` — absent on macOS dev shells, where it
+    falls back to ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` (unset here, so False).
+    CI sets that env var to "1". Monkeypatching the name as ``app.py``
+    imports it makes the outcome independent of the host this test happens to
+    run on.
     """
     monkeypatch.setattr("bellasreef_control_engine.app.clock_is_trusted", lambda: True)
 
