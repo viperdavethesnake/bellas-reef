@@ -112,7 +112,13 @@ The point-curve model stops being "engine configuration, not a wire contract"
 model moves into `bellasreef_contracts` so API and engine share one source of
 truth; the engine's `ChannelProfile` becomes a consumer of it.
 
-### API (audited mutations; admin role; contracts MINOR)
+### API (audited mutations; paired-client auth, no roles; contracts MINOR)
+
+(As built, and ruled by David 2026-08-23: auth here is the same
+`current_client` token gate as every other endpoint — RBAC is a PRD
+non-goal (`prd.md` §non-goals), and an earlier draft of this header said
+"admin role" without any design behind it. Every mutation writes an audit
+row naming the acting client; that is the whole accountability model.)
 | | |
 |---|---|
 | `GET /lighting/schedules` | list (id, name, points, zone, anchor, assigned channel_ids) |

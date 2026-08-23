@@ -85,10 +85,16 @@ telemetry.
 
 ## API
 
-- Registry consumer: subscribe `ALL_CHIPS` (durable `registry-chips`, same
-  pattern as capabilities), upsert into a new table `chip_state(id, source,
-  instance, initialised, initialised_at, facts jsonb, announced_at)` — one row
-  per (source, instance). Alembic migration 0019.
+- Registry consumer: subscribe `ALL_CHIPS` with an **ephemeral**
+  LAST_PER_SUBJECT consumer (as built in #62, ruled by David 2026-08-23;
+  this spec's earlier draft said durable `registry-chips` without a reason).
+  `BR_CHIP` retains the last message per chip, so a fresh connection replays
+  current state in full and the table rebuilds on every API start — a
+  durable would add broker-side named state (the 2026-08-10 leaked-durable
+  failure class) to protect history that does not exist. Upsert into a new
+  table `chip_state(id, source, instance, initialised, initialised_at,
+  facts jsonb, announced_at)` — one row per (source, instance). Alembic
+  migration 0020 (0019 went to schedules).
 - `GET /api/v1/hardware` lists rows, ordered by source then instance.
 - Startup: nothing to replay — `BR_CHIP` is last-value, and the consumer's
   first delivery is the retained state.
@@ -115,6 +121,13 @@ telemetry.
 ## Out of scope
 
 - Live re-reading registers on demand (a "refresh chip" button). State is
-  published when it changes; the app shows the last published.
+  published when *this service* configures the chip — once per chip per
+  process, at bring-up (accepted by David 2026-08-23). A change made
+  underneath a running service (a brownout, a bench `i2cset`) is invisible
+  until the next service start, because the driver does not poll registers
+  (`read_back()` is None by design) and detection would be new machinery
+  with no incident to justify it. Restarts happen on every adoption change
+  and every deploy, which bounds the staleness in practice. Trigger to
+  revisit: stale chip state actually misleading someone at the bench.
 - Any change to what `initialise()` writes.
 - The FET stage / `bench_verified` — CLAUDE.md's business.
