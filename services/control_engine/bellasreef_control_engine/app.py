@@ -135,11 +135,18 @@ class ControlEngine:
         self.overrides = override_store
         self._held: dict[str, ActiveOverride] = {}
         # One flag for both override-store I/O paths (_reload_overrides'
-        # read, _expire_overrides' release) — they hit the same store, so a
-        # single outage there should not produce two independent "reload
-        # failed" / "release failed" warning streams. Mirrors
-        # _schedule_read_failing (2026-08-23 finding 7).
-        self._override_read_failing = False
+        # read, _expire_overrides' release, the latter a write) — they hit
+        # the same store, so a single outage there should not produce two
+        # independent "reload failed" / "release failed" warning streams.
+        # Mirrors _schedule_read_failing (2026-08-23 finding 7). Sharing it
+        # is not perfectly precise: within one tick, if an earlier release
+        # succeeds (resetting the flag) and a later one then fails, that
+        # failure re-warns even though the outage, if any, never really
+        # cleared. Accepted as noise, not a bug — the alternative (a flag
+        # per call site) buys precision nobody has asked for at the cost of
+        # the dedup this exists for in the common case, one store having one
+        # health state.
+        self._override_io_failing = False
         self.publisher = CommandPublisher(nats_url) if nats_url else None
         self.assignments = AssignmentLedger()
         # Forget on the tombstone EVENT, not on a tick's timing. due() only
@@ -487,12 +494,12 @@ class ControlEngine:
                 await self.overrides.release(override.id, "expired")
             except Exception:
                 self.metrics.override_io_errors.inc()
-                if not self._override_read_failing:  # one log per outage, not per tick
-                    self._override_read_failing = True
+                if not self._override_io_failing:  # one log per outage, not per tick
+                    self._override_io_failing = True
                     log.warning("override release failed; will retry next tick", exc_info=True)
                 continue  # keep it in self._held; is_expired() stays True, so the
                 # next tick retries the release instead of leaking an open row.
-            self._override_read_failing = False
+            self._override_io_failing = False
             del self._held[target]
             self.metrics.suppressed.labels("override_expired").inc()
             log.info("override expired", extra={"target": target})
@@ -568,26 +575,37 @@ class ControlEngine:
         engine for the length of the flap (2026-08-23 finding 7) — while
         ``_reload_schedules`` next door was already wrapped precisely
         against this.
+
+        The rebuild — ``fresh.arm()`` and the ``held`` dict it goes into —
+        lives inside the same try/except as the store read, not just after
+        it, mirroring ``_reload_schedules``'s inclusion of
+        ``ChannelProfile.from_definition``: nothing here is expected to
+        raise today, but a future change to ``arm()`` or to what a row can
+        contain must degrade exactly like a read failure (keep the last good
+        set, count it, warn once) rather than reopen the same crash-loop
+        this fix closes. ``self._held`` is only ever reassigned once the
+        whole rebuild has succeeded, so a raise partway through never leaves
+        it half-updated.
         """
         if self.overrides is None:
             return
         try:
             fresh_rows = await self.overrides.list_active()
+            held: dict[str, ActiveOverride] = {}
+            for fresh in fresh_rows:
+                current = self._held.get(fresh.target)
+                if current is not None and current.id == fresh.id:
+                    held[fresh.target] = current
+                else:
+                    fresh.arm()
+                    held[fresh.target] = fresh
         except Exception:
             self.metrics.override_io_errors.inc()
-            if not self._override_read_failing:  # one log per outage, not per tick
-                self._override_read_failing = True
+            if not self._override_io_failing:  # one log per outage, not per tick
+                self._override_io_failing = True
                 log.warning("override reload failed; keeping last held set", exc_info=True)
             return
-        self._override_read_failing = False
-        held: dict[str, ActiveOverride] = {}
-        for fresh in fresh_rows:
-            current = self._held.get(fresh.target)
-            if current is not None and current.id == fresh.id:
-                held[fresh.target] = current
-            else:
-                fresh.arm()
-                held[fresh.target] = fresh
+        self._override_io_failing = False
         self._held = held
 
     async def _reload_schedules(self) -> None:
