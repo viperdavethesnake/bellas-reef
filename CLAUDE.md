@@ -659,6 +659,18 @@ until the probe was moved, then the register was written back to full-off and
 the leg re-run from the app. The stack's "Now" reads the last commanded duty
 and cannot see a CLI write — by design (`read_back()` is None).
 
+**Schedule acceptance — PASSED on hardware 2026-08-23, 11:18 PDT.** The
+lighting-schedules feature (#60 backend, iOS #14) proven end to end on the
+PCA9685 leg: schedule "Not Interesting" (zone America/Los_Angeles, anchor
+clock) created and assigned from the iOS app to `pca9685-0` ("Meter Check",
+adopted fresh after a full device wipe that morning). Engine picked the
+assignment up within a tick, slewed at 0.05/s (`lighting:converge` 45→79 %),
+and arrived on the curve at `lighting:ramp` duty 0.7919. **Meter at LED0:
+2.620 V, against 2.619 V predicted** (0.792 × the measured 3.307 V full
+scale) — 1 mV agreement, Stage-2 method, same probe point. The spec's
+acceptance named `pi-pwm-0`; run on `pca9685-0` instead (the channel David
+adopted), which the cross-silicon agreement row above makes equivalent.
+
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
