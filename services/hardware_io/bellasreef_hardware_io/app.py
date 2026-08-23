@@ -645,6 +645,12 @@ class HardwareIO:
         self.commands = CommandConsumer(self.spine, self.supervisor)
         await self.commands.subscribe()
 
+        # The controller's liveness beacon. Subscribed last, after every
+        # actuator is registered and watched: a beat that arrives before the
+        # watchers exist would be stamped and forgotten, and one that arrives
+        # after is exactly what resets their deadlines.
+        await self.spine.subscribe_heartbeats("control-engine", self.supervisor.heartbeat)
+
     async def _beat_and_serve(self) -> None:
         """Publish a heartbeat and take one pass at the command queue."""
         if self.spine is None:

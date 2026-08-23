@@ -314,6 +314,30 @@ class Spine:
         await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_cb)
         log.info("watching assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
 
+    async def subscribe_heartbeats(self, component: str, on_beat: Callable[[], None]) -> None:
+        """Core subscription to one component's liveness beacon.
+
+        Core pub/sub on purpose, like the publish side: a replayed heartbeat
+        would make a dead controller look alive. The callback is synchronous
+        and cheap (InterlockSupervisor.heartbeat stamps a monotonic time) —
+        nothing here may block the NATS client's task. Malformed payloads are
+        dropped with a warning, same contract as watch_assignments: parsing is
+        guarded so a bad message cannot kill the subscription.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+
+        async def _cb(msg: Msg) -> None:
+            try:
+                Heartbeat.model_validate_json(msg.data)
+            except ValidationError:
+                log.warning("dropping an undecodable heartbeat", extra={"subject": msg.subject})
+                return
+            on_beat()
+
+        await self._nc.subscribe(subjects.heartbeat(component), cb=_cb)
+        log.info("watching heartbeats", extra={"component": component})
+
     async def publish_capabilities(self, announcement: CapabilityAnnouncement) -> None:
         """Announce what one hardware source can offer.
 
