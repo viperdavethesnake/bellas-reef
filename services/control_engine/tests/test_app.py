@@ -12,7 +12,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from bellasreef_contracts import ActuatorCommand, DeviceAssignment, ScheduleDefinition
+from bellasreef_contracts import (
+    ActuatorCommand,
+    ActuatorState,
+    DeviceAssignment,
+    PwmLevel,
+    ScheduleDefinition,
+    StateReason,
+)
 from bellasreef_control_engine.app import ControlEngine
 from bellasreef_control_engine.profiles import ChannelProfile, RampPoint
 from bellasreef_control_engine.publisher import CommandPublisher
@@ -248,6 +255,30 @@ def force_clock_untrusted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("bellasreef_control_engine.app.clock_is_trusted", lambda: False)
 
 
+def prime_scheduler_memory(engine: ControlEngine, channel_id: str, *, duty: float) -> None:
+    """Seed the scheduler's emission memory as if a prior tick had commanded
+    ``duty`` on ``channel_id`` — without going through a real ``_tick``."""
+    engine.scheduler._last_duty[channel_id] = duty
+
+
+def make_state(
+    actuator_id: str, *, reason: StateReason, source: str = "hardware-io"
+) -> ActuatorState:
+    """One ActuatorState, shaped like what hardware-io actually publishes.
+    The level itself is irrelevant to _on_actuator_state — only reason and
+    actuator_id are — so a fixed PwmLevel(duty=0.0) stands in for all cases."""
+    now = datetime.now(UTC)
+    return ActuatorState(
+        message_id=uuid4(),
+        emitted_at=now,
+        source=source,
+        actuator_id=actuator_id,
+        level=PwmLevel(duty=0.0),
+        reason=reason,
+        since=now,
+    )
+
+
 class TestHeartbeat:
     """`_loop` publishes the liveness beacon hardware-io's interlock
     supervisor watches for (module docstring). Silence is deliberate in
@@ -300,6 +331,54 @@ class TestHeartbeat:
         samples = [s for m in engine.metrics.loop_beats.collect() for s in m.samples]
         beats = sum(s.value for s in samples if s.name == "bellasreef_loop_beats_total")
         assert beats == 2
+
+
+class TestActuatorStateForgetting:
+    """Finding 6: hardware-io restarts rebuild dark, but the engine's memory
+    said 0.8 — the 300s refresh then snapped a dark channel to curve duty in
+    one step, bypassing the slew. An autonomous state from hardware-io means
+    the scheduler's memory is no longer true."""
+
+    def test_autonomous_safe_state_forgets_the_channel(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "pca9685-0", duty=0.8)
+
+        engine._on_actuator_state(make_state("pca9685-0", reason="safe_state"))
+
+        assert "pca9685-0" not in engine.scheduler._last_duty  # cold again
+
+    def test_startup_and_latch_states_also_forget(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        for reason in ("startup", "interlock_latch"):
+            prime_scheduler_memory(engine, "ch", duty=0.5)
+            engine._on_actuator_state(make_state("ch", reason=reason))
+            assert "ch" not in engine.scheduler._last_duty
+
+    def test_commanded_state_does_not_forget(self) -> None:
+        """'commanded' states are echoes of our own publishes — forgetting on
+        them would cold-start every channel on every command and defeat the
+        deadband."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "ch", duty=0.5)
+
+        engine._on_actuator_state(make_state("ch", reason="commanded"))
+
+        assert engine.scheduler._last_duty.get("ch") == 0.5
+
+    def test_manual_override_state_does_not_forget(self) -> None:
+        """Pins the frozenset's boundary explicitly. 'manual_override' is a
+        real StateReason the contract defines, but it names a person's action
+        — already communicated through this engine's own override machinery
+        — not something hardware-io decided autonomously; hardware-io's
+        _TRIP_STATE_REASON never emits it. Forgetting on it would be wrong
+        for the same reason as 'commanded': it is not evidence the scheduler's
+        memory has gone stale."""
+        engine = ControlEngine([profile()], metrics_port=0)
+        prime_scheduler_memory(engine, "ch", duty=0.5)
+
+        engine._on_actuator_state(make_state("ch", reason="manual_override"))
+
+        assert engine.scheduler._last_duty.get("ch") == 0.5
 
 
 class TestClockTrustGate:

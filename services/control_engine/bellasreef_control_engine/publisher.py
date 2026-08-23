@@ -28,6 +28,7 @@ from uuid import uuid4
 import nats
 from bellasreef_contracts import (
     ActuatorCommand,
+    ActuatorState,
     DeviceAssignment,
     PwmLevel,
     SensorAlert,
@@ -312,6 +313,34 @@ class CommandPublisher:
 
         await self._nc.subscribe(subjects.ALL_ASSIGNMENTS, cb=_on_message)
         log.info("subscribed to assignments", extra={"subject": subjects.ALL_ASSIGNMENTS})
+
+    async def subscribe_states(self, handler: Callable[[ActuatorState], None]) -> None:
+        """Live actuator-state traffic, on core pub/sub.
+
+        Same transport note as subscribe_assignments: a JetStream publish
+        traverses core subjects too, so this hears every state hardware-io
+        publishes without a durable to leak. Malformed payloads are dropped
+        with a log; parsing and handling are guarded separately so a handler
+        that raises cannot kill the subscription silently.
+        """
+        if self._nc is None:
+            raise RuntimeError("publisher not connected")
+
+        async def _on_message(msg: Msg) -> None:
+            try:
+                state = ActuatorState.model_validate_json(msg.data)
+            except ValidationError:
+                log.warning(
+                    "dropping an undecodable actuator state", extra={"subject": msg.subject}
+                )
+                return
+            try:
+                handler(state)
+            except Exception:  # broad by design - see docstring
+                log.exception("state handling failed", extra={"subject": msg.subject})
+
+        await self._nc.subscribe(subjects.ALL_STATE, cb=_on_message)
+        log.info("subscribed to actuator state", extra={"subject": subjects.ALL_STATE})
 
     async def heartbeat(self, interval_s: float) -> None:
         """Core pub/sub, never JetStream.
