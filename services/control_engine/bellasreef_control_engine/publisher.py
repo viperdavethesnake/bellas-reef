@@ -131,7 +131,18 @@ class CommandPublisher:
 
     @property
     def connected(self) -> bool:
-        return self._js is not None
+        """The client's word, not the handle's.
+
+        ``self._js is not None`` stays True through every RECONNECTING
+        window — ``connect()`` only ever clears it in :meth:`close`, never on
+        a mid-run drop — so the ``_publish`` "no_spine" suppression gate this
+        backs waved commands into a dead broker, and the PubAck timeout that
+        followed unwound ``_tick`` and crash-looped the engine (2026-08-23
+        finding 8). ``nats-py`` maintains ``Client.is_connected`` across
+        RECONNECTING on its own, so asking the client directly is honest
+        where asking the handle was not.
+        """
+        return self._nc is not None and self._nc.is_connected
 
     def build_pwm_command(
         self, channel_id: str, duty: float, *, reason: str, now: datetime | None = None

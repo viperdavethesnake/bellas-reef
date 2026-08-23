@@ -77,12 +77,24 @@ class _FakePublisher(CommandPublisher):
         #: When True, heartbeat() raises instead of counting — proves a
         #: failed publish is logged and does not kill the loop.
         self.fail_heartbeats = False
+        #: Backs `connected` — settable so tests can simulate the spine
+        #: being down (Task 3, 2026-08-23 finding 8) without a real client.
+        self._connected = True
+        #: One-shot exception for emit() to raise, then clear itself. See
+        #: fail_emits_with.
+        self._emit_exception: Exception | None = None
 
     @property
     def connected(self) -> bool:
-        return True
+        return self._connected
+
+    def fail_emits_with(self, exc: Exception) -> None:
+        self._emit_exception = exc
 
     async def emit(self, command: ActuatorCommand) -> None:
+        if self._emit_exception is not None:
+            exc, self._emit_exception = self._emit_exception, None
+            raise exc
         self.published.append(command)
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
@@ -304,6 +316,27 @@ def prime_expired_hold(
     return override
 
 
+def prime_due_intent(engine: ControlEngine, channel_id: str, *, duty: float) -> None:
+    """Make ``scheduler.due()`` surface an ``Intent`` for ``channel_id`` at
+    ``duty`` on the very next ``_tick`` — adopting the channel and holding
+    it via an override, the same no-profile-needed path
+    ``TestHeldUnprofiledChannelPublishes`` uses."""
+    engine.assignments.apply(_assignment(channel_id, adopted=True))
+    engine._held[channel_id] = ActiveOverride(
+        id=uuid4(),
+        target=channel_id,
+        duty=duty,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+
+def scheduler_has_no_emission_recorded(engine: ControlEngine, channel_id: str) -> bool:
+    """True when ``mark_emitted`` has never run for ``channel_id`` — the
+    scheduler's own emission memory, checked directly rather than via
+    ``due()`` so the assertion doesn't depend on a second tick."""
+    return channel_id not in engine.scheduler._last_duty
+
+
 def make_state(
     actuator_id: str, *, reason: StateReason, source: str = "hardware-io"
 ) -> ActuatorState:
@@ -464,6 +497,37 @@ class TestClockTrustGate:
         # _refresh_clock_trust when the flag flips.
         engine.scheduler.reset()
         assert len(engine.scheduler.due(now)) == 1
+
+
+class TestSpineHealthGate:
+    """``health()`` (Task 3, 2026-08-23 finding 8) already consulted
+    ``publisher.connected`` before this fix — the lying part was
+    ``connected`` itself (it asked ``_js is not None``, which stayed True
+    through a RECONNECTING window), not this gate. Fixing the property
+    fixes the health report for free; these lock the existing wiring in
+    with an explicit assertion instead of leaving it implicit."""
+
+    def test_health_is_503_when_the_spine_is_not_connected(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        engine._clock_trusted = True
+        fake = _FakePublisher()
+        fake._connected = False
+        engine.publisher = fake
+
+        health = engine.health()
+
+        assert health.healthy is False
+        assert health.reason == "spine not connected"
+
+    def test_health_is_ok_when_the_spine_is_connected(self) -> None:
+        engine = ControlEngine([profile()], metrics_port=0)
+        engine._clock_trusted = True
+        engine.publisher = _FakePublisher()
+
+        health = engine.health()
+
+        assert health.healthy is True
+        assert health.reason == "ok"
 
 
 class TestAssignmentGate:
@@ -1017,6 +1081,56 @@ class TestOverrideStoreOutage:
 
         warnings = [r for r in caplog.records if "override reload failed" in r.message]
         assert len(warnings) == 1  # one log per outage, not per failing tick
+
+
+class TestPublishFailureSuppression:
+    """`_publish` (Task 3, 2026-08-23 finding 8): a PubAck timeout during a
+    NATS restart used to unwind `_tick` and crash-loop the engine, with
+    `health()` reporting "spine ok" the whole window because `connected`
+    only checked the handle, not the client (see TestSpineHealthGate and
+    test_publisher.py's TestConnectedProperty for that half of the fix)."""
+
+    def test_publish_failure_suppresses_instead_of_killing(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        engine, published = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        fake.fail_emits_with(TimeoutError("nats: request timeout"))
+        prime_due_intent(engine, "pca9685-0", duty=0.5)
+
+        asyncio.run(engine._tick(datetime.now(UTC)))  # must not raise
+
+        assert published == []  # nothing landed
+        assert scheduler_has_no_emission_recorded(engine, "pca9685-0")  # mark_emitted skipped
+
+        samples = [s for m in engine.metrics.suppressed.collect() for s in m.samples]
+        suppressed_total = sum(
+            s.value
+            for s in samples
+            if s.name == "bellasreef_commands_suppressed_total"
+            and s.labels.get("cause") == "publish_failed"
+        )
+        assert suppressed_total == 1.0
+
+    def test_publish_recovers_on_the_next_tick(
+        self, engine_with_fake_publisher: tuple[ControlEngine, list[ActuatorCommand]]
+    ) -> None:
+        """The suppression is a retry, not a permanent drop: once the broker
+        answers again, the very next tick's intent is still due (mark_emitted
+        never ran) and lands normally."""
+        engine, published = engine_with_fake_publisher
+        fake = engine.publisher
+        assert isinstance(fake, _FakePublisher)
+        fake.fail_emits_with(TimeoutError("nats: request timeout"))
+        prime_due_intent(engine, "pca9685-0", duty=0.5)
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert published == []
+
+        asyncio.run(engine._tick(datetime.now(UTC)))
+        assert [c.actuator_id for c in published] == ["pca9685-0"]
+        assert published[0].level.duty == pytest.approx(0.5)  # type: ignore[union-attr]
 
 
 class TestReconnectReDrain:

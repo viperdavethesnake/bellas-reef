@@ -693,7 +693,25 @@ class ControlEngine:
         command = self.publisher.build_pwm_command(
             intent.channel_id, intent.duty, reason=f"lighting:{intent.reason}", now=now
         )
-        await self.publisher.emit(command)
+        try:
+            await self.publisher.emit(command)
+        except Exception:
+            # A broker blip mid-publish (2026-08-23 finding 8: a PubAck
+            # timeout during a NATS restart used to unwind _tick and
+            # crash-loop the engine, with health reporting "spine ok" for
+            # the whole window because `connected` only checked the handle,
+            # not the client — see CommandPublisher.connected). Suppress and
+            # let the next tick retry: mark_emitted must not run below
+            # (recording an emission the broker never accepted would make
+            # the scheduler skip the next one), and the engine staying alive
+            # is what lets the retry exist at all.
+            self.metrics.suppressed.labels("publish_failed").inc()
+            log.warning(
+                "command publish failed; will retry next tick",
+                extra={"actuator_id": intent.channel_id},
+                exc_info=True,
+            )
+            return
 
         # Only after a successful publish. Recording an emission the broker
         # never accepted would make the scheduler skip the next one.
