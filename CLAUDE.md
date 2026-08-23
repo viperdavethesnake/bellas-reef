@@ -671,6 +671,21 @@ scale) — 1 mV agreement, Stage-2 method, same probe point. The spec's
 acceptance named `pi-pwm-0`; run on `pca9685-0` instead (the channel David
 adopted), which the cross-silicon agreement row above makes equivalent.
 
+Overrides over the schedule, same sitting (11:19–11:20 PDT), all PASSED:
+
+| Test | Audit row | Meter |
+|---|---|---|
+| Snap hold 15 % | `override.created` duty 0.15, transition snap, 15 min | **0.496 V** = 0.15 × 3.307, exact |
+| Snap release | `override.released`, reason manual | **2.645 V** = curve-now 80.0 % |
+| Ramp hold 15 % + release | duty 0.15 transition ramp; released manual | both legs agreed |
+
+Three-way agreement throughout: audit log, engine publications, meter. The
+released-with-reason rows also close the old E1 audit check. One reading
+mid-test looked like a discrepancy (commanded "20 %", measured 0.496 V);
+the audit said duty 0.15 and David confirmed 15 % was the actual input —
+the stack was exact, the memory wasn't, and the audit log settled it, which
+is the point of having one.
+
 **Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
