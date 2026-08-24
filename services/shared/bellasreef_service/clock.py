@@ -26,10 +26,13 @@ __all__ = ["ASSUME_TRUSTED_ENV", "clock_is_trusted", "kernel_clock_synchronised"
 
 log = get_logger(__name__)
 
-#: Explicit opt-in for environments with no `timedatectl` — inside a container,
-#: where the host guarantees trust by ordering the stack After=time-sync.target.
-#: Explicit on purpose: silently assuming a good clock is the failure being
-#: guarded against.
+#: Explicit opt-in for environments where NEITHER oracle answers — no
+#: `timedatectl` and no working `adjtimex(2)`. As of the 2026-08-23 flip that
+#: is no longer "inside a container" (the kernel oracle decides there now,
+#: proven live on the Pi); it is the dev-machine case, e.g. macOS, where
+#: libc has no adjtimex. `deploy/compose.yaml` no longer sets this — only
+#: `.env.local` on the Mac does. Explicit on purpose: silently assuming a
+#: good clock is the failure being guarded against.
 ASSUME_TRUSTED_ENV = "BELLASREEF_ASSUME_CLOCK_TRUSTED"
 
 #: adjtimex(2) return value meaning "clock not synchronised" (TIME_ERROR, aka
@@ -101,10 +104,11 @@ def kernel_clock_synchronised() -> bool | None:
     container, where timedatectl is not. Returns None where the syscall is
     unavailable (dev Mac) or fails — unknown is an answer, a guess is not.
 
-    Shadow-mode oracle only (2026-08-23, task 4): nothing gates on this yet.
-    ``clock_is_trusted()`` below logs when the two disagree so the oracle can
-    be trusted against real logs before enforcement is ever switched to it —
-    see the PR-body note for the flip David has yet to rule on.
+    Promoted into ``clock_is_trusted()``'s decision chain 2026-08-23 (David's
+    ruling to flip): it ran in shadow mode only from task 4 until then, and
+    was proven live in-container on the Pi the day of the flip (returned
+    True, no seccomp block). It now decides trust for every container, where
+    timedatectl is unreachable — the production path.
     """
     if _libc is None or not hasattr(_libc, "adjtimex"):
         return None
@@ -137,12 +141,17 @@ def _log_shadow_disagreement(*, kernel: bool | None, returned: bool) -> None:
         return
     _last_shadow = kernel
     log.warning(
-        "kernel clock oracle disagrees with clock_is_trusted() (shadow mode, not enforced)",
+        "kernel clock oracle disagrees with timedatectl (timedatectl's answer is used here; "
+        "the oracle only decides when timedatectl is unreachable)",
         extra={"event": "clock_shadow_disagreement", "kernel": kernel, "returned": returned},
     )
 
 
-def _timedatectl_says_trusted() -> bool:
+def _timedatectl_says_trusted() -> bool | None:
+    """Ask systemd. Returns ``None`` when timedatectl itself is unreachable —
+    missing binary, timeout, or a nonzero exit — as distinct from a real
+    answer, so ``clock_is_trusted()`` below can tell "no systemd here" (every
+    container) from "systemd says no" (a host that has drifted)."""
     try:
         out = subprocess.run(
             ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
@@ -152,13 +161,46 @@ def _timedatectl_says_trusted() -> bool:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return os.environ.get(ASSUME_TRUSTED_ENV) == "1"
+        return None
     if out.returncode != 0:
-        return os.environ.get(ASSUME_TRUSTED_ENV) == "1"
+        return None
     return out.stdout.strip().lower() == "yes"
 
 
 def clock_is_trusted() -> bool:
-    result = _timedatectl_says_trusted()
-    _log_shadow_disagreement(kernel=kernel_clock_synchronised(), returned=result)
-    return result
+    """Decision chain, promoted out of shadow mode 2026-08-23 (David
+    delegated the flip; the kernel oracle ran in shadow since task 4 and was
+    proven live in-container on the Pi that day — returned True, no seccomp
+    block on adjtimex).
+
+    1. ``timedatectl`` answers -> its answer wins (host runs, CI runners with
+       systemd — there is a real ``NTPSynchronized`` property to read).
+    2. ``timedatectl`` is unreachable (every container: there is no systemd
+       inside one) and the kernel oracle answers -> the oracle decides. This
+       is the production path now.
+    3. Neither answers (macOS dev: no timedatectl, and libc has no adjtimex)
+       -> the ``BELLASREEF_ASSUME_CLOCK_TRUSTED`` env override, which is now
+       only a dev-machine fallback — ``.env.local`` on the Mac is the only
+       place still setting it; `deploy/compose.yaml` no longer does.
+    4. Nothing answers -> False.
+
+    The failure direction is by design: this board has no RTC battery, so an
+    oracle that says "not synchronised" (or nothing answering at all) must
+    refuse rather than guess — commands come back ``rejected_clock`` and
+    lighting holds stop advancing (dark, not lit wrong) until chrony syncs.
+
+    Shadow-disagreement logging is kept only on the timedatectl-decides
+    branch (step 1) — that is the only branch where the oracle is a *second*
+    opinion rather than *the* decision, so it is the only branch with
+    anything left to shadow.
+    """
+    timedatectl_result = _timedatectl_says_trusted()
+    if timedatectl_result is not None:
+        _log_shadow_disagreement(kernel=kernel_clock_synchronised(), returned=timedatectl_result)
+        return timedatectl_result
+
+    kernel_result = kernel_clock_synchronised()
+    if kernel_result is not None:
+        return kernel_result
+
+    return os.environ.get(ASSUME_TRUSTED_ENV) == "1"

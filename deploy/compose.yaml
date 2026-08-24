@@ -129,11 +129,14 @@ services:
       # probe, serves metrics, logs a clean startup, and publishes nothing at
       # all. See CLAUDE.md, "Dev environment".
       BELLASREEF_NATS_URL: nats://nats:4222
-      # No timedatectl inside the container. Clock trust is guaranteed by the
-      # host: the compose stack is started by a systemd unit ordered
-      # After=time-sync.target. Making that an explicit opt-in rather than a
-      # silent default is the point — see docs/host-setup.md.
-      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
+      # No timedatectl inside the container, so clock trust here is decided
+      # by the kernel oracle (adjtimex(2), visible from inside a container
+      # where systemd is not) — promoted out of shadow mode 2026-08-23,
+      # David's ruling to flip, proven live in-container on the Pi that day.
+      # BELLASREEF_ASSUME_CLOCK_TRUSTED is no longer set here: it is now only
+      # the dev-machine fallback for when neither oracle answers (macOS),
+      # honoured in code but not needed on this hardware. See
+      # bellasreef_service/clock.py.
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
       BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
     # Deliberately NOT published. health + metrics ride the compose network
@@ -175,9 +178,9 @@ services:
       # livestock, without the ~100 s wait David ruled out at the bench
       # (2026-08-17: 0.01 was "way too slow" for a manual ramp).
       BELLASREEF_MAX_DUTY_DELTA_PER_S: "0.05"
-      # No timedatectl in the container; the host guarantees clock trust by
-      # ordering the stack After=time-sync.target. Explicit, never assumed.
-      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
+      # No timedatectl in the container; the kernel oracle decides clock
+      # trust here — see the hardware-io environment block above for the
+      # full note. BELLASREEF_ASSUME_CLOCK_TRUSTED is no longer set here.
       BELLASREEF_LIVENESS_TIMEOUT_S: "15"
       BELLASREEF_METRICS_PORT: "9102"
       BELLASREEF_LOG_LEVEL: ${BELLASREEF_LOG_LEVEL:-INFO}
@@ -198,13 +201,12 @@ services:
     environment:
       BELLASREEF_DATABASE_URL: ${BELLASREEF_DATABASE_URL:?}
       BELLASREEF_NATS_URL: nats://nats:4222
-      # No timedatectl in the container; the host guarantees clock trust by
-      # ordering the stack After=time-sync.target — same declaration the other
-      # two app services carry. Its absence here 503'd every createOverride
-      # (found live 2026-08-15, the lighting screen's first real hold): the
-      # api is the service that clock-gates override deadlines, and it was
-      # the one service not told the host had vouched for the clock.
-      BELLASREEF_ASSUME_CLOCK_TRUSTED: "1"
+      # No timedatectl in the container; the kernel oracle decides clock
+      # trust here — same as the other two app services (see hardware-io's
+      # environment block above). This is the service that clock-gates
+      # override deadlines (found live 2026-08-15: an unset override 503'd
+      # every createOverride before that was fixed) — BELLASREEF_ASSUME_
+      # CLOCK_TRUSTED is no longer what closes that gap; the oracle is.
       # The telemetry writer lives here: it needs the spine to read and Postgres
       # to resolve each device's control_authority (docs/device-classes.md §4).
       BELLASREEF_VM_URL: http://victoria-metrics:8428
