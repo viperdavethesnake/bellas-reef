@@ -1,0 +1,70 @@
+[1m▶ checking the tree is deployable[0m
+  7103c80f on origin/main
+[1m▶ reading the contract version this commit ships[0m
+  contracts 4.2.0
+[1m▶ checking CI is green for this commit[0m
+  CI success
+[1m▶ resetting bellasreef.local:/home/david/bellasreef to 7103c80f[0m
+7103c80 feat(clock): the kernel oracle decides in containers — RTC-less protection goes live (#70)
+[1m▶ checking the ghcr.io pull credential[0m
+[1m▶ pulling images tagged 7103c80f[0m
+ Image ghcr.io/viperdavethesnake/bellasreef-hardware-io:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulling 
+ Image ghcr.io/viperdavethesnake/bellasreef-control-engine:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulling 
+ Image ghcr.io/viperdavethesnake/bellasreef-api:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulling 
+ Image ghcr.io/viperdavethesnake/bellasreef-hardware-io:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulled 
+ Image ghcr.io/viperdavethesnake/bellasreef-control-engine:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulled 
+ Image ghcr.io/viperdavethesnake/bellasreef-api:7103c80f8e8f743da9cea1e8322e3808514c2b5c Pulled 
+[1m▶ recording pulled image digests[0m
+  hardware-io      ghcr.io/viperdavethesnake/bellasreef-hardware-io@sha256:4d40f1e5f71b8d2029f9f8fc8cbb6fcd85921d063664b0f10aef1039ab33968c
+  control-engine   ghcr.io/viperdavethesnake/bellasreef-control-engine@sha256:5c41c3e7b1279649f3a72bc333e9fb5aea257d4fdbb673c0ceb92368f01c3065
+  api              ghcr.io/viperdavethesnake/bellasreef-api@sha256:213586202b9b88b9d099ad0499de18662c0de4b82252e688f824d61c6cb841e1
+[1m▶ applying migrations[0m
+ Container bellasreef-nats-1 Healthy 
+ Container bellasreef-api-run-9af3cec251b2 Creating 
+ Container bellasreef-api-run-9af3cec251b2 Created 
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+[1m▶ pointing the boot unit at 7103c80f[0m
+[1m▶ installing unit files[0m
+[1m▶ installing the discovery record[0m
+  advertising contracts=4.2.0
+[1m▶ stopping any legacy host units[0m
+[1m▶ starting the app containers[0m
+ Container bellasreef-control-engine-1 Running 
+ Container bellasreef-api-1 Running 
+ Container bellasreef-nats-1 Running 
+ Container bellasreef-postgres-1 Running 
+ Container bellasreef-victoria-metrics-1 Running 
+ Container bellasreef-hardware-io-1 Running 
+ Container bellasreef-nats-1 Waiting 
+ Container bellasreef-postgres-1 Waiting 
+ Container bellasreef-nats-1 Waiting 
+ Container bellasreef-nats-1 Waiting 
+ Container bellasreef-postgres-1 Waiting 
+ Container bellasreef-nats-1 Healthy 
+ Container bellasreef-nats-1 Healthy 
+ Container bellasreef-postgres-1 Healthy 
+ Container bellasreef-nats-1 Healthy 
+ Container bellasreef-postgres-1 Healthy 
+ Container bellasreef-hardware-io-1 Waiting 
+ Container bellasreef-control-engine-1 Waiting 
+ Container bellasreef-api-1 Waiting 
+ Container bellasreef-nats-1 Waiting 
+ Container bellasreef-postgres-1 Waiting 
+ Container bellasreef-victoria-metrics-1 Waiting 
+ Container bellasreef-postgres-1 Healthy 
+ Container bellasreef-control-engine-1 Healthy 
+ Container bellasreef-api-1 Healthy 
+ Container bellasreef-victoria-metrics-1 Healthy 
+ Container bellasreef-nats-1 Healthy 
+ Container bellasreef-hardware-io-1 Healthy 
+[1m▶ enabling the boot unit[0m
+[1m▶ starting the boot unit[0m
+[1m▶ container status[0m
+  hardware-io      running
+  control-engine   running
+  api              running
+[1m▶ checking the API answers and speaks the contract we just shipped[0m
+  /info 200 · contracts 4.2.0 · 2 paired client(s)
+[1m▶ waiting for a fresh sample on the wire[0m
+[32m✓ deployed 7103c80f — API answering at contracts 4.2.0, fresh sample on the wire (28.25])[0m
