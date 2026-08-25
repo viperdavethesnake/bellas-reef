@@ -734,6 +734,81 @@ class TestAudit:
         assert unassigned_detail["channel_id"] == "led-blue"
         assert unassigned_detail["schedule_id"] == assigned_detail["schedule_id"]
 
+    def test_moving_a_channel_writes_unassigned_for_the_old_schedule(self) -> None:
+        """Reassigning a channel is a departure and an arrival, and the old
+        schedule's history must show the departure (rehearsal follow-up,
+        2026-08-25). ``assign`` replaces silently at the store layer, so
+        without this row the old schedule's audit trail shows the channel
+        arriving and never leaving."""
+
+        async def scenario() -> tuple[Audit, str, str]:
+            engine = await fresh_engine()
+            await seed_device(engine, "led-blue", "authoritative")
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                first = (
+                    await c.post("/api/v1/lighting/schedules", headers=headers, json=curve())
+                ).json()
+                second = (
+                    await c.post(
+                        "/api/v1/lighting/schedules",
+                        headers=headers,
+                        json=curve(name="amber-dusk"),
+                    )
+                ).json()
+                await c.put(
+                    "/api/v1/lighting/channels/led-blue/schedule",
+                    headers=headers,
+                    json={"schedule_id": first["id"]},
+                )
+                await c.put(
+                    "/api/v1/lighting/channels/led-blue/schedule",
+                    headers=headers,
+                    json={"schedule_id": second["id"]},
+                )
+            await engine.dispose()
+            return audit, first["id"], second["id"]
+
+        audit, first_id, second_id = run(scenario)
+        assert audit.count("schedule.assigned") == 2
+        assert audit.count("schedule.unassigned") == 1
+        detail = audit.detail("schedule.unassigned")
+        assert detail["channel_id"] == "led-blue"
+        assert detail["schedule_id"] == first_id, "the row names the OLD schedule"
+        assert detail["moved_to"] == second_id
+
+    def test_reassigning_the_same_schedule_writes_no_unassigned(self) -> None:
+        """Idempotent re-assign is not a move; no phantom departure row."""
+
+        async def scenario() -> Audit:
+            engine = await fresh_engine()
+            await seed_device(engine, "led-blue", "authoritative")
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                created = (
+                    await c.post("/api/v1/lighting/schedules", headers=headers, json=curve())
+                ).json()
+                for _ in range(2):
+                    await c.put(
+                        "/api/v1/lighting/channels/led-blue/schedule",
+                        headers=headers,
+                        json={"schedule_id": created["id"]},
+                    )
+            await engine.dispose()
+            return audit
+
+        audit = run(scenario)
+        assert audit.count("schedule.assigned") == 2
+        assert audit.count("schedule.unassigned") == 0
+
     def test_failed_mutations_write_no_audit_row(self) -> None:
         """A 409/422/404 must not leave a trail of a mutation that never
         happened."""

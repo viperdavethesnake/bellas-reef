@@ -2439,12 +2439,30 @@ def build_app(
                 status.HTTP_409_CONFLICT,
                 f"{channel_id!r} is registered observe_only and accepts no commands",
             )
+        # A reassign is a departure and an arrival. Look the old holder up
+        # before the assign overwrites it, so the old schedule's audit history
+        # shows the channel leaving (rehearsal follow-up, 2026-08-25).
+        previous = next(
+            (s.id for s in await schedules.list() if channel_id in s.assigned_channels),
+            None,
+        )
         try:
             await schedules.assign(channel_id, body.schedule_id)
         except KeyError as exc:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, f"no schedule {body.schedule_id}"
             ) from exc
+        if previous is not None and previous != body.schedule_id:
+            await sink(
+                "schedule.unassigned",
+                {
+                    "channel_id": channel_id,
+                    "schedule_id": str(previous),
+                    "moved_to": str(body.schedule_id),
+                    "actor": str(actor),
+                },
+                category="config",
+            )
         await sink(
             "schedule.assigned",
             {"channel_id": channel_id, "schedule_id": str(body.schedule_id), "actor": str(actor)},
