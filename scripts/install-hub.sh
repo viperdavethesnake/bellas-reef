@@ -698,7 +698,19 @@ ih_phase3_hardware() {
                     printf '      dtoverlay=w1-gpio,gpiopin=4\n'
                 fi
             fi
-            (( pwm_ok )) || printf '      dtoverlay=pwm-4chan\n'
+            # pwm-4chan is our custom overlay, compiled on the Pi 5 with dtc
+            # (docs/host-setup.md §9) — it names RP1 hardware and is not in
+            # the stock overlay set. On older Pis hardware-io cannot use SoC
+            # PWM at all (discover_pwm is pinned to the RP1 device), so the
+            # honest advice there is the PCA9685-over-I2C path, not an
+            # overlay that does not exist.
+            if (( ! pwm_ok )); then
+                if [[ "$board" == "pi5" ]]; then
+                    printf '      dtoverlay=pwm-4chan\n'
+                else
+                    ih_warn "SoC PWM is Pi 5-only in this stack; use a PCA9685 over I2C for PWM on this board."
+                fi
+            fi
             ih_warn "Never put a trailing # comment on those lines; the parser folds it in."
             ih_warn "Then reboot and run this script again."
             ;;

@@ -1679,6 +1679,24 @@ def test_phase3_flags_pwm_chips_with_no_muxed_pins(tmp_path: Path) -> None:
     assert "dtoverlay=pwm-4chan" in result.stdout
 
 
+def test_phase3_never_advises_pwm4chan_on_a_non_pi5(tmp_path: Path) -> None:
+    # pwm-4chan is OUR overlay, compiled on the Pi 5 with dtc (host-setup §9).
+    # It is not in the stock overlay set and names RP1 hardware a BCM2837 does
+    # not have — and hardware-io's discover_pwm() is hard-pinned to the RP1
+    # device anyway, so SoC PWM on an older Pi is unusable by the stack no
+    # matter what overlay is loaded. A 3B+ owner must be pointed at the
+    # PCA9685-over-I2C path, not at an overlay that does not exist. The
+    # 1-Wire advice above it already branches per board; this is its twin.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
+    root = full_root(tmp_path)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "dtoverlay=pwm-4chan" not in result.stdout, result.stdout
+    assert "PCA9685" in result.stdout, "the operator needs the path that works, not just a gap"
+
+
 def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
