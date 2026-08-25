@@ -809,6 +809,36 @@ class TestAudit:
         assert audit.count("schedule.assigned") == 2
         assert audit.count("schedule.unassigned") == 0
 
+    def test_audit_actor_is_the_client_name_not_a_uuid(self) -> None:
+        """Checkpoint D observation (rehearsal 2026-08-24): a bare UUID names
+        nobody. ``actor`` carries the paired client's name; ``actor_id`` keeps
+        the UUID for identity."""
+
+        async def scenario() -> Audit:
+            engine = await fresh_engine()
+            await seed_device(engine, "led-blue", "authoritative")
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(app)  # pairs as "phone"
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                created = (
+                    await c.post("/api/v1/lighting/schedules", headers=headers, json=curve())
+                ).json()
+                await c.put(
+                    "/api/v1/lighting/channels/led-blue/schedule",
+                    headers=headers,
+                    json={"schedule_id": created["id"]},
+                )
+            await engine.dispose()
+            return audit
+
+        audit = run(scenario)
+        detail = audit.detail("schedule.assigned")
+        assert detail["actor"] == "phone"
+        uuid.UUID(detail["actor_id"])  # parses, or raises
+
     def test_failed_mutations_write_no_audit_row(self) -> None:
         """A 409/422/404 must not leave a trail of a mutation that never
         happened."""

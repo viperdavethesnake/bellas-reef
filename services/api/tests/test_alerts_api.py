@@ -178,7 +178,10 @@ class TestThresholdConfiguration:
             "minimum": 24.0,
             "maximum": 27.0,
             "clear_margin": 0.5,
-            "actor": client_id,
+            # The resolved name plus the durable id — a bare UUID names nobody
+            # (rehearsal 2026-08-24, checkpoint D).
+            "actor": "phone",
+            "actor_id": client_id,
             # Setting a full band closes nothing (see TestClearingABandClosesItsEpisode).
             "closed_open_episode": False,
             "closed_bounds": [],

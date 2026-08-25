@@ -990,6 +990,18 @@ def build_app(
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "client revoked")
         return client_id
 
+    async def actor_fields(client_id: UUID) -> dict[str, str]:
+        """Resolved operator identity for audit payloads.
+
+        The audit column shows ``actor`` verbatim, and a bare UUID names
+        nobody (rehearsal 2026-08-24, checkpoint D). ``actor_id`` keeps the
+        durable identity — names are the client's to choose, ids are not.
+        Resolved at write time on purpose: rows are append-only, so the name
+        recorded is point-in-time truth.
+        """
+        name = await store.client_name(client_id)
+        return {"actor": name or str(client_id), "actor_id": str(client_id)}
+
     # ---------------------------------------------------------- unauthenticated
 
     @app.get("/healthz", tags=["ops"], operation_id="health")
@@ -1454,7 +1466,9 @@ def build_app(
         CLI.
         """
         await store.revoke(actor)
-        await sink("client.revoked", {"client_id": str(actor), "actor": str(actor), "self": True})
+        await sink(
+            "client.revoked", {"client_id": str(actor), **await actor_fields(actor), "self": True}
+        )
         return {"status": "revoked"}
 
     @app.delete(
@@ -1477,7 +1491,16 @@ def build_app(
         """
         if not await store.revoke(client_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or already revoked")
-        await sink("client.revoked", {"client_id": str(client_id), "revoked_by": str(actor)})
+        # The actor-shaped field here is ``revoked_by``; resolved the same way
+        # ``actor`` is everywhere else, with the UUID kept beside it.
+        await sink(
+            "client.revoked",
+            {
+                "client_id": str(client_id),
+                "revoked_by": (await store.client_name(actor)) or str(actor),
+                "revoked_by_id": str(actor),
+            },
+        )
         return {"status": "revoked"}
 
     # ----------------------------------------------------------- hardware
@@ -1626,7 +1649,7 @@ def build_app(
                 "driver_type": body.driver_type,
                 "channel": body.channel,
                 "created": created,
-                "actor": str(actor),
+                **await actor_fields(actor),
             },
             category="config",
         )
@@ -1681,7 +1704,11 @@ def build_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such device")
         await sink(
             "device.renamed",
-            {"device_id": device_id, "display_name": body.display_name, "actor": str(actor)},
+            {
+                "device_id": device_id,
+                "display_name": body.display_name,
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return DeviceNameView(device_id=row["device_id"], display_name=row["display_name"])
@@ -1754,7 +1781,7 @@ def build_app(
                 "device_id": row["device_id"],
                 "driver_type": row["driver_type"],
                 "binding": row["binding"],
-                "actor": str(actor),
+                **await actor_fields(actor),
             },
             category="config",
         )
@@ -1817,7 +1844,7 @@ def build_app(
 
         await sink(
             "device.bound",
-            {"device_id": device_id, "readopt": True, "actor": str(actor)},
+            {"device_id": device_id, "readopt": True, **await actor_fields(actor)},
             category="config",
         )
         full = next(d for d in await store.list_devices() if d["device_id"] == device_id)
@@ -1872,7 +1899,7 @@ def build_app(
             )
         await sink(
             "device.forgotten",
-            {"device_id": device_id, "actor": str(actor)},
+            {"device_id": device_id, **await actor_fields(actor)},
             category="config",
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -2081,7 +2108,7 @@ def build_app(
                 "minimum": body.minimum,
                 "maximum": body.maximum,
                 "clear_margin": body.clear_margin,
-                "actor": str(actor),
+                **await actor_fields(actor),
                 "closed_open_episode": bool(closed_bounds),
                 "closed_bounds": closed_bounds,
             },
@@ -2201,7 +2228,7 @@ def build_app(
                     "target": displaced.target,
                     "reason": "superseded",
                     "superseded_by": str(placed.id),
-                    "actor": str(actor),
+                    **await actor_fields(actor),
                 },
                 category="command",
             )
@@ -2212,7 +2239,7 @@ def build_app(
                 "target": placed.target,
                 "duty": placed.duty,
                 "expires_at": placed.expires_at.isoformat(),
-                "actor": str(actor),
+                **await actor_fields(actor),
                 "transition": placed.transition,
             },
             category="command",
@@ -2247,7 +2274,7 @@ def build_app(
                 "override_id": str(override_id),
                 "target": target,
                 "reason": "manual",
-                "actor": str(actor),
+                **await actor_fields(actor),
             },
             category="command",
         )
@@ -2311,7 +2338,11 @@ def build_app(
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         await sink(
             "schedule.created",
-            {"schedule_id": str(stored.id), "name": stored.definition.name, "actor": str(actor)},
+            {
+                "schedule_id": str(stored.id),
+                "name": stored.definition.name,
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return _schedule_view(stored)
@@ -2361,7 +2392,11 @@ def build_app(
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         await sink(
             "schedule.updated",
-            {"schedule_id": str(stored.id), "name": stored.definition.name, "actor": str(actor)},
+            {
+                "schedule_id": str(stored.id),
+                "name": stored.definition.name,
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return _schedule_view(stored)
@@ -2394,7 +2429,11 @@ def build_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"no schedule {schedule_id}") from exc
         await sink(
             "schedule.deleted",
-            {"schedule_id": str(schedule_id), "name": stored.definition.name, "actor": str(actor)},
+            {
+                "schedule_id": str(schedule_id),
+                "name": stored.definition.name,
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -2459,13 +2498,17 @@ def build_app(
                     "channel_id": channel_id,
                     "schedule_id": str(previous),
                     "moved_to": str(body.schedule_id),
-                    "actor": str(actor),
+                    **await actor_fields(actor),
                 },
                 category="config",
             )
         await sink(
             "schedule.assigned",
-            {"channel_id": channel_id, "schedule_id": str(body.schedule_id), "actor": str(actor)},
+            {
+                "channel_id": channel_id,
+                "schedule_id": str(body.schedule_id),
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return _schedule_view(await schedules.get(body.schedule_id))
@@ -2491,7 +2534,11 @@ def build_app(
         await schedules.unassign(channel_id)
         await sink(
             "schedule.unassigned",
-            {"channel_id": channel_id, "schedule_id": str(schedule_id), "actor": str(actor)},
+            {
+                "channel_id": channel_id,
+                "schedule_id": str(schedule_id),
+                **await actor_fields(actor),
+            },
             category="config",
         )
         return {"status": "unassigned"}

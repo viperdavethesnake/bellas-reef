@@ -185,11 +185,14 @@ class TestNaming:
         assert "device.renamed" in audit.events
         # Named by whom: the sink fills ``actor`` with ``api`` unless the detail
         # says otherwise, and a rename attributed to the process is no
-        # attribution at all.
+        # attribution at all. ``actor`` is the client's resolved name — a bare
+        # UUID names nobody (rehearsal 2026-08-24, checkpoint D) — and
+        # ``actor_id`` keeps the durable identity.
         assert audit.detail("device.renamed") == {
             "device_id": "probe",
             "display_name": "Frag tank",
-            "actor": client_id,
+            "actor": "phone",
+            "actor_id": client_id,
         }
 
     def test_a_whitespace_name_normalises_to_no_name(self) -> None:

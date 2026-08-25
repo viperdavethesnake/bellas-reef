@@ -92,13 +92,17 @@ async def announce(engine: AsyncEngine, source: str, channel: str) -> None:
 
 
 async def paired_client(
-    engine: AsyncEngine, *, audit: Audit | None = None, nats_url: str | None = None
+    engine: AsyncEngine,
+    *,
+    audit: Audit | None = None,
+    nats_url: str | None = None,
+    name: str | None = None,
 ) -> tuple[httpx.AsyncClient, dict[str, str], str]:
     """A client, its bearer headers, and the client id the hub paired it under."""
     app = build_app(engine, audit=audit or Audit(), nats_url=nats_url, vm_url=None)
     c = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://hub")
     granted = (
-        await c.post("/api/v1/pair", json={"client_name": f"t-{uuid.uuid4().hex[:6]}"})
+        await c.post("/api/v1/pair", json={"client_name": name or f"t-{uuid.uuid4().hex[:6]}"})
     ).json()
     minted = await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
     token = minted.json()["access_token"]
@@ -1183,14 +1187,19 @@ def test_every_device_config_event_names_the_client_that_did_it() -> None:
     ``api`` renaming, unbinding and forgetting devices — an actor that describes
     the process rather than the operator holding the phone. This walks one
     device through its whole lifecycle from one paired client and checks that
-    each event carries that client's id.
+    each event carries that client's identity.
+
+    Identity means the *name*, not the bare UUID: the rehearsal (2026-08-24,
+    checkpoint D) read ``device.bound`` rows whose actor named nobody. The
+    UUID stays alongside as ``actor_id`` — names are the client's to choose,
+    ids are not.
     """
 
     async def scenario() -> tuple[str, Audit]:
         engine = await fresh_engine()
         await announce(engine, "pi-pwm", "0")
         audit = Audit()
-        c, headers, client_id = await paired_client(engine, audit=audit)
+        c, headers, client_id = await paired_client(engine, audit=audit, name="bench-phone")
         try:
             await bind_light(c, headers, "pi-pwm-0", "0")
             renamed = await c.patch(
@@ -1222,16 +1231,21 @@ def test_every_device_config_event_names_the_client_that_did_it() -> None:
         "device.forgotten",
     ]
     for event, detail in config_records:
-        assert detail.get("actor") == client_id, (
-            f"{event} was audited without the acting client: {detail!r}. The sink "
-            "would fill in 'api', which names the process, not the operator."
+        assert detail.get("actor") == "bench-phone", (
+            f"{event} was audited without the acting client's name: {detail!r}. The "
+            "sink would fill in 'api', which names the process, not the operator — "
+            "and a bare UUID names nobody (rehearsal 2026-08-24, checkpoint D)."
+        )
+        assert detail.get("actor_id") == client_id, (
+            f"{event} lost the client's durable identity: {detail!r}"
         )
     # The readopt is the second device.bound; it must be attributed too, not
     # only the original binding.
     assert audit.details("device.bound")[1] == {
         "device_id": "pi-pwm-0",
         "readopt": True,
-        "actor": client_id,
+        "actor": "bench-phone",
+        "actor_id": client_id,
     }
 
 
