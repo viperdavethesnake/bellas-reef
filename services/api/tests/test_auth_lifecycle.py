@@ -10,6 +10,7 @@ are database behaviour, and a mocked store would prove none of it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -909,6 +910,7 @@ def test_auth_events_reach_bellasreef_audit_auth() -> None:
         from bellasreef_api.audit import NatsAuditSink
         from bellasreef_contracts import subjects
         from bellasreef_hardware_io.spine import Spine
+        from nats.js.errors import NotFoundError
 
         spine = Spine(os.environ[_NATS])
         await spine.connect()
@@ -917,31 +919,51 @@ def test_auth_events_reach_bellasreef_audit_auth() -> None:
         for consumer in await spine.js.consumers_info("BR_AUDIT"):
             await spine.js.delete_consumer("BR_AUDIT", consumer.name)
 
-        sub = await spine.js.pull_subscribe(
-            subjects.ALL_AUDIT, durable=f"auth-{uuid.uuid4().hex[:8]}", stream="BR_AUDIT"
-        )
+        # BR_AUDIT is a workqueue: one consumer per filter subject, and a
+        # durable outlives this process by design. This durable used to leak
+        # on every run — nothing ever deleted it — and a leaked one refuses
+        # every later subscriber ("filtered consumer not unique"), including
+        # the audit writer of whatever test runs next. Delete it on every
+        # exit path, not just the green one.
+        durable = f"auth-{uuid.uuid4().hex[:8]}"
+        sink = None
+        engine = None
+        try:
+            sub = await spine.js.pull_subscribe(
+                subjects.ALL_AUDIT, durable=durable, stream="BR_AUDIT"
+            )
 
-        sink = NatsAuditSink(os.environ[_NATS])
-        engine = await fresh_engine()
-        app = build_app(engine, audit=sink)
+            sink = NatsAuditSink(os.environ[_NATS])
+            engine = await fresh_engine()
+            app = build_app(engine, audit=sink)
 
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://hub"
-        ) as c:
-            granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
-            await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+                await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
 
-        msgs = await sub.fetch(10, timeout=5.0)
-        subjects_seen = [m.subject for m in msgs]
-        events = []
-        for m in msgs:
-            events.append(json.loads(m.data)["event"])
-            await m.ack()
-
-        await sink.close()
-        await engine.dispose()
-        await spine.close()
-        return len(msgs), events + subjects_seen
+            msgs = await sub.fetch(10, timeout=5.0)
+            subjects_seen = [m.subject for m in msgs]
+            events = []
+            for m in msgs:
+                events.append(json.loads(m.data)["event"])
+                await m.ack()
+            return len(msgs), events + subjects_seen
+        finally:
+            try:
+                # NotFoundError alone is fine here: it means pull_subscribe
+                # never created the durable, and raising would mask whatever
+                # made it fail. Any other deletion failure IS the leak this
+                # finally exists to prevent, so it propagates.
+                with contextlib.suppress(NotFoundError):
+                    await spine.js.delete_consumer("BR_AUDIT", durable)
+            finally:
+                if sink is not None:
+                    await sink.close()
+                if engine is not None:
+                    await engine.dispose()
+                await spine.close()
 
     count, seen = run(scenario)
     assert count >= 2, "pairing and token minting should both be audited"
