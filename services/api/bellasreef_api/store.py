@@ -838,6 +838,22 @@ class Store:
         async with self._engine.begin() as conn:
             await conn.execute(text("DELETE FROM paired_clients WHERE id = :id"), {"id": client_id})
 
+    async def client_name(self, client_id: UUID) -> str | None:
+        """The paired client's name, or None for a row that does not exist.
+
+        Read at audit-write time: audit rows are append-only, so the name
+        recorded is point-in-time truth and a later change never rewrites
+        history.
+        """
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT name FROM paired_clients WHERE id = :id"),
+                    {"id": client_id},
+                )
+            ).first()
+            return None if row is None else str(row[0])
+
     async def is_active(self, client_id: UUID) -> bool:
         async with self._engine.connect() as conn:
             row = (

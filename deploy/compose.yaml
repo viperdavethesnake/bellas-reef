@@ -225,6 +225,10 @@ services:
     volumes:
       # `bellasreef backup --out /backups/...` lands archives on the host here.
       - /home/david/backups:/backups
+      # Read-only: the device-import manifest the docs tell the operator to
+      # pass lives here on the host, and the documented command runs inside
+      # this container (rehearsal 2026-08-24, F1).
+      - /etc/bellasreef:/etc/bellasreef:ro
     restart: unless-stopped
 
 volumes:
