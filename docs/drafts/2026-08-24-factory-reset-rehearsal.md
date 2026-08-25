@@ -155,6 +155,8 @@ Findings, in the order hit:
   container. Worked around by `cat`-ing the manifest into the container's
   `/tmp` first. Fix is either a compose mount for `/etc/bellasreef` (ro) or
   correcting the documented command to the copy-in form.
+  RESOLVED 2026-08-25: `/etc/bellasreef` is now a read-only mount in the api
+  service (deploy/compose.yaml), so the documented command works as written.
 - **F2 — `/info.paired_client_count` counts clients *ever*, revoked
   included** (`total_clients_ever`; deliberate — TOFU keys on it so revoking
   everything cannot reopen first-use pairing). After the seed dance it reads
