@@ -401,7 +401,7 @@ if [[ $FOUND -eq 0 ]]; then
     die "no sensor sample reached VictoriaMetrics within 90s. The containers are up and the tank is not being monitored — this is exactly the state a process check would have called a successful deploy."
 fi
 
-latest="$(sed -n 's/.*"values":\[\([^,]*\).*/\1/p' <<<"$body" | tail -1)"
+latest="$(sed -n 's/.*"values":\[\([^],]*\).*/\1/p' <<<"$body" | tail -1)"
 
 printf '\033[32m✓ deployed %s — API answering at contracts %s, fresh sample on the wire (%s)\033[0m\n' \
     "${SHA:0:8}" "$CONTRACTS" "${latest:-ok}"

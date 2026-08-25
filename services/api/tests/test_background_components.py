@@ -32,6 +32,7 @@ import nats
 import pytest
 from bellasreef_api.app import build_app
 from bellasreef_service.httpd import probe_once
+from nats.js.errors import NotFoundError
 from sqlalchemy import NullPool, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -80,12 +81,37 @@ async def clear_audit_consumers() -> None:
     nc = await nats.connect(os.environ[_NATS])
     try:
         js = nc.jetstream()
-        try:
-            for consumer in await js.consumers_info("BR_AUDIT"):
-                await js.delete_consumer("BR_AUDIT", consumer.name)
-        except Exception:
-            # No stream yet: hardware-io provisions it, and it may not have run.
-            pass
+        remaining: list[str] = []
+        for _ in range(5):
+            try:
+                consumers = await js.consumers_info("BR_AUDIT")
+            except NotFoundError:
+                # No stream yet: hardware-io provisions it, and it may not
+                # have run.
+                return
+            except Exception:
+                # A slow broker under CI load. This used to be swallowed for
+                # good — which let a ghost consumer survive the clear and fail
+                # the *next* test with "the writer is not draining", sixty
+                # seconds and one misleading assertion later. Retry instead.
+                await asyncio.sleep(0.5)
+                continue
+            if not consumers:
+                return
+            remaining = [c.name for c in consumers]
+            for name in remaining:
+                with contextlib.suppress(Exception):
+                    await js.delete_consumer("BR_AUDIT", name)
+            # Go around again: deletion is verified by re-listing, and a
+            # consumer whose creation was still in flight during this listing
+            # shows up on the next one.
+            await asyncio.sleep(0.2)
+        raise RuntimeError(
+            f"BR_AUDIT still has consumers after 5 clear attempts: {remaining} "
+            "— a leaked durable holds the workqueue filter, so no audit writer "
+            "can bind. Find the test that created it; do not weaken this back "
+            "to a silent pass."
+        )
     finally:
         await nc.close()
 
