@@ -479,6 +479,15 @@ leftover `period=1000000` from the 2026-08-13 bring-up; that 1 kHz is nobody's
 decision and must be set to 2 000 000 before it is used. CH0 and CH2 are now at
 2 000 000.
 
+Superseded 2026-08-25 (Stage 6 register pass, run at David's direction with
+nothing connected): CH1 and CH3 both driven and read back through the full
+duty walk at the pinned 2 000 000 ns period, then parked at duty 0 / disabled
+— the CH3 leftover-period trap no longer exists, and all four pins were read
+muxed live (`pinctrl get 12,13,18,19`). hardware-io no longer held CH1 (only
+adopted channels are owned; `pi-pwm-1` is not adopted post-reset). Register
+and mux level only — a channel still meets a meter the day it first drives a
+real load. See `docs/drafts/2026-08-25-stage6-register-pass.md`.
+
 **Stage 1 (PCA9685), CH0 — PASSED on hardware 2026-08-15.**
 
 Board rewired onto I2C bus 1 the same afternoon and answering at `0x40` plus
@@ -686,7 +695,16 @@ the audit said duty 0.15 and David confirmed 15 % was the actual input —
 the stack was exact, the memory wasn't, and the audit log settled it, which
 is the point of having one.
 
-**Stages 4–6** — real light, fail-safe drills, CH1 — follow on David's go.
+**Stages 4–6**, resolved 2026-08-25 by David except the drills:
+- Stage 4 (real light) SKIPPED by ruling — "we did meter tests, the results
+  are no different"; the Stage 1/2 characterization stands.
+- Stage 6 (remaining channels) done the same day at register/mux level
+  (`docs/drafts/2026-08-25-stage6-register-pass.md`); the electrical half is
+  folded into load-hookup — a channel meets a meter the day it first drives
+  a real load.
+- **Stage 5 — fail-safe drills with the meter watching a driven pin — is the
+  one bench item still open**, on David's go. The drills have passed in logs
+  and container state; nobody has yet watched the voltage during a failure.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
 the only kernel interface the `w1-therm` driver exposes — there is no character
