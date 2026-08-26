@@ -44,17 +44,53 @@ sudo usermod -aG docker $USER
 ```
 
 **Group membership is granted at login.** The current shell does not have
-it; log out and back in (for ssh, just reconnect). `install-hub.sh` fails
+it; log out and back in (for ssh, reconnect). `install-hub.sh` fails
 its Docker check on exactly this: docker installed, user in the group,
 daemon still unreachable, because the session predates the grant.
+
+Reconnecting has a trap of its own: ssh connection multiplexing
+(`ControlMaster`/`ControlPersist` in the client's `~/.ssh/config`) silently
+reuses the old connection, which is the old login, which does not have the
+group. Found live on the 2026-08-25 rebuild: `docker info` still read
+permission-denied after "reconnecting", until the master connection was
+bypassed. If the denial survives a reconnect, force a genuinely new
+connection (`ssh -o ControlPath=none <pi-host>` or `ssh -O exit <pi-host>`
+first) before concluding anything is wrong on the host.
 
 Verify all three legs, in a fresh login:
 
 ```bash
 docker info >/dev/null && echo daemon reachable
-docker compose version        # must say v2.x
+docker compose version        # the compose *plugin*; prints its own version
+                              # (v5.x at this writing), not a literal "v2"
 systemctl is-enabled docker   # enabled; the boot unit needs the daemon at boot
 ```
+
+"Compose v2" names the plugin architecture (`docker compose`, a subcommand),
+as opposed to the retired python `docker-compose` binary. The version string
+moved past 2.x long ago; what matters is that the subcommand exists.
+
+## 1a. Log rotation — `/etc/docker/daemon.json`
+
+Docker's default `json-file` logging never rotates. Six always-on services
+on a 115 GB drive will eventually fill it, and compose.yaml deliberately
+carries no per-service `logging:` blocks, so the daemon default is the only
+place rotation exists. Write it before starting the stack:
+
+```bash
+sudo tee /etc/docker/daemon.json >/dev/null <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+sudo systemctl restart docker
+```
+
+This file was host state from 2026-08-09 that no document recorded; the
+2026-08-25 rebuild surfaced it (it only survived the wipe because apt purge
+leaves `/etc/docker` alone when it is not empty). A fresh host without it
+gets unbounded logs, silently.
 
 Installed, reachable, and Compose v2 present are three different facts and
 any one can fail alone.
