@@ -21,6 +21,10 @@ names the command when the pull is refused, but it does not manage
 credentials. For what any machine has to provide before either is worth
 running, see `docs/hub-platform-requirements.md`.
 
+For the runtime prerequisites themselves (Docker Engine with Compose v2, the
+repo clone, `deploy/.env`, and the dev-only ghcr.io login) follow
+`docs/hub-prereqs.md`; this file assumes them and does not install them.
+
 ---
 
 ## 1. Device tree overlays
