@@ -659,7 +659,8 @@ def test_republish_safe_states_includes_a_channel_left_dark_by_a_snap_band_comma
         await service.supervisor.start()
         service._registrations = [service.supervisor.registration_of("light-a")]
 
-        await service.supervisor.apply(command("light-a", PwmLevel(duty=0.05)))
+        outcome = await service.supervisor.apply(command("light-a", PwmLevel(duty=0.05)))
+        assert outcome == "applied", "the command itself must not have been refused"
         assert service.supervisor.is_at_safe_state("light-a"), (
             "the pin is genuinely dark (snapped); the guard must agree"
         )

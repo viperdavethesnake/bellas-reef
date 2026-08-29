@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final, Protocol
 from uuid import uuid4
@@ -62,39 +61,13 @@ from uuid import uuid4
 from bellasreef_contracts import ActuatorLevel, ActuatorRegistration, ChipState, PwmLevel
 from bellasreef_service import get_logger
 
-from bellasreef_hardware_io.drivers.dimming import light_registration, snap_duty
+from bellasreef_hardware_io.drivers.dimming import (
+    light_registration,
+    snap_duty,
+    to_thread_uncancellable,
+)
 
 log = get_logger(__name__)
-
-
-async def _to_thread_uncancellable[**P](
-    func: Callable[P, None], *args: P.args, **kwargs: P.kwargs
-) -> None:
-    """Run a blocking bus call in a thread; a cancellation cannot leave it running.
-
-    ``asyncio.to_thread`` cannot stop the worker thread once a write has
-    started — cancelling the *awaiting* coroutine only stops this coroutine
-    from waiting on it, and the ``smbus2`` transaction keeps running to
-    completion regardless. Left unshielded, a cancellation racing a write
-    inside :meth:`Pca9685Device.apply_duty` or :meth:`Pca9685Device.initialise`
-    would unwind straight out of ``async with self._lock`` and release the
-    lock while the write was still on the wire — the exact interleaving the
-    lock exists to prevent.
-
-    Shielding the offloaded task keeps a cancellation from reaching it; if the
-    caller is cancelled anyway, we still wait for the thread to actually
-    finish before letting ``CancelledError`` continue past us, so nothing
-    downstream — the lock release, or a caller that reacts to the
-    cancellation by issuing its own write right after — ever observes a write
-    still in flight.
-    """
-    task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.gather(task, return_exceptions=True)
-        raise
-
 
 __all__ = [
     "INVRT_ON",
@@ -277,6 +250,11 @@ class Pca9685Device:
         #: register block, since each write is now real wall-clock time on a
         #: worker thread rather than one atomic hop on the loop.
         self._lock = asyncio.Lock()
+        #: Guards the check-then-act in :meth:`ensure_initialised` only — a
+        #: separate lock from :attr:`_lock` because :meth:`initialise` already
+        #: takes that one, and an ``asyncio.Lock`` is not reentrant; nesting
+        #: them would deadlock a second concurrent caller against itself.
+        self._init_lock = asyncio.Lock()
 
     async def ensure_initialised(self) -> None:
         """:meth:`initialise` exactly once per chip, however many channels open.
@@ -285,12 +263,25 @@ class Pca9685Device:
         only the first does the work: re-running the sleep/PRE_SCALE/restart
         sequence for channel 7 would black out channels 0-6, which are already
         up and possibly already driven.
+
+        The check and the flag it sets both live inside :attr:`_init_lock`,
+        so two channels calling this around the same moment cannot both pass
+        the check and both run :meth:`initialise`. Without the lock, the
+        offloaded write inside ``initialise()`` is a real suspension point:
+        the first caller yields to the loop there before
+        ``self._initialised`` is ever set, and a second caller sees the same
+        ``False`` — reaching exactly the black-out scenario this docstring
+        already warned about, from ordinary concurrent startup rather than a
+        contrived race. (No fast path outside the lock: an uncontended
+        ``asyncio.Lock`` acquire is cheap, and every real caller only reaches
+        this once per channel, at ``open()`` time.)
         """
-        if self._initialised:
-            return
-        await self.initialise()
-        self._initialised = True
-        self._initialised_at = datetime.now(UTC)
+        async with self._init_lock:
+            if self._initialised:
+                return
+            await self.initialise()
+            self._initialised = True
+            self._initialised_at = datetime.now(UTC)
 
     async def initialise(self) -> None:
         """Put the chip into the configuration this project has decided on.
@@ -308,11 +299,11 @@ class Pca9685Device:
         blocking bus calls in a row — so it runs off the loop in a worker
         thread, under this chip's lock, same as every other write to it. See
         :attr:`_lock`. The offload is cancellation-shielded (see
-        :func:`_to_thread_uncancellable`) so a cancellation here cannot
-        release the lock mid-sequence either.
+        :func:`~.dimming.to_thread_uncancellable`) so a cancellation here
+        cannot release the lock mid-sequence either.
         """
         async with self._lock:
-            await _to_thread_uncancellable(self._initialise_sync)
+            await to_thread_uncancellable(self._initialise_sync)
 
         log.info(
             "pca9685 initialised",
@@ -374,13 +365,13 @@ class Pca9685Device:
         channel's, its fifteen siblings', and :meth:`initialise` — by
         :attr:`_lock`, so two commands landing at once cannot interleave their
         bytes on the wire. The offload is cancellation-shielded (see
-        :func:`_to_thread_uncancellable`): a caller cancelled mid-write still
-        cannot make the lock available to a second caller until this write has
-        actually finished on the wire, which is the property the lock exists
-        to provide in the first place.
+        :func:`~.dimming.to_thread_uncancellable`): a caller cancelled
+        mid-write still cannot make the lock available to a second caller
+        until this write has actually finished on the wire, which is the
+        property the lock exists to provide in the first place.
         """
         async with self._lock:
-            await _to_thread_uncancellable(self.write_channel, channel, duty)
+            await to_thread_uncancellable(self.write_channel, channel, duty)
 
     def write_channel(self, channel: int, duty: float) -> None:
         if not 0 <= channel < _CHANNELS:
@@ -458,7 +449,6 @@ class Pca9685Channel:
         self._channel = channel
         self._actuator_id = actuator_id
         self._driver_id = driver_id
-        self._last: float = 0.0
 
     @property
     def driver_id(self) -> str:
@@ -510,7 +500,6 @@ class Pca9685Channel:
         if not isinstance(level, PwmLevel):
             raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
         await self._device.apply_duty(self._channel, level.duty)
-        self._last = level.duty
 
     async def drive_safe(self) -> None:
         """Hard off, without consulting anything.
@@ -522,7 +511,6 @@ class Pca9685Channel:
         stall hardest.
         """
         await self._device.apply_duty(self._channel, 0.0)
-        self._last = 0.0
 
     async def read_back(self) -> ActuatorLevel | None:
         """``None``: the PCA9685 cannot report its own output.
@@ -547,6 +535,15 @@ class Pca9685Channel:
         without this, a snap-band command like 5% read as "not at safe
         state" even though the pin sits hard off, the same silent divergence
         the 2026-08-23 truth-line publish fix (spine.py) caught for the wire).
+
+        The prediction covers the SNAP decision only — hard off, hard on, or
+        passed through unchanged — not the count quantization
+        :func:`duty_to_counts` performs afterwards on a non-snapped value: a
+        commanded 0.5 comes back as ``0.5`` here, not as whatever ``off/4096``
+        actually rounds to on the wire. That is fine for the safe-state
+        comparison this exists for (a channel is either at the declared safe
+        state or it is not), and would not be fine for anything that needed
+        the exact register value.
         """
         if not isinstance(level, PwmLevel):
             raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")

@@ -400,6 +400,50 @@ def test_effective_level_refuses_a_binary_level() -> None:
         channel.effective_level(BinaryLevel(on=True))
 
 
+@pytest.mark.parametrize("duty", [0.05, MIN_USABLE_DUTY, 0.0, 1.0])
+def test_apply_lands_what_effective_level_predicted(duty: float) -> None:
+    """Round-trip: decode the registers ``apply()`` actually wrote on the fake
+    bus and check they agree with ``effective_level``'s prediction for the
+    same input — the real registers landing, not a second call into
+    ``duty_to_counts``.
+
+    Exact agreement everywhere except ``MIN_USABLE_DUTY``: that row is
+    honoured rather than snapped, so it also carries the count quantization
+    ``effective_level`` explicitly does not predict (see its docstring) —
+    0.08 of 4096 counts is 327.68, which rounds to 328, not back to 0.08
+    exactly.
+    """
+
+    async def scenario() -> FakeBus:
+        device, bus = _device()
+        channel = Pca9685Channel(device, 5, "led-blue")
+        await channel.apply(PwmLevel(duty=duty))
+        return bus
+
+    bus = run(scenario)
+    register, payload = bus.blocks[-1]
+    assert register == _LED0_ON_L + 4 * 5
+    on = payload[0] | (payload[1] << 8)
+    off = payload[2] | (payload[3] << 8)
+
+    if on == _FULL << 8:
+        landed = 1.0
+    elif off == _FULL << 8:
+        landed = 0.0
+    else:
+        landed = off / 4096
+
+    device, _ = _device()
+    predicted_level = Pca9685Channel(device, 5, "led-blue").effective_level(PwmLevel(duty=duty))
+    assert isinstance(predicted_level, PwmLevel)
+    predicted = predicted_level.duty
+
+    if duty == MIN_USABLE_DUTY:
+        assert landed == pytest.approx(predicted, abs=1 / 4096)
+    else:
+        assert landed == predicted
+
+
 # ------------------------------------------------------------- registration
 
 
@@ -487,6 +531,33 @@ def test_sixteen_channels_share_one_chip_and_initialise_it_once() -> None:
     bus = run(scenario)
     all_off_writes = [b for b in bus.blocks if b[0] == _ALL_LED_ON_L]
     assert len(all_off_writes) == 1
+
+
+def test_concurrent_ensure_initialised_calls_initialise_the_chip_once() -> None:
+    """Two channels opening around the same moment — ordinary hub startup,
+    not a contrived interleaving — must not both run the initialise
+    sequence.
+
+    ``ensure_initialised``'s ``if self._initialised: return`` check and the
+    write of that flag used to sit outside any lock: the offloaded bus write
+    inside ``initialise()`` (``await _to_thread_uncancellable(...)``) is a
+    real suspension point, so a first caller yields to the loop there before
+    ``self._initialised`` is ever set. A second concurrent caller sees the
+    same ``False``, queues on the chip's write lock behind the first, and
+    once that lock frees runs the whole sleep/PRE_SCALE/restart sequence
+    again — exactly the "channel 7 blacks out channels 0-6" scenario
+    :meth:`Pca9685Device.ensure_initialised`'s own docstring warns about,
+    reached without any test double beyond the two real calls.
+    """
+
+    async def scenario() -> FakeBus:
+        device, bus = _device()
+        await asyncio.gather(device.ensure_initialised(), device.ensure_initialised())
+        return bus
+
+    bus = run(scenario)
+    all_off_writes = [b for b in bus.blocks if b[0] == _ALL_LED_ON_L]
+    assert len(all_off_writes) == 1, "the initialise sequence ran more than once"
 
 
 # ------------------------------------------------------------ off the event loop
@@ -691,4 +762,66 @@ def test_a_cancelled_write_does_not_release_the_lock_before_it_lands() -> None:
     assert bus.overlap == 0
     # Both writes landed, strictly in order — B could not start until A's
     # (cancelled) write had actually finished.
+    assert len(bus.blocks) == 2
+
+
+def test_a_twice_cancelled_write_does_not_release_the_lock_before_it_lands() -> None:
+    """The guarantee above must survive a REPEATED cancellation, not just one.
+
+    The original fix's recovery path (``await asyncio.gather(task, ...)``
+    after the first ``CancelledError``) is itself an await, and a second
+    cancellation delivered while sitting in *that* recovery wait would have
+    unwound past it uncaught — escaping ``_to_thread_uncancellable`` before
+    the thread's write had actually landed, exactly the hole the shield
+    exists to close. Two real cancellations, delivered at two different
+    suspension points, not a single cancel repeated by coincidence.
+    """
+    bus = ReleasableBus()
+    device = Pca9685Device(bus)
+    a = Pca9685Channel(device, 0, "led-a")
+    b = Pca9685Channel(device, 1, "led-b")
+
+    async def scenario() -> None:
+        first = asyncio.create_task(a.apply(PwmLevel(duty=0.5)))
+        await asyncio.to_thread(bus.write_started.wait)
+
+        first.cancel()
+        second: asyncio.Task[None] | None = None
+        try:
+            # Let the first cancellation actually reach
+            # _to_thread_uncancellable and land it in its "wait for the real
+            # completion" phase.
+            await asyncio.sleep(0.02)
+            assert not first.done(), (
+                "the first cancellation completed the task before its own write landed"
+            )
+
+            first.cancel()  # a second cancellation, while still waiting on the same write
+            await asyncio.sleep(0.05)
+            assert not first.done(), (
+                "a second cancellation let the task finish before its own write landed"
+            )
+
+            second = asyncio.create_task(b.apply(PwmLevel(duty=0.5)))
+            await asyncio.sleep(0.05)
+            assert not second.done(), (
+                "the lock was released before the twice-cancelled write had landed"
+            )
+            assert bus.overlap == 0
+        finally:
+            # Whichever assert above lands (or fails), A's real (background)
+            # write is blocked on `_release` and must be let go — otherwise
+            # this leaves a `ThreadPoolExecutor` worker parked forever, which
+            # hangs the whole process at interpreter exit rather than just
+            # failing this test. Unconditional, so an assertion failing
+            # partway through still lets the run finish.
+            bus.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert second is not None
+        await second
+
+    run(scenario)
+    assert bus.overlap == 0
     assert len(bus.blocks) == 2

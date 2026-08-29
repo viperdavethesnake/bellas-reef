@@ -552,6 +552,13 @@ def test_a_snap_band_command_starts_no_runtime_clock() -> None:
     band twice a day, so this was the ordinary path, not an edge case: after
     LIGHT_MAX_RUNTIME_S the guard would latch a dark channel, and clearing a
     latch is an explicit operator action.
+
+    The behavioural half, mirroring
+    :func:`test_drill_returning_to_safe_state_resets_the_runtime_cap`: it is
+    not enough that ``runtime_task`` reads ``None`` immediately after the
+    command — the test also has to actually sleep past ``MAX_RUNTIME_S`` and
+    prove nothing latches later. ``runtime_task is None`` alone would still
+    pass if some other code path started a clock a beat later.
     """
 
     async def scenario() -> None:
@@ -572,6 +579,22 @@ def test_a_snap_band_command_starts_no_runtime_clock() -> None:
         assert sup._guards["light-a"].runtime_task is None, (
             "a snap-band command must not start the max-runtime clock on a dark pin"
         )
+
+        # Keep heartbeats healthy so a latch here could only be the runtime
+        # cap, then sleep well past it and prove it never fires.
+        async def beat() -> None:
+            while True:
+                sup.heartbeat()
+                await asyncio.sleep(HEARTBEAT_TIMEOUT_S / 4)
+
+        beater = asyncio.create_task(beat())
+        await asyncio.sleep(MAX_RUNTIME_S + JITTER_S)
+        beater.cancel()
+
+        assert not sup.is_latched("light-a"), (
+            "a snap-band command must not latch the channel once the cap elapses"
+        )
+        assert [e for e in rec.events if e.reason == "max_runtime_exceeded"] == []
 
         await sup.stop()
 
