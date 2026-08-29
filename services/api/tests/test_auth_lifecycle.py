@@ -1038,6 +1038,41 @@ def test_audit_event_exposes_action() -> None:
     assert run(scenario) == "device.unbound"
 
 
+class TestAuditLimitValidation:
+    """`limit` is unbounded today (defect B): `?limit=-1` reaches Postgres as
+    `LIMIT -1` (a 500) and `?limit=100000000` is a full scan+sort of
+    `audit_log`. 500 is the ruled cap (task brief); `ge=1, le=500`.
+
+    `test_audit_event_exposes_action` above already exercises `limit=200` —
+    unaffected by clamping to `[1, 500]` — so the default-unchanged case is
+    covered there rather than duplicated here.
+    """
+
+    def _get(self, limit: int) -> int:
+        async def scenario() -> int:
+            h = await harness()
+            async with h.client() as c:
+                granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+                headers = await bearer(c, granted["refresh_token"])
+                r = await c.get("/api/v1/audit", params={"limit": limit}, headers=headers)
+            await h.engine.dispose()
+            return r.status_code
+
+        return run(scenario)
+
+    def test_limit_zero_is_refused_with_422(self) -> None:
+        assert self._get(0) == 422
+
+    def test_a_negative_limit_is_refused_with_422(self) -> None:
+        assert self._get(-1) == 422
+
+    def test_a_limit_over_the_cap_is_refused_with_422(self) -> None:
+        assert self._get(501) == 422
+
+    def test_a_limit_at_the_cap_is_accepted(self) -> None:
+        assert self._get(500) == 200
+
+
 # ------------------------------------------------------------ recovery window
 
 
