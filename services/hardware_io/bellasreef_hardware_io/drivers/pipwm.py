@@ -337,7 +337,13 @@ class PiPwmChannel:
     async def apply(self, level: ActuatorLevel) -> None:
         if not isinstance(level, PwmLevel):
             raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
-        self._sysfs.write(self._dir / "duty_cycle", str(duty_to_ns(level.duty, self._period_ns)))
+        duty_ns = str(duty_to_ns(level.duty, self._period_ns))
+        # `path.write_text` is a blocking syscall reached straight from this
+        # `async def`, same shape as the PCA9685's I2C writes — offloaded the
+        # same way, off the loop. No cross-channel lock: unlike the PCA9685's
+        # sixteen channels sharing one chip's register block, each RP1 channel
+        # is its own sysfs file and cannot interleave with another channel's.
+        await asyncio.to_thread(self._sysfs.write, self._dir / "duty_cycle", duty_ns)
 
     async def drive_safe(self) -> None:
         """Zero on-time, without consulting anything.
@@ -345,9 +351,11 @@ class PiPwmChannel:
         Duty rather than ``enable``: disabling releases the pin to whatever the
         pad default is, and this must land somewhere known. It is also called
         precisely when the spine, the engine and the database are gone, so it
-        touches none of them.
+        touches none of them — and it is what the heartbeat watcher calls, so
+        the write is offloaded the same as :meth:`apply`: this is the one path
+        that must never itself be the thing stalling on a wedged bus.
         """
-        self._sysfs.write(self._dir / "duty_cycle", "0")
+        await asyncio.to_thread(self._sysfs.write, self._dir / "duty_cycle", "0")
 
     async def read_back(self) -> ActuatorLevel | None:
         """What the kernel currently has, which is more than the PCA9685 offers.

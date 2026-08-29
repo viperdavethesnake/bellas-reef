@@ -20,6 +20,8 @@ The fake models the two chip behaviours that actually bite:
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -450,3 +452,122 @@ def test_sixteen_channels_share_one_chip_and_initialise_it_once() -> None:
     bus = run(scenario)
     all_off_writes = [b for b in bus.blocks if b[0] == _ALL_LED_ON_L]
     assert len(all_off_writes) == 1
+
+
+# ------------------------------------------------------------ off the event loop
+#
+# Every smbus2 transaction is a blocking syscall. Reached straight from `async
+# def apply`/`drive_safe`/`initialise` with no executor hop, a wedged or
+# clock-stretching bus stalls the whole process — including the heartbeat
+# watcher in safety.py whose entire job is to notice a stall. The DS18B20
+# driver (onewire.py) already offloads its sysfs read the same way; these
+# tests are that file's `test_slow_probe_does_not_stall_the_event_loop` and
+# `test_probes_on_one_bus_serialise_against_each_other`, aimed at the I2C bus.
+
+
+class BlockingBus(FakeBus):
+    """A chip whose write takes real wall-clock time.
+
+    ``threading.Event.wait(timeout=...)`` rather than ``time.sleep`` — nobody
+    ever sets the event, so this always times out, but it reads as "blocked
+    until released or the clock runs out", which is what a wedged or
+    clock-stretching bus actually looks like.
+    """
+
+    def __init__(self, block_s: float = 0.3) -> None:
+        super().__init__()
+        self._never = threading.Event()
+        self._block_s = block_s
+
+    def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
+        self._never.wait(timeout=self._block_s)
+        super().write_i2c_block_data(address, register, data)
+
+
+def test_a_blocked_write_does_not_stall_the_event_loop() -> None:
+    """The whole point of offloading to a thread.
+
+    If ``apply()`` ran the blocking write straight on the loop, the ticker
+    below would barely advance for the ~300 ms the write takes.
+    """
+    bus = BlockingBus()
+    device, _ = Pca9685Device(bus), bus
+    channel = Pca9685Channel(device, 0, "led-blue")
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.apply(PwmLevel(duty=0.5))
+        t.cancel()
+
+    run(scenario)
+    # ~30 ticks expected in 300 ms. A blocked loop would yield ~0.
+    assert ticks > 10, f"event loop was stalled by the write (only {ticks} ticks)"
+
+
+def test_a_blocked_drive_safe_does_not_stall_the_event_loop() -> None:
+    """Doubly so for ``drive_safe`` — it is what the heartbeat watcher calls."""
+    bus = BlockingBus()
+    device = Pca9685Device(bus)
+    channel = Pca9685Channel(device, 0, "led-blue")
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.drive_safe()
+        t.cancel()
+
+    run(scenario)
+    assert ticks > 10, f"event loop was stalled by drive_safe (only {ticks} ticks)"
+
+
+class TrackedBus(FakeBus):
+    """Records whether two writes to this chip were ever in flight at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.overlap = 0
+
+    def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
+        self.active += 1
+        if self.active > 1:
+            self.overlap += 1
+        time.sleep(0.05)
+        self.active -= 1
+        super().write_i2c_block_data(address, register, data)
+
+
+def test_two_channels_on_one_chip_serialise_their_writes() -> None:
+    """One shared chip, sixteen channels: offloaded writes must still queue.
+
+    Two ``to_thread`` calls with no lock between them would let one channel's
+    write land mid-way through another's — on real silicon that is a
+    corrupted register block, not just a reordering.
+    """
+    bus = TrackedBus()
+    device = Pca9685Device(bus)
+    a = Pca9685Channel(device, 0, "led-a")
+    b = Pca9685Channel(device, 1, "led-b")
+
+    async def scenario() -> None:
+        await asyncio.gather(a.apply(PwmLevel(duty=0.5)), b.apply(PwmLevel(duty=0.5)))
+
+    run(scenario)
+    assert bus.overlap == 0, "two channel writes on the same chip overlapped"

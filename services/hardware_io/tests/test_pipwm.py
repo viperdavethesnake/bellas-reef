@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -388,6 +389,90 @@ def test_read_back_is_none_when_the_channel_is_not_there() -> None:
         return await _channel(FakeSysfs()).read_back()
 
     assert run(scenario) is None
+
+
+# ------------------------------------------------------------ off the event loop
+#
+# Every sysfs write here is a blocking syscall (`path.write_text`), reached
+# straight from `async def apply`/`drive_safe` with no executor hop. A stalled
+# write — a wedged pwmchip, a slow filesystem — stalls the whole process,
+# including the heartbeat watcher in safety.py. Same shape as the PCA9685's
+# I2C bus, and the same fix: offload to a thread. Mirrors onewire.py's
+# `test_slow_probe_does_not_stall_the_event_loop`.
+
+
+class BlockingSysfs(FakeSysfs):
+    """A sysfs whose writes take real wall-clock time once armed.
+
+    Armed only after ``open()`` so the setup sequence itself stays instant —
+    what's under test is the command path (``apply``/``drive_safe``), not
+    channel bring-up. ``threading.Event.wait(timeout=...)`` always times out
+    (nothing ever sets it), which reads as "blocked until released or the
+    clock runs out" — a wedged pwmchip, not a scripted delay.
+    """
+
+    def __init__(self, block_s: float = 0.3, **kw: Any) -> None:
+        super().__init__(**kw)
+        self._never = threading.Event()
+        self._block_s = block_s
+        self.blocking = False
+
+    def write(self, path: Path, value: str) -> None:
+        if self.blocking:
+            self._never.wait(timeout=self._block_s)
+        super().write(path, value)
+
+
+def test_a_blocked_apply_write_does_not_stall_the_event_loop() -> None:
+    """If ``apply()`` ran the write straight on the loop, the ticker below
+    would barely advance for the ~300 ms the write takes."""
+    sysfs = BlockingSysfs()
+    channel = _channel(sysfs)
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+        await channel.open()
+        sysfs.blocking = True
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.apply(PwmLevel(duty=0.5))
+        t.cancel()
+
+    run(scenario)
+    # ~30 ticks expected in 300 ms. A blocked loop would yield ~0.
+    assert ticks > 10, f"event loop was stalled by the write (only {ticks} ticks)"
+
+
+def test_a_blocked_drive_safe_write_does_not_stall_the_event_loop() -> None:
+    """Doubly so for ``drive_safe`` — it is what the heartbeat watcher calls."""
+    sysfs = BlockingSysfs()
+    channel = _channel(sysfs)
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+        await channel.open()
+        sysfs.blocking = True
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.drive_safe()
+        t.cancel()
+
+    run(scenario)
+    assert ticks > 10, f"event loop was stalled by drive_safe (only {ticks} ticks)"
 
 
 # ------------------------------------------------------------ registration
