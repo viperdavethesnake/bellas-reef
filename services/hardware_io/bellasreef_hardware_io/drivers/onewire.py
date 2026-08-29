@@ -11,10 +11,16 @@ That cost is absorbed here and never exposed to the caller:
 
 * the blocking sysfs read runs in a worker thread, so the event loop keeps
   running;
-* probes sharing a bus master serialize against *each other* through a lock
-  owned by this module, not against anything else in the process;
+* probes sharing a bus master serialize against *each other* through a
+  ``threading.Lock`` owned by this module, acquired and released **inside**
+  the worker thread — for the read's true lifetime, not the awaiter's. A read
+  that overruns ``read_timeout_s`` cannot leave the lock released while its
+  thread is still on the wire: ``asyncio.wait_for`` cancels the AWAIT, never
+  the thread, so the lock has to be the thread's to hold;
 * a read that overruns ``read_timeout_s`` yields ``quality="fault"`` rather than
-  a stale value wearing a fresh timestamp.
+  a stale value wearing a fresh timestamp, while the straggler thread finishes
+  and releases the lock on its own schedule — the next read's thread queues on
+  it without touching the event loop at all.
 
 Read path is sysfs because that is the only interface ``w1-therm`` exposes.
 This is not the forbidden sysfs GPIO.
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -50,13 +57,28 @@ _TEMP_RE = re.compile(r"\bt=(-?\d+)\s*$", re.MULTILINE)
 
 #: One lock per bus master. Probes on the same 1-Wire bus must not talk over
 #: each other; probes on different bus masters need not wait.
-_BUS_LOCKS: dict[str, asyncio.Lock] = {}
+#:
+#: A ``threading.Lock``, not an ``asyncio.Lock``: serialization belongs to the
+#: reader thread's domain, acquired and released inside it, so it is held for
+#: the read's true lifetime rather than the awaiting coroutine's. An
+#: ``asyncio.Lock`` released by ``async with`` on ``wait_for`` timeout let a
+#: second probe start converting while the first's thread was still on the
+#: wire — see :meth:`DS18B20._read_locked`. A plain ``threading.Lock`` also
+#: has no event loop to bind to.
+#:
+#: ``_bus_lock`` itself is get-or-create over a plain dict and is only ever
+#: called from :meth:`DS18B20.read`, which runs on the event loop — a single
+#: thread, cooperatively scheduled — never from inside a worker thread. That
+#: is what makes the lookup safe without its own lock: two coroutines racing
+#: to create the *first* lock for a bus master would otherwise be a real
+#: check-then-set race and could hand out two different ``Lock`` objects.
+_BUS_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _bus_lock(bus_master: str) -> asyncio.Lock:
+def _bus_lock(bus_master: str) -> threading.Lock:
     lock = _BUS_LOCKS.get(bus_master)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = threading.Lock()
         _BUS_LOCKS[bus_master] = lock
     return lock
 
@@ -136,15 +158,26 @@ class DS18B20:
 
     async def read(self) -> SensorSample:
         """Take one sample. Never raises on hardware failure."""
+        # Resolved here, on the event loop, not inside the worker thread — see
+        # the get-or-create note on ``_bus_lock``. The lock itself is acquired
+        # and released in ``_read_locked``, which runs in the thread.
+        lock = _bus_lock(self._bus_master)
         try:
-            async with _bus_lock(self._bus_master):
-                raw_text = await asyncio.wait_for(
-                    asyncio.to_thread(self._blocking_read),
-                    timeout=self._read_timeout_s,
-                )
+            raw_text = await asyncio.wait_for(
+                asyncio.to_thread(self._read_locked, lock),
+                timeout=self._read_timeout_s,
+            )
         except (TimeoutError, OSError):
             # Probe unplugged, bus wedged, or conversion overran. All are
             # operating conditions on a wet installation, not exceptions.
+            #
+            # A timeout here only cancels this AWAIT — ``_read_locked`` keeps
+            # running in its worker thread regardless, still holding ``lock``
+            # until the sysfs read actually returns. That is the fix: the old
+            # code held an ``asyncio.Lock`` in an ``async with`` wrapped
+            # around this same ``wait_for``, so the timeout's cancellation
+            # unwound the ``async with`` and released the lock immediately,
+            # while the real read kept running on the bus underneath it.
             return self._fault()
 
         return self._parse(raw_text)
@@ -174,8 +207,27 @@ class DS18B20:
 
     # -------------------------------------------------------------- internals
 
+    def _read_locked(self, lock: threading.Lock) -> str:
+        """Runs in a worker thread. Holds ``lock`` for the read's true lifetime.
+
+        Acquired and released here — inside the thread body — not around the
+        awaiting coroutine. ``asyncio.wait_for`` can only cancel the AWAIT; it
+        cannot stop this thread once it has started. A timed-out ``read()``
+        gets its fault sample back immediately while this thread keeps the bus
+        reserved until the sysfs read actually finishes; the next probe's
+        thread then queues on ``lock.acquire()`` — blocking a worker thread,
+        never the event loop — instead of starting a second conversion on a
+        bus that is still serialized underneath it.
+        """
+        with lock:
+            return self._blocking_read()
+
     def _blocking_read(self) -> str:
-        """Runs in a worker thread. ~831 ms on the target hardware."""
+        """The sysfs read itself. ~831 ms on the target hardware.
+
+        Only ever called from :meth:`_read_locked`, so it always runs with the
+        bus lock held.
+        """
         return self._path.read_text()
 
     def _fault(self) -> SensorSample:
