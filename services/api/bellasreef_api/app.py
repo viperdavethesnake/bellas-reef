@@ -60,6 +60,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Query,
     Request,
     Response,
     WebSocket,
@@ -1913,7 +1914,7 @@ def build_app(
     )
     async def list_audit(
         _: Annotated[UUID, Depends(current_client)],
-        limit: int = 50,
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
         category: str | None = None,
     ) -> list[AuditEvent]:
         """The audit trail, as persisted.
@@ -1967,6 +1968,16 @@ def build_app(
         if reader is None:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "no telemetry store configured"
+            )
+        # FastAPI parses both offset-bearing and offset-free ISO-8601 forms
+        # into `datetime`, so a naive value would otherwise reach the compare
+        # below — raising TypeError (one side naive) or silently comparing in
+        # server-local time with tzinfo=None propagating into every returned
+        # Bucket.at (both sides naive). Mirrors the engine's guard style
+        # (control_engine scheduler.py, `now.tzinfo is None`).
+        if start.tzinfo is None or end.tzinfo is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "start and end must be timezone-aware"
             )
         if end <= start:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "end must be after start")
@@ -2130,7 +2141,7 @@ def build_app(
     )
     async def list_alerts(
         _: Annotated[UUID, Depends(current_client)],
-        limit: int = 50,
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
     ) -> AlertsView:
         """What is wrong now, and what has been wrong lately.
 

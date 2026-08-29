@@ -18,11 +18,21 @@ from typing import Any
 
 import httpx
 import pytest
+from bellasreef_api.app import build_app
 from bellasreef_api.history import MAX_BUCKETS, HistoryReader
+from sqlalchemy import NullPool, text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+_PG = "BELLASREEF_TEST_DATABASE_URL"
 _VM = "BELLASREEF_TEST_VM_URL"
 
-pytestmark = pytest.mark.skipif(not os.environ.get(_VM), reason=f"{_VM} not set")
+# No blanket module-level skip: `TestBucketSizing`, `TestEnvelope` and
+# `TestGaps` read and write real series data and need `_VM`; the endpoint
+# validation class added below needs only `_PG` — the naive/aware guard and
+# the empty-registry path never reach VictoriaMetrics. Each class below
+# declares the environment it actually needs.
+_needs_vm = pytest.mark.skipif(not os.environ.get(_VM), reason=f"{_VM} not set")
+_needs_pg = pytest.mark.skipif(not os.environ.get(_PG), reason=f"{_PG} not set")
 
 
 def run[T](scenario: Callable[[], Coroutine[Any, Any, T]]) -> T:
@@ -67,6 +77,7 @@ async def wait_until_stored(vm: str, device_id: str, expected: int) -> None:
     raise AssertionError("samples never became readable")
 
 
+@_needs_vm
 class TestBucketSizing:
     def test_a_window_divides_into_the_requested_buckets(self) -> None:
         start = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
@@ -86,6 +97,7 @@ class TestBucketSizing:
         assert HistoryReader.bucket_seconds(at, at, 240) >= 1
 
 
+@_needs_vm
 class TestEnvelope:
     @pytest.mark.timeout(120)
     def test_a_spike_inside_a_bucket_survives_downsampling(self) -> None:
@@ -129,6 +141,7 @@ class TestEnvelope:
         assert floor == pytest.approx(24.0, abs=0.01)
 
 
+@_needs_vm
 class TestGaps:
     @pytest.mark.timeout(120)
     def test_a_window_with_no_samples_produces_no_buckets(self) -> None:
@@ -186,3 +199,77 @@ class TestGaps:
             f"{filled} of {requested} buckets filled — a gap was zero-filled or "
             "interpolated rather than left absent"
         )
+
+
+# ------------------------------------------------------- endpoint validation
+#
+# `/api/v1/history` itself, not `HistoryReader`. A dummy `vm_url` is enough:
+# these cases either 422 before the handler ever calls `reader.series()`, or
+# (the both-aware case) run against an empty device registry, which returns
+# with no VictoriaMetrics call at all — see `store.list_devices()` in the
+# handler. Real series data belongs in `TestEnvelope`/`TestGaps` above.
+
+
+async def _fresh_engine() -> AsyncEngine:
+    engine = create_async_engine(os.environ[_PG], future=True, poolclass=NullPool)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "TRUNCATE sensor_alerts, overrides, pairing_windows, pairing_requests, "
+                "paired_clients, devices CASCADE"
+            )
+        )
+    return engine
+
+
+async def _paired(app: Any) -> dict[str, str]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://hub"
+    ) as c:
+        granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+        tok = (
+            await c.post("/api/v1/token", json={"refresh_token": granted["refresh_token"]})
+        ).json()
+    return {"Authorization": f"Bearer {tok['access_token']}"}
+
+
+@_needs_pg
+class TestHistoryEndpointValidation:
+    """Naive/aware datetimes at the query boundary (defect A).
+
+    FastAPI parses both offset-bearing and offset-free ISO-8601 forms into
+    `datetime`, so a naive value reaches `end <= start` — which raises
+    `TypeError: can't compare offset-naive and offset-aware datetimes` when
+    only one side is naive, and silently uses server-local time when both are
+    — instead of the 422 the endpoint's own `responses` block promises.
+    """
+
+    def _get(self, start: str, end: str) -> int:
+        async def scenario() -> int:
+            engine = await _fresh_engine()
+            app = build_app(engine, vm_url="http://127.0.0.1:1")
+            headers = await _paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.get(
+                    "/api/v1/history", params={"start": start, "end": end}, headers=headers
+                )
+            await engine.dispose()
+            return r.status_code
+
+        return run(scenario)
+
+    def test_a_naive_start_is_refused_with_422(self) -> None:
+        assert self._get("2026-08-10T12:00:00", "2026-08-10T13:00:00Z") == 422
+
+    def test_a_naive_end_is_refused_with_422(self) -> None:
+        assert self._get("2026-08-10T12:00:00Z", "2026-08-10T13:00:00") == 422
+
+    def test_both_naive_is_refused_with_422(self) -> None:
+        assert self._get("2026-08-10T12:00:00", "2026-08-10T13:00:00") == 422
+
+    def test_both_aware_is_the_existing_behavior(self) -> None:
+        """No devices registered, so this is the normal empty result — the
+        guard must not reject a window it used to accept."""
+        assert self._get("2026-08-10T12:00:00Z", "2026-08-10T13:00:00Z") == 200

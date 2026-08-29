@@ -347,6 +347,52 @@ class TestAlertHistory:
         assert run(scenario) == 401
 
 
+class TestAlertsLimitValidation:
+    """`limit` is unbounded today (defect B): `?limit=-1` reaches Postgres as
+    `LIMIT -1` (a 500) and `?limit=100000000` is a full scan+sort of every
+    recorded episode. 500 is the ruled cap (task brief); `ge=1, le=500`."""
+
+    def _get(self, limit: int) -> int:
+        async def scenario() -> int:
+            engine = await fresh_engine()
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.get("/api/v1/alerts", params={"limit": limit}, headers=headers)
+            await engine.dispose()
+            return r.status_code
+
+        return run(scenario)
+
+    def test_limit_zero_is_refused_with_422(self) -> None:
+        assert self._get(0) == 422
+
+    def test_a_negative_limit_is_refused_with_422(self) -> None:
+        assert self._get(-1) == 422
+
+    def test_a_limit_over_the_cap_is_refused_with_422(self) -> None:
+        assert self._get(501) == 422
+
+    def test_a_limit_at_the_cap_is_accepted(self) -> None:
+        assert self._get(500) == 200
+
+    def test_the_default_limit_is_unchanged(self) -> None:
+        async def scenario() -> int:
+            engine = await fresh_engine()
+            app = build_app(engine, audit=Audit())
+            headers = await paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                r = await c.get("/api/v1/alerts", headers=headers)
+            await engine.dispose()
+            return r.status_code
+
+        assert run(scenario) == 200
+
+
 class TestClearingABandClosesItsEpisode:
     """Removing a bound must close the episode that bound raised.
 
