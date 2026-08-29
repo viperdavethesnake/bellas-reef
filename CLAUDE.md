@@ -651,10 +651,21 @@ Two things learned on the way, both load-bearing:
    `docs/bellas-reef-ios-ux-review.md`) and is designed there, not shipped
    standalone. Needs a new message type (contracts MINOR), API store +
    endpoint, iOS.
+   RESOLVED 2026-08-22/23 (shipped): backend #61/#62 (migration 0020,
+   `/api/v1/hardware`), iOS #9/#15 (System tab Hardware leaf), contracts
+   4.2.0. The C1/C2 rows in the 2026-08-23 UX review are marked Shipped.
 2. **Adopting a channel restarts hardware-io** (`assignment_restart`: "exiting
    to rebuild from registry"), and on the way down it logged `failed to
    publish actuator state … reason=safe_state` for both pi-pwm channels — the
    safe-state publish racing the NATS close. Not investigated yet.
+   RESOLVED 2026-08-18: `HardwareIO.shutdown()` now runs `supervisor.stop()`
+   (safe drive + trip-state publish) *before* `spine.close()` — the order was
+   reversed until then, so every shutdown publish failed into a closed spine.
+   The NATS-*outage* variant of the same swallowed publish is separately
+   handled by the reconnect republish (#68, `_republish_safe_states`).
+   Verified 2026-08-28 on the hub: zero `failed to publish actuator state`
+   lines in the current container's logs, which include the 2026-08-25
+   rebuild's `assignment_restart`.
 
 Bench notes: the engine slewed at 1 %/s in 1 % steps at the time, so 100 → 5 %
 took ~95 s. Resolved since: holds carry a per-hold `snap` | `ramp` transition
@@ -702,9 +713,16 @@ is the point of having one.
   (`docs/drafts/2026-08-25-stage6-register-pass.md`); the electrical half is
   folded into load-hookup — a channel meets a meter the day it first drives
   a real load.
-- **Stage 5 — fail-safe drills with the meter watching a driven pin — is the
-  one bench item still open**, on David's go. The drills have passed in logs
-  and container state; nobody has yet watched the voltage during a failure.
+- **Stage 5 — PASSED on hardware 2026-08-25** (run record:
+  `docs/drafts/2026-08-25-stage5-drills.md`). D1 engine stop: safe at 30.0 s,
+  meter 1.984 V → 0 V, recovery by slew from dark. D2 hardware-io host
+  `kill -9`: ~4 s held-at-last-duty exposure, safe-state-first restart, dip
+  to dark caught on the meter. D3 NATS 44 s outage: safe at ~30 s, ~9 s
+  self-heal — register-verified only; **the D3 meter word was never taken**
+  (the sitting ended first), recorded as the weaker basis it is. The doc's
+  pre-run "≤ 15 s" expectations were a conflation — see the RESOLVED finding
+  in that file. With this, the bench plan is CLOSED except load-hookup day —
+  a channel still meets a meter the day it first drives a real load.
 
 **The 1-Wire read path is sysfs** (`/sys/bus/w1/devices/28-*/w1_slave`). That is
 the only kernel interface the `w1-therm` driver exposes — there is no character

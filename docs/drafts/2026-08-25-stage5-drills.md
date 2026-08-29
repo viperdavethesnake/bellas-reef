@@ -149,3 +149,19 @@ own log names it: `no heartbeat for 30.0s`. Which is intent — is 30 s a
 config bug against a correct 15 s contract, or is the declared 15 a stale
 constant? No dependent work ships on top of this until ruled (the
 measured-vs-documented discrepancy rule).
+
+RESOLVED 2026-08-28: **no discrepancy existed, so there was nothing to
+rule.** Traced on the repo and the live hub: `LIGHT_HEARTBEAT_TIMEOUT_S` in
+`contracts/python/bellasreef_contracts/messages.py` has been **30.0 since
+the commit that introduced it** (`4e4f0db`), both driver registration
+defaults (`dimming.py`, `pca9685.py`) are 30.0, and the fresh hub's device
+rows declare 30 for both PWM channels. Declared and enforced agree at 30 s.
+The "15" this doc stated pre-run was a conflation with
+`liveness_timeout_s = 15.0` — each service's *own* event-loop stall guard
+(`LivenessGuard` in hardware-io and control-engine), which watches a process
+for stalling, not the engine's heartbeat to actuators. The pre-run "≤ 15 s"
+expectations in Setup, D1 and D3 above inherit the same conflation and
+should be read as "≤ 30 s + a beat"; the measured results pass against the
+actual contract. Whether 30 s is the *wanted* window per role remains a
+design choice when tighter-class actuators (heater/relay) arrive —
+`heartbeat_timeout_s` is per-registration, so nothing blocks that.
