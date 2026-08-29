@@ -30,13 +30,15 @@ authenticate to. Full procedures in
 
 ```bash
 cd /home/david/bellasreef
-set -a; . /etc/bellasreef/api.env; set +a   # BELLASREEF_DATABASE_URL, and
-                                            # BELLASREEF_NATS_URL for the audit event
+alias br='docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef'
 
-.venv/bin/bellasreef pair --ttl 600   # open a 10-minute window; pair a replacement device
-.venv/bin/bellasreef revoke --list    # every client this hub has ever paired
-.venv/bin/bellasreef revoke <id>      # turn one off, by id or by unambiguous name
+br pair --ttl 600     # open a 10-minute window; pair a replacement device
+br revoke --list      # every client this hub has ever paired
+br revoke <id>        # turn one off, by id or by unambiguous name
 ```
+
+The CLI lives in the `api` image and inherits the running container's
+environment — there is no host virtualenv and no env file to source.
 
 Replacing a phone is both commands. A pairing window *adds* a client and never
 removes one, because the trust-on-first-use window is keyed on client rows

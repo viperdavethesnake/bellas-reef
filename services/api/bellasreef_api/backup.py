@@ -143,8 +143,8 @@ class HubIdentity(_Strict):
     ``database_host`` is the Postgres server exactly as the DSN addressed it.
     A loopback name (``localhost``, ``127.0.0.1``, a tunnel) identifies
     nothing; a network name like ``bellasreef.local`` identifies everything.
-    Which one the on-hub flow produces is a fact about the host's ``api.env``,
-    not about this code.
+    Which one the on-hub flow produces is a fact about the api container's
+    configured ``BELLASREEF_DATABASE_URL``, not about this code.
 
     ``taken_on`` is the machine that ran the tool, and has the mirror-image
     problem: on the hub it is the hub, from a laptop it is the laptop.
