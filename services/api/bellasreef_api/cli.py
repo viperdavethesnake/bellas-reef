@@ -95,7 +95,8 @@ async def _emit(
         return (
             f"BELLASREEF_NATS_URL is not set, so `{event}` was NOT recorded.\n"
             "  The operation itself succeeded; the audit trail has a hole where\n"
-            "  it should be. The value is in /etc/bellasreef/api.env on the hub."
+            "  it should be. Run via `docker compose exec api` so the CLI\n"
+            "  inherits the container's environment (docs/host-setup.md, section 10)."
         )
 
     from bellasreef_api.audit import NatsAuditSink
