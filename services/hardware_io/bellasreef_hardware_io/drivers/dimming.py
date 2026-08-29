@@ -65,22 +65,43 @@ async def to_thread_uncancellable[**P](
     whatever recovery code is sitting on the thread's completion: every
     cancellation received while the underlying task is still running is
     swallowed and we go back to waiting on it; only once the task has
-    actually finished do we re-raise, once, if any cancellation arrived along
-    the way.
+    actually finished do we re-raise — the very ``CancelledError`` instance
+    we caught, not a freshly constructed one, so a ``task.cancel(msg)``
+    message survives — if any cancellation arrived along the way.
+
+    Cancellation wins over whatever the offloaded call itself does. If no
+    cancellation ever arrived, the call's own exception (a real bus fault,
+    say) propagates normally, same as an unshielded ``to_thread`` call would.
+    But once a cancellation has been absorbed, the offloaded call's own
+    outcome — success, or its own exception — is no longer this caller's to
+    see: the caller was told to stop, and finding out the write also failed
+    is not a substitute for honoring that. 2026-08-29 review finding: an
+    earlier version of this loop caught only ``CancelledError`` here, so a
+    task that went on to raise its own exception (an ``OSError`` from the
+    bus, say) surfaced that exception straight out of the loop instead —
+    the absorbed cancellation was silently discarded.
     """
     task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
-    cancelled = False
+    cancelled: asyncio.CancelledError | None = None
     while True:
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
+        except asyncio.CancelledError as exc:
+            cancelled = exc
             if task.done():
                 break
             continue
-        break
-    if cancelled:
-        raise asyncio.CancelledError
+        except Exception:
+            # The offloaded call's own exception. If a cancellation already
+            # arrived, it wins — discard this exception rather than let it
+            # escape in place of the CancelledError the caller is owed.
+            if cancelled is not None:
+                break
+            raise
+        else:
+            break
+    if cancelled is not None:
+        raise cancelled
 
 
 #: Below this the XLG output is undefined — it may flicker, sit dark, or go to
