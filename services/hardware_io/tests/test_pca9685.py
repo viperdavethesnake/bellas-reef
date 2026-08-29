@@ -365,6 +365,41 @@ def test_a_channel_outside_the_chip_is_refused() -> None:
         device.write_channel(16, 0.5)
 
 
+# ------------------------------------------------------------ effective_level
+
+
+@pytest.mark.parametrize(
+    ("duty", "expected"),
+    [
+        (0.05, 0.0),  # in the undefined band: snaps to hard off
+        (MIN_USABLE_DUTY, MIN_USABLE_DUTY),  # the floor is honoured, not snapped
+        (0.0, 0.0),
+        (1.0, 1.0),
+    ],
+)
+def test_effective_level_mirrors_the_snap_apply_would_actually_write(
+    duty: float, expected: float
+) -> None:
+    """Pure prediction of what :meth:`apply` puts on the pin, computed without
+    touching the bus — safety.py's runtime-cap clock keys off this (2026-08-29
+    finding: it used to key off the commanded level, so a 5% command read as
+    "not safe" even though duty_to_counts snaps it to hard off). Must agree
+    with duty_to_counts's own snap_duty call, not a second copy of the rule.
+    """
+    device, _ = _device()
+    channel = Pca9685Channel(device, 0, "led-blue")
+    assert channel.effective_level(PwmLevel(duty=duty)) == PwmLevel(duty=expected)
+
+
+def test_effective_level_refuses_a_binary_level() -> None:
+    """Same class check as :meth:`apply` — a prediction of an apply() this
+    channel would refuse must refuse it too, not silently coerce it."""
+    device, _ = _device()
+    channel = Pca9685Channel(device, 0, "led-blue")
+    with pytest.raises(TypeError):
+        channel.effective_level(BinaryLevel(on=True))
+
+
 # ------------------------------------------------------------- registration
 
 

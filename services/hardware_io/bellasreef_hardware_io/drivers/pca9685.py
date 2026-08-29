@@ -535,6 +535,23 @@ class Pca9685Channel:
         """
         return None
 
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        """What :meth:`apply` would actually put on the pin — pure, no I²C.
+
+        hardware-io-internal Protocol member (safety.py's
+        ``SafetyActuatorDriver``), not part of the contracts
+        ``ActuatorDriver``. Applies the same :func:`~.dimming.snap_duty` rule
+        :func:`duty_to_counts` uses, so the two can never disagree: this is
+        what lets safety.py's max-runtime clock key on what the hardware
+        actually does instead of what was commanded (2026-08-29 finding —
+        without this, a snap-band command like 5% read as "not at safe
+        state" even though the pin sits hard off, the same silent divergence
+        the 2026-08-23 truth-line publish fix (spine.py) caught for the wire).
+        """
+        if not isinstance(level, PwmLevel):
+            raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
+        return PwmLevel(duty=snap_duty(level.duty))
+
 
 def registration(
     channel: Pca9685Channel,

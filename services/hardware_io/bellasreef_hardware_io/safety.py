@@ -32,7 +32,7 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Final, Literal
+from typing import Final, Literal, Protocol
 
 from bellasreef_contracts import ActuatorCommand, ActuatorLevel, ActuatorRegistration
 from bellasreef_contracts.driver import ActuatorDriver
@@ -75,6 +75,37 @@ CommandOutcome = Literal[
 NowFn = Callable[[], datetime]
 
 
+class SafetyActuatorDriver(ActuatorDriver, Protocol):
+    """The contract's :class:`ActuatorDriver`, plus what this module needs
+    and the contract deliberately does not carry: a way to know what
+    ``apply(level)`` would actually put on the hardware, without applying it.
+
+    hardware-io-internal only — contracts stays at 4.2.0, untouched. A PWM
+    driver's own snap band (dimming.py's ``snap_duty``: anything under 8%
+    hits the pin as hard off) means "commanded" and "effective" can diverge,
+    and the max-runtime clock below must key on the latter or a dawn/dusk
+    ramp that dips into the band starts a runaway-cap clock on a channel that
+    is, in fact, already dark (2026-08-29 finding). ``spine.py``'s truth-line
+    publish solved the same divergence for the wire in 2026-08-23 via
+    ``read_back()`` — that is a post-hoc *measurement* and returns ``None``
+    for a chip that cannot report itself (the PCA9685); this is a pure
+    *prediction*, always answerable, which is what a clock decided before any
+    hardware I/O needs.
+    """
+
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        """What applying ``level`` would actually put on the hardware.
+
+        Pure — no I/O, no state mutation. Both real PWM drivers (pca9685.py,
+        pipwm.py) compute this from the same ``dimming.snap_duty`` their own
+        ``apply()`` already uses, so there is exactly one place the snap rule
+        is expressed twice: once per driver, and it must not drift between
+        them (the module-level docstring of ``dimming.py`` exists for that
+        reason).
+        """
+        ...
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -109,7 +140,7 @@ EventSink = Callable[[SafetyEvent], Awaitable[None]]
 @dataclass(slots=True)
 class _Guard:
     registration: ActuatorRegistration
-    driver: ActuatorDriver
+    driver: SafetyActuatorDriver
 
     #: Set when a beat arrives, so the watcher wakes immediately rather than
     #: waiting out a stale deadline.
@@ -184,7 +215,7 @@ class InterlockSupervisor:
 
     # ------------------------------------------------------------- lifecycle
 
-    def register(self, registration: ActuatorRegistration, driver: ActuatorDriver) -> None:
+    def register(self, registration: ActuatorRegistration, driver: SafetyActuatorDriver) -> None:
         """Register an actuator. Authoritative devices only.
 
         docs/device-classes.md §3: this service is the one that is allowed to
@@ -403,8 +434,17 @@ class InterlockSupervisor:
                 extra={"actuator_id": guard.actuator_id},
             )
 
+        # The runtime-cap clock must key on what actually reaches the
+        # hardware, not what was asked for: a PWM driver's own snap band
+        # (dimming.py's snap_duty) can turn a low-duty command into a
+        # genuinely dark pin, and comparing the COMMANDED level against the
+        # declared safe state used to start the clock on a channel that was
+        # already safe (2026-08-29 finding). Computed before the drive so a
+        # driver that raises mid-apply leaves no clock started on a level
+        # that was never reached.
+        effective = guard.driver.effective_level(command.level)
         await guard.driver.apply(command.level)
-        self._note_level(guard, command.level)
+        self._note_level(guard, effective)
         return "applied"
 
     def _note_level(self, guard: _Guard, level: ActuatorLevel) -> None:

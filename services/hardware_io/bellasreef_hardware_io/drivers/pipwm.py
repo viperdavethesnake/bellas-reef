@@ -411,3 +411,20 @@ class PiPwmChannel:
         if period_ns <= 0:
             return None
         return PwmLevel(duty=min(duty_ns / period_ns, 1.0))
+
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        """What :meth:`apply` would actually write to ``duty_cycle`` — pure,
+        no sysfs I/O.
+
+        hardware-io-internal Protocol member (safety.py's
+        ``SafetyActuatorDriver``), not part of the contracts
+        ``ActuatorDriver``. Applies the same
+        :func:`~.dimming.snap_duty` rule :func:`duty_to_ns` uses, from the
+        same constant the PCA9685 driver's ``effective_level`` uses, so a
+        channel's safety behaviour cannot depend on which silicon drives it
+        (2026-08-29 finding — see :mod:`.pca9685`'s ``effective_level`` for
+        the full context on why this exists).
+        """
+        if not isinstance(level, PwmLevel):
+            raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
+        return PwmLevel(duty=snap_duty(level.duty))

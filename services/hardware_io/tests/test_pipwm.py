@@ -391,6 +391,36 @@ def test_read_back_is_none_when_the_channel_is_not_there() -> None:
     assert run(scenario) is None
 
 
+# ------------------------------------------------------------ effective_level
+
+
+@pytest.mark.parametrize(
+    ("duty", "expected"),
+    [
+        (0.05, 0.0),  # in the undefined band: snaps to hard off
+        (MIN_USABLE_DUTY, MIN_USABLE_DUTY),  # the floor is honoured, not snapped
+        (0.0, 0.0),
+        (1.0, 1.0),
+    ],
+)
+def test_effective_level_mirrors_the_snap_apply_would_actually_write(
+    duty: float, expected: float
+) -> None:
+    """Pure prediction of what :meth:`apply` writes to ``duty_cycle``, computed
+    without touching sysfs — the same rule as the PCA9685's, from the same
+    :func:`~bellasreef_hardware_io.drivers.dimming.snap_duty`, so safety.py's
+    runtime-cap clock agrees with the pin regardless of which silicon drives
+    the channel."""
+    channel = _channel(FakeSysfs())
+    assert channel.effective_level(PwmLevel(duty=duty)) == PwmLevel(duty=expected)
+
+
+def test_effective_level_refuses_a_binary_level() -> None:
+    channel = _channel(FakeSysfs())
+    with pytest.raises(TypeError):
+        channel.effective_level(BinaryLevel(on=True))
+
+
 # ------------------------------------------------------------ off the event loop
 #
 # Every sysfs write here is a blocking syscall (`path.write_text`), reached

@@ -23,7 +23,9 @@ from bellasreef_contracts.driver import (
     SensorSample,
 )
 
-__all__ = ["FakeActuator", "FakeSensor"]
+from bellasreef_hardware_io.drivers.dimming import snap_duty
+
+__all__ = ["FakeActuator", "FakeSensor", "SnappingFakeActuator"]
 
 
 class FakeActuator:
@@ -109,6 +111,18 @@ class FakeActuator:
     async def read_back(self) -> ActuatorLevel | None:
         return self.level
 
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        """Identity: this fake models no hardware-specific narrowing.
+
+        Real PWM drivers narrow a commanded level to what actually reaches
+        the pin (dimming.py's ``snap_duty``, since safety.py's 2026-08-29
+        max-runtime-keys-on-effective-level fix); this generic fake is also
+        used for plain binary actuators that have no such narrowing, so the
+        honest generic answer is "whatever was asked for". A test exercising
+        the snap-band behaviour wants :class:`SnappingFakeActuator` instead.
+        """
+        return level
+
     # ---- test helpers -----------------------------------------------------
 
     def is_safe(self) -> bool:
@@ -120,6 +134,55 @@ class FakeActuator:
         every later `assert x.is_safe`.
         """
         return self.level == self._safe_state
+
+
+class SnappingFakeActuator:
+    """A minimal PWM-class driver satisfying ``ActuatorDriver`` by hand.
+
+    Mirrors the real PCA9685/RP1 drivers' round-trip: ``apply()`` snaps duty
+    the same way ``duty_to_counts``/``duty_to_ns`` do (dimming.py's
+    ``snap_duty`` — under 8% snaps to 0), ``read_back()`` reports what was
+    actually written rather than what was asked for, and ``effective_level()``
+    is the same snap computed *without* touching state — the pure prediction
+    safety.py's runtime-cap clock keys off. No real hardware involved; this is
+    the shape of the snap-band bug, not the silicon.
+    """
+
+    def __init__(self, actuator_id: str, safe_state: PwmLevel) -> None:
+        self._actuator_id = actuator_id
+        self._safe_state = safe_state
+        self._level = safe_state
+
+    @property
+    def driver_id(self) -> str:
+        return "fake-pwm"
+
+    @property
+    def actuator_id(self) -> str:
+        return self._actuator_id
+
+    @property
+    def safe_state(self) -> ActuatorLevel:
+        return self._safe_state
+
+    async def open(self) -> None:
+        pass
+
+    async def apply(self, level: ActuatorLevel) -> None:
+        if not isinstance(level, PwmLevel):
+            raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
+        self._level = PwmLevel(duty=snap_duty(level.duty))
+
+    async def drive_safe(self) -> None:
+        self._level = self._safe_state
+
+    async def read_back(self) -> ActuatorLevel | None:
+        return self._level
+
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        if not isinstance(level, PwmLevel):
+            raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
+        return PwmLevel(duty=snap_duty(level.duty))
 
 
 class FakeSensor:

@@ -36,9 +36,13 @@ from bellasreef_contracts import (
     BinaryLevel,
     PwmLevel,
 )
-from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent
+from bellasreef_hardware_io import (
+    FakeActuator,
+    InterlockSupervisor,
+    SafetyEvent,
+    SnappingFakeActuator,
+)
 from bellasreef_hardware_io.app import HardwareIO
-from bellasreef_hardware_io.drivers.dimming import snap_duty
 from bellasreef_hardware_io.spine import CommandConsumer
 
 OFF = BinaryLevel(on=False)
@@ -109,48 +113,6 @@ class RaisingReadBackActuator(FakeActuator):
 
     async def read_back(self) -> ActuatorLevel | None:
         raise OSError("bus unavailable")
-
-
-class SnappingFakeActuator:
-    """A minimal PWM-class driver satisfying ``ActuatorDriver`` by hand.
-
-    Mirrors pipwm.py's real round-trip: ``apply()`` snaps duty the same way
-    ``duty_to_ns`` does (dimming.py's ``snap_duty`` — under 8% snaps to 0),
-    and ``read_back()`` reports what was actually written, the way the real
-    driver reads its own ``duty_cycle`` sysfs node back rather than trusting
-    what it was told to write. No sysfs involved; this is the shape of the
-    bug, not the hardware.
-    """
-
-    def __init__(self, actuator_id: str, safe_state: PwmLevel) -> None:
-        self._actuator_id = actuator_id
-        self._safe_state = safe_state
-        self._level = safe_state
-
-    @property
-    def driver_id(self) -> str:
-        return "fake-pwm"
-
-    @property
-    def actuator_id(self) -> str:
-        return self._actuator_id
-
-    @property
-    def safe_state(self) -> ActuatorLevel:
-        return self._safe_state
-
-    async def open(self) -> None:
-        pass
-
-    async def apply(self, level: ActuatorLevel) -> None:
-        assert isinstance(level, PwmLevel)
-        self._level = PwmLevel(duty=snap_duty(level.duty))
-
-    async def drive_safe(self) -> None:
-        self._level = self._safe_state
-
-    async def read_back(self) -> ActuatorLevel | None:
-        return self._level
 
 
 def registration(
@@ -605,6 +567,53 @@ def test_republish_safe_states_publishes_only_for_actuators_at_safe_state() -> N
     assert states[0].level == OFF
     assert states[0].reason == "safe_state"
     assert states[0].latched is False
+
+
+def test_republish_safe_states_includes_a_channel_left_dark_by_a_snap_band_command() -> None:
+    """A snap-band command must not make the reconnect republish skip a
+    channel that is actually dark.
+
+    2026-08-29 finding: InterlockSupervisor's runtime-cap bookkeeping used to
+    compare the COMMANDED level against the declared safe state, so a 5% PWM
+    command — genuinely dark at the pin, per dimming.py's snap_duty rule —
+    read as "not at safe state". ``is_at_safe_state()`` feeds straight into
+    ``_republish_safe_states`` (see the test above), so a channel a
+    dawn/dusk ramp's low end drove dark would be silently skipped on
+    reconnect, leaving the engine's duty memory uncorrected — the exact bug
+    the 2026-08-23 republish fix exists to prevent, reached from the snap-band
+    side instead of the heartbeat/runtime-trip side.
+    """
+
+    async def scenario() -> list[ActuatorState]:
+        service = HardwareIO(metrics_port=0)
+        service.supervisor = InterlockSupervisor(on_event=service._on_safety_event)
+        pwm_off = PwmLevel(duty=0.0)
+        driver = SnappingFakeActuator("light-a", pwm_off)
+        service.supervisor.register(
+            registration("light-a", safe_state=pwm_off, actuator_class="pwm"), driver
+        )
+        await service.supervisor.start()
+        service._registrations = [service.supervisor.registration_of("light-a")]
+
+        await service.supervisor.apply(command("light-a", PwmLevel(duty=0.05)))
+        assert service.supervisor.is_at_safe_state("light-a"), (
+            "the pin is genuinely dark (snapped); the guard must agree"
+        )
+
+        spine = FakeSpinePublisher()
+        service.spine = spine  # type: ignore[assignment]
+
+        await service._republish_safe_states()
+
+        published = list(spine.states)
+        await service.supervisor.stop()
+        return published
+
+    states = run(scenario)
+    assert len(states) == 1, "a snap-band command must not make republish skip the channel"
+    assert states[0].actuator_id == "light-a"
+    assert states[0].level == PwmLevel(duty=0.0)
+    assert states[0].reason == "safe_state"
 
 
 def test_republish_safe_states_carries_the_current_latch_flag() -> None:

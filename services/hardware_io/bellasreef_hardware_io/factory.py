@@ -13,7 +13,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from bellasreef_contracts import ActuatorRegistration, DeviceAssignment
-from bellasreef_contracts.driver import ActuatorDriver
 from bellasreef_service import get_logger
 
 from bellasreef_hardware_io.capabilities import find_pwm_chip
@@ -21,6 +20,7 @@ from bellasreef_hardware_io.drivers.dimming import light_registration
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.drivers.pca9685 import Pca9685Channel, Pca9685Device
 from bellasreef_hardware_io.drivers.pipwm import PiPwmChannel, SysfsWriter
+from bellasreef_hardware_io.safety import SafetyActuatorDriver
 
 log = get_logger(__name__)
 
@@ -38,7 +38,7 @@ class TopologyError(RuntimeError):
 class BuiltActuator:
     """A driver plus the registration that declares its safety contract."""
 
-    def __init__(self, driver: ActuatorDriver, registration: ActuatorRegistration) -> None:
+    def __init__(self, driver: SafetyActuatorDriver, registration: ActuatorRegistration) -> None:
         self.driver = driver
         self.registration = registration
 

@@ -31,8 +31,15 @@ from bellasreef_contracts import (
     ActuatorLevel,
     ActuatorRegistration,
     BinaryLevel,
+    PwmLevel,
 )
-from bellasreef_hardware_io import FakeActuator, InterlockSupervisor, SafetyEvent, safety
+from bellasreef_hardware_io import (
+    FakeActuator,
+    InterlockSupervisor,
+    SafetyEvent,
+    SnappingFakeActuator,
+    safety,
+)
 
 # Timeouts are short so the suite stays fast, and deliberately not round
 # numbers so an implementation that happened to poll on a 50/100 ms cadence
@@ -82,6 +89,52 @@ def _command(
         actuator_id=actuator_id,
         actuator_class="binary",
         level=BinaryLevel(on=on),
+        idempotency_key=uuid4(),
+        expires_at=now + timedelta(seconds=ttl_s),
+    )
+
+
+PWM_OFF = PwmLevel(duty=0.0)
+
+
+def _pwm_registration(
+    actuator_id: str = "light-a",
+    *,
+    heartbeat_timeout_s: float = HEARTBEAT_TIMEOUT_S,
+    max_runtime_s: float = MAX_RUNTIME_S,
+) -> ActuatorRegistration:
+    """Same shape as :func:`_registration`, for the PWM/snap-band drills —
+    these need an ``actuator_class="pwm"`` guard with a ``PwmLevel`` safe
+    state, which :func:`_registration`'s binary pumps/heaters don't exercise.
+    """
+    return ActuatorRegistration(
+        message_id=uuid4(),
+        emitted_at=datetime.now(UTC),
+        source="hardware-io",
+        actuator_id=actuator_id,
+        actuator_class="pwm",
+        role="light",
+        driver_id="fake-pwm",
+        control_authority="authoritative",
+        failsafe_capable=True,
+        transport="local",
+        safe_state=PWM_OFF,
+        max_runtime_s=max_runtime_s,
+        heartbeat_timeout_s=heartbeat_timeout_s,
+    )
+
+
+def _pwm_command(
+    actuator_id: str = "light-a", *, duty: float, ttl_s: float = 30.0
+) -> ActuatorCommand:
+    now = datetime.now(UTC)
+    return ActuatorCommand(
+        message_id=uuid4(),
+        emitted_at=now,
+        source="control-engine",
+        actuator_id=actuator_id,
+        actuator_class="pwm",
+        level=PwmLevel(duty=duty),
         idempotency_key=uuid4(),
         expires_at=now + timedelta(seconds=ttl_s),
     )
@@ -478,6 +531,76 @@ def test_drill_returning_to_safe_state_resets_the_runtime_cap() -> None:
 
         assert not sup.is_latched("heater")
         assert [e for e in rec.events if e.reason == "max_runtime_exceeded"] == []
+        await sup.stop()
+
+    run(scenario)
+
+
+# ------------------------------------------- drill: max runtime keys on the
+# ------------------------------------------- effective (post-snap) level
+
+
+def test_a_snap_band_command_starts_no_runtime_clock() -> None:
+    """Extends test_drill_max_runtime_trips_and_latches's area: the runtime
+    cap must key on what the hardware actually does, not what was asked for.
+
+    2026-08-29 finding: dimming.py's snap_duty rule (session-4 ruling,
+    CLAUDE.md) turns any duty under 8% into a genuinely dark pin, but
+    InterlockSupervisor used to compare the COMMANDED level (0.049) against
+    the declared safe state (0.0) — a mismatch that started the runtime-cap
+    clock on a channel already dark at the pin. A dawn/dusk ramp crosses this
+    band twice a day, so this was the ordinary path, not an edge case: after
+    LIGHT_MAX_RUNTIME_S the guard would latch a dark channel, and clearing a
+    latch is an explicit operator action.
+    """
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        actuator = SnappingFakeActuator("light-a", PWM_OFF)
+        sup.register(_pwm_registration(), actuator)
+
+        await sup.start()
+        sup.heartbeat()
+
+        outcome = await sup.apply(_pwm_command(duty=0.049))
+        assert outcome == "applied"
+
+        assert sup.is_at_safe_state("light-a"), (
+            "the pin is genuinely dark (snapped); the guard must agree"
+        )
+        assert sup._guards["light-a"].runtime_task is None, (
+            "a snap-band command must not start the max-runtime clock on a dark pin"
+        )
+
+        await sup.stop()
+
+    run(scenario)
+
+
+def test_exactly_eight_percent_starts_the_runtime_clock() -> None:
+    """The 8% floor (MIN_USABLE_DUTY, dimming.py) is honoured, not snapped —
+    the pin is genuinely lit, so the runtime cap must guard it exactly as it
+    would any other non-safe level."""
+
+    async def scenario() -> None:
+        rec = Recorder()
+        sup = InterlockSupervisor(on_event=rec)
+        actuator = SnappingFakeActuator("light-a", PWM_OFF)
+        sup.register(_pwm_registration(), actuator)
+
+        await sup.start()
+        sup.heartbeat()
+
+        outcome = await sup.apply(_pwm_command(duty=0.08))
+        assert outcome == "applied"
+
+        assert not sup.is_at_safe_state("light-a")
+        task = sup._guards["light-a"].runtime_task
+        assert task is not None and not task.done(), (
+            "8% is honoured, not snapped; the runtime clock must be running"
+        )
+
         await sup.stop()
 
     run(scenario)
