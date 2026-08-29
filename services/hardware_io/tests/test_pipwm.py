@@ -475,6 +475,98 @@ def test_a_blocked_drive_safe_write_does_not_stall_the_event_loop() -> None:
     assert ticks > 10, f"event loop was stalled by drive_safe (only {ticks} ticks)"
 
 
+class ReleasableSysfs(FakeSysfs):
+    """The *next armed* write blocks until the test explicitly releases it.
+
+    Distinct from :class:`BlockingSysfs`'s timeout: this needs precise
+    control over when one specific write actually lands, to prove a
+    cancelled ``apply()`` cannot let its stale write escape and land after a
+    caller's very next ``drive_safe()``. Only one write is ever armed at a
+    time — ``open()``'s setup writes and any other unarmed write pass
+    straight through, same as the real kernel would let them.
+    """
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.write_started = threading.Event()
+        self._release = threading.Event()
+        self._armed = False
+
+    def block_next(self) -> None:
+        self.write_started.clear()
+        self._release.clear()
+        self._armed = True
+
+    def release(self) -> None:
+        self._release.set()
+
+    def write(self, path: Path, value: str) -> None:
+        if self._armed:
+            self._armed = False
+            self.write_started.set()
+            self._release.wait()
+        super().write(path, value)
+
+
+def test_a_cancelled_apply_write_cannot_land_after_a_later_drive_safe() -> None:
+    """The regression this task's original fix introduced.
+
+    There is no lock on this driver (each channel is its own sysfs file), so
+    the property that has to hold is narrower: ``apply()`` must not let
+    ``CancelledError`` reach its caller until its own write has actually
+    landed. ``asyncio.to_thread`` cannot stop the worker thread once
+    ``path.write_text`` has started — cancelling the coroutine awaiting it
+    only stops *waiting*. Without the shield, a caller that reacts to the
+    cancellation by immediately calling ``drive_safe()`` (exactly what
+    safety.py's trip path does) would have its "0" land first, and the stale
+    commanded duty would land *after* it once the original write finally
+    completes — leaving the channel lit rather than dark after a trip.
+    """
+    sysfs = ReleasableSysfs()
+    channel = _channel(sysfs)
+
+    async def scenario() -> None:
+        await channel.open()
+        sysfs.writes.clear()
+        sysfs.block_next()
+
+        apply_task = asyncio.create_task(channel.apply(PwmLevel(duty=0.5)))
+        # Wait for the 0.5 write to actually be running (blocked) in its thread.
+        await asyncio.to_thread(sysfs.write_started.wait)
+
+        apply_task.cancel()
+
+        # Give the cancellation every chance to (wrongly) let apply() return
+        # before its own write has landed.
+        try:
+            await asyncio.sleep(0.05)
+            assert not apply_task.done(), (
+                "apply() completed while its own write was still in flight — a "
+                "caller reacting to this cancellation could call drive_safe() "
+                "before the stale write actually lands"
+            )
+        finally:
+            # However the assert above lands, the real (background) write is
+            # blocked on `_release` and must be let go — otherwise this leaves
+            # a `ThreadPoolExecutor` worker parked forever, which hangs the
+            # whole process at interpreter exit rather than just failing this
+            # test.
+            sysfs.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await apply_task
+
+        # Only after apply() has genuinely finished does the caller drive safe.
+        await channel.drive_safe()
+
+    run(scenario)
+    duty_writes = [v for name, v in sysfs.writes if name == "duty_cycle"]
+    assert duty_writes == [str(duty_to_ns(0.5, DEFAULT_PERIOD_NS)), "0"], (
+        f"drive_safe's 0 must land after the cancelled apply's stale write, "
+        f"never before it: {duty_writes}"
+    )
+
+
 # ------------------------------------------------------------ registration
 
 

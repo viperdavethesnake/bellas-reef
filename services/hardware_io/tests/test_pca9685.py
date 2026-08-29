@@ -491,7 +491,7 @@ def test_a_blocked_write_does_not_stall_the_event_loop() -> None:
     below would barely advance for the ~300 ms the write takes.
     """
     bus = BlockingBus()
-    device, _ = Pca9685Device(bus), bus
+    device = Pca9685Device(bus)
     channel = Pca9685Channel(device, 0, "led-blue")
     ticks = 0
 
@@ -571,3 +571,89 @@ def test_two_channels_on_one_chip_serialise_their_writes() -> None:
 
     run(scenario)
     assert bus.overlap == 0, "two channel writes on the same chip overlapped"
+
+
+class ReleasableBus(FakeBus):
+    """A chip whose write blocks until the test explicitly releases it.
+
+    Distinct from :class:`BlockingBus`'s timeout: this one needs precise
+    control over when the in-flight write actually lands, to prove a
+    cancelled caller cannot make the lock available before that happens.
+    Also tracks overlap, the same way :class:`TrackedBus` does — a second
+    write starting while this one is still blocked is exactly the bug.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_started = threading.Event()
+        self.active = 0
+        self.overlap = 0
+        self._release = threading.Event()
+
+    def write_i2c_block_data(self, address: int, register: int, data: list[int]) -> None:
+        self.active += 1
+        if self.active > 1:
+            self.overlap += 1
+        self.write_started.set()
+        self._release.wait()
+        self.active -= 1
+        super().write_i2c_block_data(address, register, data)
+
+    def release(self) -> None:
+        self._release.set()
+
+
+def test_a_cancelled_write_does_not_release_the_lock_before_it_lands() -> None:
+    """The regression this task's original fix introduced.
+
+    ``asyncio.to_thread`` cannot stop the worker thread once
+    ``write_i2c_block_data`` has started — cancelling the coroutine awaiting
+    it only stops *waiting*. Without the shield in ``apply_duty``, cancelling
+    channel A's ``apply()`` while its write is in flight would unwind
+    straight out of ``async with self._lock``, releasing the lock while A's
+    write was still running on its own thread — letting channel B start a
+    second, genuinely concurrent transaction on the same chip. That is the
+    exact interleaving the lock exists to prevent, and it would have passed
+    ``test_two_channels_on_one_chip_serialise_their_writes`` above, which
+    never cancels anything.
+    """
+    bus = ReleasableBus()
+    device = Pca9685Device(bus)
+    a = Pca9685Channel(device, 0, "led-a")
+    b = Pca9685Channel(device, 1, "led-b")
+
+    async def scenario() -> None:
+        first = asyncio.create_task(a.apply(PwmLevel(duty=0.5)))
+        # Wait for A's write to actually be running (blocked) in its thread.
+        await asyncio.to_thread(bus.write_started.wait)
+
+        first.cancel()
+
+        # Give the cancellation every chance to (wrongly) unwind through the
+        # lock — this sleep is exactly where a premature release would show
+        # up as B's write starting.
+        second = asyncio.create_task(b.apply(PwmLevel(duty=0.5)))
+        try:
+            await asyncio.sleep(0.05)
+            assert not second.done(), (
+                "the second channel's apply() completed while the first channel's "
+                "write was still in flight — the lock was released too early"
+            )
+            assert bus.overlap == 0, "a second write started while the first was still on the wire"
+        finally:
+            # However the asserts above land, A's real (background) write is
+            # blocked on `_release` and must be let go — otherwise this leaves
+            # a `ThreadPoolExecutor` worker parked forever, which hangs the
+            # whole process at interpreter exit rather than just failing this
+            # test.
+            bus.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+
+    run(scenario)
+    assert bus.overlap == 0
+    # Both writes landed, strictly in order — B could not start until A's
+    # (cancelled) write had actually finished.
+    assert len(bus.blocks) == 2

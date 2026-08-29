@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final, Protocol
 from uuid import uuid4
@@ -64,6 +65,36 @@ from bellasreef_service import get_logger
 from bellasreef_hardware_io.drivers.dimming import light_registration, snap_duty
 
 log = get_logger(__name__)
+
+
+async def _to_thread_uncancellable[**P](
+    func: Callable[P, None], *args: P.args, **kwargs: P.kwargs
+) -> None:
+    """Run a blocking bus call in a thread; a cancellation cannot leave it running.
+
+    ``asyncio.to_thread`` cannot stop the worker thread once a write has
+    started — cancelling the *awaiting* coroutine only stops this coroutine
+    from waiting on it, and the ``smbus2`` transaction keeps running to
+    completion regardless. Left unshielded, a cancellation racing a write
+    inside :meth:`Pca9685Device.apply_duty` or :meth:`Pca9685Device.initialise`
+    would unwind straight out of ``async with self._lock`` and release the
+    lock while the write was still on the wire — the exact interleaving the
+    lock exists to prevent.
+
+    Shielding the offloaded task keeps a cancellation from reaching it; if the
+    caller is cancelled anyway, we still wait for the thread to actually
+    finish before letting ``CancelledError`` continue past us, so nothing
+    downstream — the lock release, or a caller that reacts to the
+    cancellation by issuing its own write right after — ever observes a write
+    still in flight.
+    """
+    task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
 
 __all__ = [
     "INVRT_ON",
@@ -276,10 +307,12 @@ class Pca9685Device:
         The whole sequence is one ``smbus2`` transaction after another — ten
         blocking bus calls in a row — so it runs off the loop in a worker
         thread, under this chip's lock, same as every other write to it. See
-        :attr:`_lock`.
+        :attr:`_lock`. The offload is cancellation-shielded (see
+        :func:`_to_thread_uncancellable`) so a cancellation here cannot
+        release the lock mid-sequence either.
         """
         async with self._lock:
-            await asyncio.to_thread(self._initialise_sync)
+            await _to_thread_uncancellable(self._initialise_sync)
 
         log.info(
             "pca9685 initialised",
@@ -340,10 +373,14 @@ class Pca9685Device:
         Serialized against every other offloaded write to this chip — this
         channel's, its fifteen siblings', and :meth:`initialise` — by
         :attr:`_lock`, so two commands landing at once cannot interleave their
-        bytes on the wire.
+        bytes on the wire. The offload is cancellation-shielded (see
+        :func:`_to_thread_uncancellable`): a caller cancelled mid-write still
+        cannot make the lock available to a second caller until this write has
+        actually finished on the wire, which is the property the lock exists
+        to provide in the first place.
         """
         async with self._lock:
-            await asyncio.to_thread(self.write_channel, channel, duty)
+            await _to_thread_uncancellable(self.write_channel, channel, duty)
 
     def write_channel(self, channel: int, duty: float) -> None:
         if not 0 <= channel < _CHANNELS:
