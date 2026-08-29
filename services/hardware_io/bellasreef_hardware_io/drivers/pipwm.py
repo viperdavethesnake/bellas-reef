@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final, Protocol
 
@@ -60,6 +61,36 @@ __all__ = [
     "chip_identity_and_facts",
     "duty_to_ns",
 ]
+
+
+async def _to_thread_uncancellable[**P](
+    func: Callable[P, None], *args: P.args, **kwargs: P.kwargs
+) -> None:
+    """Run a blocking sysfs write in a thread; a cancellation cannot leave it running.
+
+    Same shape and the same reason as the PCA9685 driver's helper of the same
+    name: ``asyncio.to_thread`` cannot stop the worker thread once a write has
+    started, so cancelling the awaiting coroutine only stops *waiting* on it —
+    the write keeps running regardless.
+
+    There is no chip-wide lock here (each RP1 channel is its own sysfs file,
+    unlike the PCA9685's sixteen channels sharing one register block), but the
+    escape is still live: a cancelled ``apply()`` whose stale write outlives it
+    can land *after* a caller's very next ``drive_safe()``, leaving the
+    channel at the commanded duty rather than dark. Shielding keeps the
+    cancellation from reaching the write; if the caller is cancelled anyway,
+    we still wait for the write to land before letting ``CancelledError``
+    continue past us, so a caller that reacts to the cancellation by calling
+    ``drive_safe()`` right after can never race a write that is still in
+    flight.
+    """
+    task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
 
 #: Default sysfs root. A path rather than a discovered device, because the
 #: chip index has moved between kernel releases before — see the gpiochip note
@@ -337,7 +368,17 @@ class PiPwmChannel:
     async def apply(self, level: ActuatorLevel) -> None:
         if not isinstance(level, PwmLevel):
             raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
-        self._sysfs.write(self._dir / "duty_cycle", str(duty_to_ns(level.duty, self._period_ns)))
+        duty_ns = str(duty_to_ns(level.duty, self._period_ns))
+        # `path.write_text` is a blocking syscall reached straight from this
+        # `async def`, same shape as the PCA9685's I2C writes — offloaded the
+        # same way, off the loop. No cross-channel lock: unlike the PCA9685's
+        # sixteen channels sharing one chip's register block, each RP1 channel
+        # is its own sysfs file and cannot interleave with another channel's.
+        # Cancellation-shielded (see :func:`_to_thread_uncancellable`) so a
+        # cancelled apply's write cannot still be in flight by the time a
+        # caller's next drive_safe() writes "0" — see that function's
+        # docstring for what goes wrong without it.
+        await _to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", duty_ns)
 
     async def drive_safe(self) -> None:
         """Zero on-time, without consulting anything.
@@ -345,9 +386,14 @@ class PiPwmChannel:
         Duty rather than ``enable``: disabling releases the pin to whatever the
         pad default is, and this must land somewhere known. It is also called
         precisely when the spine, the engine and the database are gone, so it
-        touches none of them.
+        touches none of them — and it is what the heartbeat watcher calls, so
+        the write is offloaded the same as :meth:`apply`: this is the one path
+        that must never itself be the thing stalling on a wedged bus. Also
+        cancellation-shielded, same as :meth:`apply` — the safe-state write
+        cannot be superseded by a still-running write from whatever this
+        channel was doing before.
         """
-        self._sysfs.write(self._dir / "duty_cycle", "0")
+        await _to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
 
     async def read_back(self) -> ActuatorLevel | None:
         """What the kernel currently has, which is more than the PCA9685 offers.
@@ -365,3 +411,20 @@ class PiPwmChannel:
         if period_ns <= 0:
             return None
         return PwmLevel(duty=min(duty_ns / period_ns, 1.0))
+
+    def effective_level(self, level: ActuatorLevel) -> ActuatorLevel:
+        """What :meth:`apply` would actually write to ``duty_cycle`` — pure,
+        no sysfs I/O.
+
+        hardware-io-internal Protocol member (safety.py's
+        ``SafetyActuatorDriver``), not part of the contracts
+        ``ActuatorDriver``. Applies the same
+        :func:`~.dimming.snap_duty` rule :func:`duty_to_ns` uses, from the
+        same constant the PCA9685 driver's ``effective_level`` uses, so a
+        channel's safety behaviour cannot depend on which silicon drives it
+        (2026-08-29 finding — see :mod:`.pca9685`'s ``effective_level`` for
+        the full context on why this exists).
+        """
+        if not isinstance(level, PwmLevel):
+            raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")
+        return PwmLevel(duty=snap_duty(level.duty))

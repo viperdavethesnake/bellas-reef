@@ -10,13 +10,14 @@ default run — CI never touches a tank.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
 import pytest
-from bellasreef_contracts.driver import CalibrationPoint, OneWireDevice
+from bellasreef_contracts.driver import CalibrationPoint, OneWireDevice, SensorSample
 from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
 
 # A real capture from the attached probe, 2026-08-09.
@@ -184,6 +185,91 @@ class TestBusSerialisation:
 
         run(scenario)
         assert overlap == 0, "two probes converted on the same bus simultaneously"
+
+
+class TestBusLockSurvivesTimeout:
+    """Task 3: the bus lock must be held for the reader thread's true lifetime.
+
+    Previously the lock was an ``asyncio.Lock`` held by ``async with`` around
+    ``wait_for``. On timeout, ``wait_for`` cancels the AWAIT, not the thread —
+    the sysfs read kept running on the bus, but the ``async with`` unwound and
+    released the lock anyway, so a second probe could start converting on the
+    wire while the first was still mid-read. Fixed by moving the lock to a
+    ``threading.Lock`` acquired and released inside the worker thread itself,
+    which has no cancellation hole to unwind through.
+
+    (No multi-loop test for the dissolved asyncio.Lock loop-binding defect:
+    a ``threading.Lock`` has no event loop to bind to, so that failure mode is
+    structurally impossible now, not merely untested.)
+    """
+
+    def test_timeout_does_not_release_the_bus(self, w1_root: Path) -> None:
+        probe1_entered = threading.Event()
+        release_probe1 = threading.Event()
+        probe1_finished = threading.Event()
+        second_entered = threading.Event()
+        overlap_detected = threading.Event()
+
+        class StragglerProbe(DS18B20):
+            def _blocking_read(self) -> str:
+                probe1_entered.set()
+                # Held open by the test, not by a sleep duration, so the
+                # ordering assertion below does not depend on timing luck.
+                release_probe1.wait()
+                probe1_finished.set()
+                return GOOD
+
+        class SecondProbe(DS18B20):
+            def _blocking_read(self) -> str:
+                if not probe1_finished.is_set():
+                    overlap_detected.set()
+                second_entered.set()
+                return GOOD
+
+        # Same default bus_master, so both probes resolve to one lock.
+        probe1 = StragglerProbe(OneWireDevice(device_id=ROM), root=w1_root, read_timeout_s=1.0)
+        probe2 = SecondProbe(OneWireDevice(device_id=ROM), root=w1_root, read_timeout_s=1.0)
+
+        async def scenario() -> None:
+            probe2_task: asyncio.Task[SensorSample] | None = None
+            try:
+                sample1 = await probe1.read()
+                assert sample1.quality == "fault"
+                # The straggler thread is still running the "conversion" —
+                # proven by the fact that only the test itself can release it.
+                assert probe1_entered.is_set()
+                assert not probe1_finished.is_set()
+
+                probe2_task = asyncio.create_task(probe2.read())
+                # Give probe 2's worker thread a moment to reach the lock. It
+                # must be unable to pass it while probe 1's straggler still
+                # holds it — this is the assertion the old code failed.
+                await asyncio.sleep(0.05)
+                assert not second_entered.is_set(), (
+                    "probe 2 entered the blocking body while probe 1's "
+                    "straggler thread was still running — the bus lock was "
+                    "released early"
+                )
+
+                release_probe1.set()
+                sample2 = await probe2_task
+                assert sample2.quality == "ok"
+            finally:
+                # Release the straggler thread no matter how the scenario
+                # above ends. Left blocked, it would still be sitting in
+                # release_probe1.wait() when asyncio.run() tears the loop
+                # down and its executor shutdown joins every worker thread —
+                # which would hang the whole test rather than fail it.
+                release_probe1.set()
+                if probe2_task is not None and not probe2_task.done():
+                    probe2_task.cancel()
+
+        run(scenario)
+        assert not overlap_detected.is_set(), (
+            "probe 2 ran before probe 1's thread released the lock"
+        )
+        assert probe1_finished.is_set()
+        assert second_entered.is_set()
 
 
 # ------------------------------------------------------------ real hardware

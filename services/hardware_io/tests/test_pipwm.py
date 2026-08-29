@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -388,6 +389,212 @@ def test_read_back_is_none_when_the_channel_is_not_there() -> None:
         return await _channel(FakeSysfs()).read_back()
 
     assert run(scenario) is None
+
+
+# ------------------------------------------------------------ effective_level
+
+
+@pytest.mark.parametrize(
+    ("duty", "expected"),
+    [
+        (0.05, 0.0),  # in the undefined band: snaps to hard off
+        (MIN_USABLE_DUTY, MIN_USABLE_DUTY),  # the floor is honoured, not snapped
+        (0.0, 0.0),
+        (1.0, 1.0),
+    ],
+)
+def test_effective_level_mirrors_the_snap_apply_would_actually_write(
+    duty: float, expected: float
+) -> None:
+    """Pure prediction of what :meth:`apply` writes to ``duty_cycle``, computed
+    without touching sysfs — the same rule as the PCA9685's, from the same
+    :func:`~bellasreef_hardware_io.drivers.dimming.snap_duty`, so safety.py's
+    runtime-cap clock agrees with the pin regardless of which silicon drives
+    the channel."""
+    channel = _channel(FakeSysfs())
+    assert channel.effective_level(PwmLevel(duty=duty)) == PwmLevel(duty=expected)
+
+
+def test_effective_level_refuses_a_binary_level() -> None:
+    channel = _channel(FakeSysfs())
+    with pytest.raises(TypeError):
+        channel.effective_level(BinaryLevel(on=True))
+
+
+# ------------------------------------------------------------ off the event loop
+#
+# Every sysfs write here is a blocking syscall (`path.write_text`), reached
+# straight from `async def apply`/`drive_safe` with no executor hop. A stalled
+# write — a wedged pwmchip, a slow filesystem — stalls the whole process,
+# including the heartbeat watcher in safety.py. Same shape as the PCA9685's
+# I2C bus, and the same fix: offload to a thread. Mirrors onewire.py's
+# `test_slow_probe_does_not_stall_the_event_loop`.
+
+
+class BlockingSysfs(FakeSysfs):
+    """A sysfs whose writes take real wall-clock time once armed.
+
+    Armed only after ``open()`` so the setup sequence itself stays instant —
+    what's under test is the command path (``apply``/``drive_safe``), not
+    channel bring-up. ``threading.Event.wait(timeout=...)`` always times out
+    (nothing ever sets it), which reads as "blocked until released or the
+    clock runs out" — a wedged pwmchip, not a scripted delay.
+    """
+
+    def __init__(self, block_s: float = 0.3, **kw: Any) -> None:
+        super().__init__(**kw)
+        self._never = threading.Event()
+        self._block_s = block_s
+        self.blocking = False
+
+    def write(self, path: Path, value: str) -> None:
+        if self.blocking:
+            self._never.wait(timeout=self._block_s)
+        super().write(path, value)
+
+
+def test_a_blocked_apply_write_does_not_stall_the_event_loop() -> None:
+    """If ``apply()`` ran the write straight on the loop, the ticker below
+    would barely advance for the ~300 ms the write takes."""
+    sysfs = BlockingSysfs()
+    channel = _channel(sysfs)
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+        await channel.open()
+        sysfs.blocking = True
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.apply(PwmLevel(duty=0.5))
+        t.cancel()
+
+    run(scenario)
+    # ~30 ticks expected in 300 ms. A blocked loop would yield ~0.
+    assert ticks > 10, f"event loop was stalled by the write (only {ticks} ticks)"
+
+
+def test_a_blocked_drive_safe_write_does_not_stall_the_event_loop() -> None:
+    """Doubly so for ``drive_safe`` — it is what the heartbeat watcher calls."""
+    sysfs = BlockingSysfs()
+    channel = _channel(sysfs)
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+        await channel.open()
+        sysfs.blocking = True
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.drive_safe()
+        t.cancel()
+
+    run(scenario)
+    assert ticks > 10, f"event loop was stalled by drive_safe (only {ticks} ticks)"
+
+
+class ReleasableSysfs(FakeSysfs):
+    """The *next armed* write blocks until the test explicitly releases it.
+
+    Distinct from :class:`BlockingSysfs`'s timeout: this needs precise
+    control over when one specific write actually lands, to prove a
+    cancelled ``apply()`` cannot let its stale write escape and land after a
+    caller's very next ``drive_safe()``. Only one write is ever armed at a
+    time — ``open()``'s setup writes and any other unarmed write pass
+    straight through, same as the real kernel would let them.
+    """
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.write_started = threading.Event()
+        self._release = threading.Event()
+        self._armed = False
+
+    def block_next(self) -> None:
+        self.write_started.clear()
+        self._release.clear()
+        self._armed = True
+
+    def release(self) -> None:
+        self._release.set()
+
+    def write(self, path: Path, value: str) -> None:
+        if self._armed:
+            self._armed = False
+            self.write_started.set()
+            self._release.wait()
+        super().write(path, value)
+
+
+def test_a_cancelled_apply_write_cannot_land_after_a_later_drive_safe() -> None:
+    """The regression this task's original fix introduced.
+
+    There is no lock on this driver (each channel is its own sysfs file), so
+    the property that has to hold is narrower: ``apply()`` must not let
+    ``CancelledError`` reach its caller until its own write has actually
+    landed. ``asyncio.to_thread`` cannot stop the worker thread once
+    ``path.write_text`` has started — cancelling the coroutine awaiting it
+    only stops *waiting*. Without the shield, a caller that reacts to the
+    cancellation by immediately calling ``drive_safe()`` (exactly what
+    safety.py's trip path does) would have its "0" land first, and the stale
+    commanded duty would land *after* it once the original write finally
+    completes — leaving the channel lit rather than dark after a trip.
+    """
+    sysfs = ReleasableSysfs()
+    channel = _channel(sysfs)
+
+    async def scenario() -> None:
+        await channel.open()
+        sysfs.writes.clear()
+        sysfs.block_next()
+
+        apply_task = asyncio.create_task(channel.apply(PwmLevel(duty=0.5)))
+        # Wait for the 0.5 write to actually be running (blocked) in its thread.
+        await asyncio.to_thread(sysfs.write_started.wait)
+
+        apply_task.cancel()
+
+        # Give the cancellation every chance to (wrongly) let apply() return
+        # before its own write has landed.
+        try:
+            await asyncio.sleep(0.05)
+            assert not apply_task.done(), (
+                "apply() completed while its own write was still in flight — a "
+                "caller reacting to this cancellation could call drive_safe() "
+                "before the stale write actually lands"
+            )
+        finally:
+            # However the assert above lands, the real (background) write is
+            # blocked on `_release` and must be let go — otherwise this leaves
+            # a `ThreadPoolExecutor` worker parked forever, which hangs the
+            # whole process at interpreter exit rather than just failing this
+            # test.
+            sysfs.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await apply_task
+
+        # Only after apply() has genuinely finished does the caller drive safe.
+        await channel.drive_safe()
+
+    run(scenario)
+    duty_writes = [v for name, v in sysfs.writes if name == "duty_cycle"]
+    assert duty_writes == [str(duty_to_ns(0.5, DEFAULT_PERIOD_NS)), "0"], (
+        f"drive_safe's 0 must land after the cancelled apply's stale write, "
+        f"never before it: {duty_writes}"
+    )
 
 
 # ------------------------------------------------------------ registration
