@@ -582,12 +582,17 @@ class InterlockSupervisor:
     def registration_of(self, actuator_id: str) -> ActuatorRegistration:
         return self._guards[actuator_id].registration
 
-    def driver_of(self, actuator_id: str) -> ActuatorDriver:
+    def driver_of(self, actuator_id: str) -> SafetyActuatorDriver:
         """Read-only access to a registered driver.
 
         Broker-free, like every other accessor here — it exists so a spine-
         holding caller (CommandConsumer) can ask a driver what it actually did
-        (``read_back()``) without safety.py taking any dependency on NATS."""
+        (``read_back()``) or would do (``effective_level()``) without
+        safety.py taking any dependency on NATS. Typed against the extended
+        protocol (not the bare contracts ``ActuatorDriver``) so a caller like
+        ``_publish_applied_state`` can reach ``effective_level()`` without an
+        unchecked cast — every guard's driver already satisfies it, since
+        ``register()`` requires it."""
         return self._guards[actuator_id].driver
 
     def is_latched(self, actuator_id: str) -> bool:

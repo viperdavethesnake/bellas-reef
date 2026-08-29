@@ -115,6 +115,23 @@ class RaisingReadBackActuator(FakeActuator):
         raise OSError("bus unavailable")
 
 
+class NoReadBackSnappingActuator(SnappingFakeActuator):
+    """The actual PCA9685 shape: snaps duty like every PWM driver, AND
+    ``read_back()`` is honestly ``None`` (pca9685.py:528 — the registers
+    only echo what was written, never a measurement).
+
+    ``NoReadBackActuator`` above covers "driver can't report" for a plain
+    (non-snapping) actuator; ``SnappingFakeActuator`` covers "driver snaps"
+    for one that *can* report. Neither alone reproduces the PCA9685 bug this
+    class exists for: read_back() None forces the fallback branch, and only
+    a snapping driver's ``effective_level()`` can disagree with its
+    commanded level once there.
+    """
+
+    async def read_back(self) -> ActuatorLevel | None:
+        return None
+
+
 def registration(
     actuator_id: str,
     *,
@@ -216,6 +233,53 @@ def test_applied_command_publishes_the_snapped_level_not_the_commanded_one() -> 
     state = states[0]
     assert state.actuator_id == "light-a"
     assert state.level == PwmLevel(duty=0.0), "published the commanded 5%, not the snapped truth"
+    assert state.reason == "commanded"
+    assert state.latched is False
+
+
+def test_none_read_back_falls_back_to_effective_level_not_the_commanded_one() -> None:
+    """The PCA9685 shape, exactly: ``read_back()`` is honestly ``None``
+    (pca9685.py:528, deliberately — the registers only echo what was
+    written), so the truth line falls back to ``driver.effective_level()``.
+
+    2026-08-29 fix-round finding: before this, the fallback used
+    ``command.level`` unconditionally, so a 5% command on a real PCA9685
+    channel published 5% on the wire and archived 5% in VictoriaMetrics
+    while the pin — and, since the same-day max-runtime fix, the supervisor
+    itself — considered the channel genuinely dark. Same headline bug as
+    ``test_applied_command_publishes_the_snapped_level_not_the_commanded_one``
+    above, reached through the "driver cannot report at all" branch instead
+    of the "read_back disagrees" one — which is the branch every adopted
+    PCA9685 channel actually takes, every time, since its ``read_back()``
+    never returns anything else.
+    """
+
+    async def scenario() -> list[ActuatorState]:
+        pwm_off = PwmLevel(duty=0.0)
+        supervisor = InterlockSupervisor(on_event=_swallow)
+        driver = NoReadBackSnappingActuator("light-a", pwm_off)
+        pwm_reg = registration("light-a", safe_state=pwm_off, actuator_class="pwm")
+        supervisor.register(pwm_reg, driver)
+        await supervisor.start()
+
+        spine = FakeSpinePublisher()
+        consumer = CommandConsumer(spine, supervisor)  # type: ignore[arg-type]
+
+        cmd = command("light-a", PwmLevel(duty=0.05))
+        outcome = await supervisor.apply(cmd)
+        assert outcome == "applied"
+        await consumer._publish_applied_state(cmd)
+
+        await supervisor.stop()
+        return spine.states
+
+    states = run(scenario)
+    assert len(states) == 1
+    state = states[0]
+    assert state.actuator_id == "light-a"
+    assert state.level == PwmLevel(duty=0.0), (
+        "published the commanded 5% via the None-read_back fallback, not the snapped truth"
+    )
     assert state.reason == "commanded"
     assert state.latched is False
 

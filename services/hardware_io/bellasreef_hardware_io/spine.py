@@ -711,16 +711,29 @@ class CommandConsumer:
         snap_duty rule (dimming.py) can turn a 5% command into a dark pin;
         publishing ``command.level`` unconditionally would have shown 5% on
         the truth line and archived 5% in VictoriaMetrics while the channel
-        sat at 0%. Falls back to the commanded level only when the driver
-        cannot report one at all (PCA9685, deliberately — see its
-        ``read_back()``), and on a ``read_back()`` failure.
+        sat at 0%.
+
+        Falls back to ``driver.effective_level(command.level)`` — the same
+        pure snap prediction safety.py's max-runtime clock now keys on
+        (2026-08-29) — when the driver cannot report a measured value at all.
+        This is not a corner case: the PCA9685 (pca9685.py:528) *always*
+        returns ``None`` from ``read_back()``, deliberately, because its
+        registers only echo what was written and prove nothing about the
+        LED driver. Before this fallback existed, that meant the PCA9685 leg
+        published the raw commanded level unconditionally — so a 5% command
+        on an adopted PCA9685 channel would have shown 5% on the wire and in
+        VictoriaMetrics while the supervisor (correctly, post the same-day
+        fix) already considered the channel dark: the exact divergence this
+        method's docstring describes, reached through the "driver cannot
+        report" branch rather than the read_back-disagrees one.
+        ``command.level`` remains the last resort, on a ``read_back()``
+        failure — a raised exception, not a driver's honest ``None``.
         """
         level: ActuatorLevel = command.level
         try:
             driver = self._supervisor.driver_of(command.actuator_id)
             read = await driver.read_back()
-            if read is not None:
-                level = read
+            level = read if read is not None else driver.effective_level(command.level)
         except Exception:
             log.warning(
                 "read_back failed; publishing the commanded level instead",
