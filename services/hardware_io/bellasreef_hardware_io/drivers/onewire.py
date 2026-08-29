@@ -7,7 +7,7 @@ for. Measured on the target hardware, a single read costs **831 ms** — above t
 ~750 ms datasheet conversion time at 12-bit resolution — and the 1-Wire bus is
 serialized, so N probes read naively cost N × 831 ms.
 
-That cost is absorbed here and never exposed to the caller:
+The event-loop half of that cost is absorbed here; the bus half is not:
 
 * the blocking sysfs read runs in a worker thread, so the event loop keeps
   running;
@@ -17,10 +17,20 @@ That cost is absorbed here and never exposed to the caller:
   that overruns ``read_timeout_s`` cannot leave the lock released while its
   thread is still on the wire: ``asyncio.wait_for`` cancels the AWAIT, never
   the thread, so the lock has to be the thread's to hold;
-* a read that overruns ``read_timeout_s`` yields ``quality="fault"`` rather than
-  a stale value wearing a fresh timestamp, while the straggler thread finishes
-  and releases the lock on its own schedule — the next read's thread queues on
-  it without touching the event loop at all.
+* because the lock is acquired *inside* the thread, ``read_timeout_s`` now
+  covers queue time as well as conversion time — a probe waiting behind
+  others on the same bus master can time out, and be reported
+  ``quality="fault"``, while the bus itself is healthy. The straggler thread
+  is not cancelled: it performs its read once the lock frees, for a sample
+  nobody receives.
+
+That is fine at the measured 831 ms with the one probe this bus carries
+today — nothing queues behind it. It stops being fine once a second probe
+shares the bus master: three or more probes polling at once can queue past
+the 2.0 s default on a healthy bus. ``read_timeout_s``'s semantics —
+queue-inclusive, as implemented, versus conversion-only, as the name
+suggests — must be re-ruled before a second probe joins this bus, not
+discovered from fault samples after it does.
 
 Read path is sysfs because that is the only interface ``w1-therm`` exposes.
 This is not the forbidden sysfs GPIO.

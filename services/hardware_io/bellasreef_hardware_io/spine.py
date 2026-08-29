@@ -736,7 +736,7 @@ class CommandConsumer:
             level = read if read is not None else driver.effective_level(command.level)
         except Exception:
             log.warning(
-                "read_back failed; publishing the commanded level instead",
+                "could not determine effective level; publishing the commanded level instead",
                 extra={"actuator_id": command.actuator_id},
                 exc_info=True,
             )
