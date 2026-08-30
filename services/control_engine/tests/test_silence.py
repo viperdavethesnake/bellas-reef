@@ -308,3 +308,49 @@ def test_a_restart_resumes_an_open_silence_rather_than_re_raising() -> None:
         assert store.raised == []
 
     run(scenario)
+
+
+def test_a_restart_with_a_dead_probe_and_no_open_episode_never_raises() -> None:
+    """PINS A KNOWN GAP — this documents current (wrong-for-production)
+    behavior. David's ruling 2026-08-29: pin it with a test now, fix later,
+    before livestock goes in. Do not flip this assertion without a ruling;
+    if a fix makes this test fail, that is the fix working, and the
+    assertion must be rewritten to match the corrected behavior deliberately
+    — not silenced, not marked xfail.
+
+    ``sweep`` (bellasreef_control_engine/alerts.py, ~lines 442-449) exempts a
+    device from the dead-probe CRITICAL as long as ``self._last_seen`` has no
+    entry for it, on the theory that "never seen" means "we have not been
+    listening long enough yet" (e.g. this process started before
+    hardware-io). But ``prime()`` only seeds ``self._silent`` from
+    already-open episodes in Postgres — it never seeds ``_last_seen`` — so a
+    probe that was already dead *before* this process started, with no open
+    episode recorded (say, the episode table was never written, or this is
+    the very first boot after the probe failed), looks identical to "brand
+    new, give it a grace period" and is exempted forever. Restart the engine
+    while a probe is dead with no open episode, and the alarm never arms —
+    the exact silent-monitoring failure this module's own docstring exists
+    to prevent, just reached by a different door (a restart, not the
+    2026-08-10 outage's leaked durable).
+
+    Simulated restart: a fresh ``SilenceWatcher``, ``prime()`` against a
+    store with the cadence configured but no open silence recorded, and
+    ``_last_seen`` never populated (no ``on_reading`` call — the dead probe
+    publishes nothing). Advance well past the deadline and sweep.
+    """
+
+    async def scenario() -> None:
+        store = FakeSilenceStore({"probe": 60.0})  # deadline 360s
+        # No store.open entry: no episode was ever recorded for this probe.
+        watcher = _watcher(store, Published())
+        await watcher.prime()  # the "restart" — _last_seen stays empty
+
+        await watcher.sweep(now=datetime.now(UTC) + timedelta(hours=6))
+
+        # Wrong for production: the probe has been silent the whole time
+        # this process has existed, yet nothing is raised. Fix is gated on
+        # livestock, not on this test (David, 2026-08-29).
+        assert store.raised == []
+        assert not watcher.is_silent("probe")
+
+    run(scenario)

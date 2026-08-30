@@ -57,7 +57,15 @@ class AssignmentPublisher:
 
     async def publish(self, assignment: DeviceAssignment) -> None:
         try:
-            if self._nc is None or not self._nc.is_connected:
+            if self._nc is not None and not self._nc.is_connected:
+                # Same stale-client hazard as stream.py's _ensure_connected:
+                # is_connected=False can mean "reconnecting", not dead. Close
+                # it before replacing it rather than leaking a client that
+                # may still finish reconnecting on its own.
+                with contextlib.suppress(Exception):
+                    await self._nc.close()
+                self._nc = None
+            if self._nc is None:
                 self._nc = await nats.connect(self._url)
             js = self._nc.jetstream()
             await js.publish(

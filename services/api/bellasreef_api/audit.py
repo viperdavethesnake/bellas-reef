@@ -25,6 +25,7 @@ at CRITICAL so they are visible rather than silent.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -66,7 +67,16 @@ class NatsAuditSink:
         self.failures = 0
 
     async def _client(self) -> Client | None:
-        if self._nc is None or not self._nc.is_connected:
+        if self._nc is not None and not self._nc.is_connected:
+            # Same stale-client hazard as stream.py's _ensure_connected and
+            # registry.py's AssignmentPublisher.publish: is_connected=False
+            # can mean "reconnecting", not dead. Close it before replacing
+            # it — called on every audit event, not once at startup, so a
+            # blip left unclosed here leaks one client per reconnect.
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
+        if self._nc is None:
             try:
                 self._nc = await nats.connect(self._url)
             except Exception:

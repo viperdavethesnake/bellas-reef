@@ -33,6 +33,7 @@ does not have.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime
 from uuid import UUID
@@ -82,6 +83,16 @@ class StreamBridge:
         async with self._lock:
             if self._nc is not None and self._nc.is_connected:
                 return
+            if self._nc is not None:
+                # nats-py reports is_connected=False on a client that is
+                # merely RECONNECTING, not dead — it may finish reconnecting
+                # on its own. Left uncleared, that client would go on
+                # delivering to its own subscriptions forever alongside the
+                # replacement built below, and close() only ever closes
+                # whichever client is newest.
+                with contextlib.suppress(Exception):
+                    await self._nc.close()
+                self._nc = None
             self._nc = await nats.connect(self._url)
             await self._nc.subscribe(subjects.ALL_STATE, cb=self._on_message)
             await self._nc.subscribe(subjects.ALL_SENSORS, cb=self._on_message)
