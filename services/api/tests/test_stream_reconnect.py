@@ -124,6 +124,11 @@ def test_ensure_connected_closes_the_stale_client_before_rebuilding(
 
     assert first.closed is True, "the stale client must be closed, not leaked"
     assert cast(Any, bridge._nc) is second, "the bridge must be left holding only the new client"
+    assert set(second.subscriptions) == {
+        subjects.ALL_STATE,
+        subjects.ALL_SENSORS,
+        subjects.ALL_ALERTS,
+    }, "the rebuilt client must re-register all three core subscriptions"
 
 
 def test_a_reconnect_blip_must_not_deliver_every_frame_twice(
