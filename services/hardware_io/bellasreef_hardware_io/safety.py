@@ -41,6 +41,7 @@ from bellasreef_service import get_logger
 __all__ = [
     "CommandOutcome",
     "InterlockSupervisor",
+    "SafetyActuatorDriver",
     "SafetyEvent",
     "TripReason",
 ]
@@ -98,10 +99,10 @@ class SafetyActuatorDriver(ActuatorDriver, Protocol):
 
         Pure — no I/O, no state mutation. Both real PWM drivers (pca9685.py,
         pipwm.py) compute this from the same ``dimming.snap_duty`` their own
-        ``apply()`` already uses, so there is exactly one place the snap rule
-        is expressed twice: once per driver, and it must not drift between
-        them (the module-level docstring of ``dimming.py`` exists for that
-        reason).
+        ``apply()`` already uses — one shared ``snap_duty``, called from each
+        driver's apply path and its ``effective_level``, so the rule cannot
+        drift between them (the module-level docstring of ``dimming.py``
+        exists for that reason).
         """
         ...
 
@@ -439,9 +440,17 @@ class InterlockSupervisor:
         # (dimming.py's snap_duty) can turn a low-duty command into a
         # genuinely dark pin, and comparing the COMMANDED level against the
         # declared safe state used to start the clock on a channel that was
-        # already safe (2026-08-29 finding). Computed before the drive so a
-        # driver that raises mid-apply leaves no clock started on a level
-        # that was never reached.
+        # already safe (2026-08-29 finding). The no-clock-on-raise property
+        # comes from _note_level running AFTER apply, not from computing
+        # effective first — effective_level is pure and cannot raise, so its
+        # place in this ordering is immaterial; a driver that raises
+        # mid-apply simply never reaches the _note_level call below, leaving
+        # no clock started on a level that was never reached. A cancellation
+        # landing during `await apply()` skips _note_level the same way,
+        # even though the shield inside the driver means the write itself
+        # landed — the only canceller today is shutdown, which drives safe
+        # anyway, so this is safe in practice; anyone adding a `wait_for`
+        # around `supervisor.apply` breaks that assumption.
         effective = guard.driver.effective_level(command.level)
         await guard.driver.apply(command.level)
         self._note_level(guard, effective)

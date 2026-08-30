@@ -76,21 +76,19 @@ _TEMP_RE = re.compile(r"\bt=(-?\d+)\s*$", re.MULTILINE)
 #: wire — see :meth:`DS18B20._read_locked`. A plain ``threading.Lock`` also
 #: has no event loop to bind to.
 #:
-#: ``_bus_lock`` itself is get-or-create over a plain dict and is only ever
-#: called from :meth:`DS18B20.read`, which runs on the event loop — a single
-#: thread, cooperatively scheduled — never from inside a worker thread. That
-#: is what makes the lookup safe without its own lock: two coroutines racing
-#: to create the *first* lock for a bus master would otherwise be a real
-#: check-then-set race and could hand out two different ``Lock`` objects.
+#: ``_bus_lock`` itself is get-or-create over a plain dict, via
+#: ``dict.setdefault`` — atomic in CPython, so two callers racing to create
+#: the *first* lock for a bus master cannot each hand out a different
+#: ``Lock`` object. Today's only caller, :meth:`DS18B20.read`, also happens
+#: to run on the event loop's single, cooperatively-scheduled thread, but the
+#: safety here comes from ``setdefault`` being enforced, not from that
+#: calling convention being merely asserted — a plain get-then-set would have
+#: needed it.
 _BUS_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _bus_lock(bus_master: str) -> threading.Lock:
-    lock = _BUS_LOCKS.get(bus_master)
-    if lock is None:
-        lock = threading.Lock()
-        _BUS_LOCKS[bus_master] = lock
-    return lock
+    return _BUS_LOCKS.setdefault(bus_master, threading.Lock())
 
 
 def discover_probes(root: Path = W1_ROOT) -> tuple[OneWireDevice, ...]:

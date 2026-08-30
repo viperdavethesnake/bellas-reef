@@ -15,6 +15,8 @@ remembering to read the other one.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Final
 from uuid import uuid4
@@ -27,7 +29,80 @@ from bellasreef_contracts import (
     PwmLevel,
 )
 
-__all__ = ["MIN_USABLE_DUTY", "light_registration", "snap_duty"]
+__all__ = [
+    "MIN_USABLE_DUTY",
+    "light_registration",
+    "snap_duty",
+    "to_thread_uncancellable",
+]
+
+
+async def to_thread_uncancellable[**P](
+    func: Callable[P, None], *args: P.args, **kwargs: P.kwargs
+) -> None:
+    """Run a blocking driver call in a thread; a cancellation cannot leave it running.
+
+    Shared by both PWM drivers — pca9685.py's I2C writes and pipwm.py's
+    sysfs writes — for the same reason :func:`snap_duty` is shared: one copy
+    means the guarantee cannot drift between the two silicons the way two
+    independently-written copies eventually would.
+
+    ``asyncio.to_thread`` cannot stop the worker thread once a blocking call
+    has started — cancelling the *awaiting* coroutine only stops this
+    coroutine from waiting on it, and the underlying transaction (an I2C
+    write, a sysfs write) keeps running to completion regardless. Left
+    unshielded, a cancellation racing that write could unwind straight out of
+    whatever the caller holds — pca9685.py's per-chip lock, most critically —
+    releasing it while the write was still on the wire, which is the exact
+    interleaving that lock exists to prevent.
+
+    Shielding the offloaded task keeps a cancellation from reaching it. If
+    the caller is cancelled anyway, we keep waiting for the thread to
+    actually finish before letting ``CancelledError`` continue past us — and
+    that guarantee has to hold under REPEATED cancellation, not just one. A
+    second cancellation delivered while we are already waiting out the first
+    must be absorbed the same way, not allowed to escape early through
+    whatever recovery code is sitting on the thread's completion: every
+    cancellation received while the underlying task is still running is
+    swallowed and we go back to waiting on it; only once the task has
+    actually finished do we re-raise — the very ``CancelledError`` instance
+    we caught, not a freshly constructed one, so a ``task.cancel(msg)``
+    message survives — if any cancellation arrived along the way.
+
+    Cancellation wins over whatever the offloaded call itself does. If no
+    cancellation ever arrived, the call's own exception (a real bus fault,
+    say) propagates normally, same as an unshielded ``to_thread`` call would.
+    But once a cancellation has been absorbed, the offloaded call's own
+    outcome — success, or its own exception — is no longer this caller's to
+    see: the caller was told to stop, and finding out the write also failed
+    is not a substitute for honoring that. 2026-08-29 review finding: an
+    earlier version of this loop caught only ``CancelledError`` here, so a
+    task that went on to raise its own exception (an ``OSError`` from the
+    bus, say) surfaced that exception straight out of the loop instead —
+    the absorbed cancellation was silently discarded.
+    """
+    task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            if task.done():
+                break
+            continue
+        except Exception:
+            # The offloaded call's own exception. If a cancellation already
+            # arrived, it wins — discard this exception rather than let it
+            # escape in place of the CancelledError the caller is owed.
+            if cancelled is not None:
+                break
+            raise
+        else:
+            break
+    if cancelled is not None:
+        raise cancelled
+
 
 #: Below this the XLG output is undefined — it may flicker, sit dark, or go to
 #: full. A property of the LED driver, not something software can smooth over.

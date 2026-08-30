@@ -39,14 +39,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable
 from pathlib import Path
 from typing import Final, Protocol
 
 from bellasreef_contracts import ActuatorLevel, PwmLevel
 from bellasreef_service import get_logger
 
-from bellasreef_hardware_io.drivers.dimming import snap_duty
+from bellasreef_hardware_io.drivers.dimming import snap_duty, to_thread_uncancellable
 
 log = get_logger(__name__)
 
@@ -61,35 +60,6 @@ __all__ = [
     "chip_identity_and_facts",
     "duty_to_ns",
 ]
-
-
-async def _to_thread_uncancellable[**P](
-    func: Callable[P, None], *args: P.args, **kwargs: P.kwargs
-) -> None:
-    """Run a blocking sysfs write in a thread; a cancellation cannot leave it running.
-
-    Same shape and the same reason as the PCA9685 driver's helper of the same
-    name: ``asyncio.to_thread`` cannot stop the worker thread once a write has
-    started, so cancelling the awaiting coroutine only stops *waiting* on it —
-    the write keeps running regardless.
-
-    There is no chip-wide lock here (each RP1 channel is its own sysfs file,
-    unlike the PCA9685's sixteen channels sharing one register block), but the
-    escape is still live: a cancelled ``apply()`` whose stale write outlives it
-    can land *after* a caller's very next ``drive_safe()``, leaving the
-    channel at the commanded duty rather than dark. Shielding keeps the
-    cancellation from reaching the write; if the caller is cancelled anyway,
-    we still wait for the write to land before letting ``CancelledError``
-    continue past us, so a caller that reacts to the cancellation by calling
-    ``drive_safe()`` right after can never race a write that is still in
-    flight.
-    """
-    task: asyncio.Task[None] = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.gather(task, return_exceptions=True)
-        raise
 
 
 #: Default sysfs root. A path rather than a discovered device, because the
@@ -288,18 +258,29 @@ class PiPwmChannel:
         4. **Polarity while still disabled**, per rule 1.
         5. **Enable last**, with duty still 0 — so the channel comes up dark
            rather than at whatever the previous run left behind.
+
+        Every write below is offloaded through the same cancellation-shielded
+        helper :meth:`apply`/:meth:`drive_safe` use (see
+        :func:`~.dimming.to_thread_uncancellable`) — these are the same
+        blocking ``path.write_text`` calls, reached from bring-up rather than
+        from the command path, and a wedged pwmchip during ``open()`` must
+        not stall the event loop any more than one during ``apply()`` would.
         """
         if self._sysfs.exists(self._dir):
-            self._sysfs.write(self._dir / "enable", "0")
+            await to_thread_uncancellable(self._sysfs.write, self._dir / "enable", "0")
         else:
-            self._sysfs.write(self._chip / "export", str(self._channel))
+            await to_thread_uncancellable(
+                self._sysfs.write, self._chip / "export", str(self._channel)
+            )
             await self._await_export()
 
-        self._sysfs.write(self._dir / "duty_cycle", "0")
-        self._sysfs.write(self._dir / "period", str(self._period_ns))
-        self._sysfs.write(self._dir / "polarity", "inversed" if self._inverted else "normal")
-        self._sysfs.write(self._dir / "duty_cycle", "0")
-        self._sysfs.write(self._dir / "enable", "1")
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "period", str(self._period_ns))
+        await to_thread_uncancellable(
+            self._sysfs.write, self._dir / "polarity", "inversed" if self._inverted else "normal"
+        )
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "enable", "1")
 
         log.info(
             "rp1 pwm channel open",
@@ -356,12 +337,20 @@ class PiPwmChannel:
         Unexporting an enabled channel leaves the pin in a state the kernel no
         longer manages. Driving it dark first means shutdown looks like every
         other safe-state path rather than like a special case.
+
+        Offloaded the same way as :meth:`open`, for the same reason. This
+        does not by itself serialize ``unexport`` against an in-flight
+        ``apply()``'s own offloaded write — there is no cross-call lock on
+        this driver (see :meth:`apply`'s docstring) — only shields each
+        individual write from being abandoned mid-flight by a cancellation.
         """
         if not self._sysfs.exists(self._dir):
             return
-        self._sysfs.write(self._dir / "duty_cycle", "0")
-        self._sysfs.write(self._dir / "enable", "0")
-        self._sysfs.write(self._chip / "unexport", str(self._channel))
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "enable", "0")
+        await to_thread_uncancellable(
+            self._sysfs.write, self._chip / "unexport", str(self._channel)
+        )
 
     # ----------------------------------------------------------- driving
 
@@ -374,11 +363,11 @@ class PiPwmChannel:
         # same way, off the loop. No cross-channel lock: unlike the PCA9685's
         # sixteen channels sharing one chip's register block, each RP1 channel
         # is its own sysfs file and cannot interleave with another channel's.
-        # Cancellation-shielded (see :func:`_to_thread_uncancellable`) so a
-        # cancelled apply's write cannot still be in flight by the time a
+        # Cancellation-shielded (see :func:`~.dimming.to_thread_uncancellable`)
+        # so a cancelled apply's write cannot still be in flight by the time a
         # caller's next drive_safe() writes "0" — see that function's
         # docstring for what goes wrong without it.
-        await _to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", duty_ns)
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", duty_ns)
 
     async def drive_safe(self) -> None:
         """Zero on-time, without consulting anything.
@@ -393,7 +382,7 @@ class PiPwmChannel:
         cannot be superseded by a still-running write from whatever this
         channel was doing before.
         """
-        await _to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
+        await to_thread_uncancellable(self._sysfs.write, self._dir / "duty_cycle", "0")
 
     async def read_back(self) -> ActuatorLevel | None:
         """What the kernel currently has, which is more than the PCA9685 offers.
@@ -424,6 +413,12 @@ class PiPwmChannel:
         channel's safety behaviour cannot depend on which silicon drives it
         (2026-08-29 finding — see :mod:`.pca9685`'s ``effective_level`` for
         the full context on why this exists).
+
+        The prediction covers the SNAP decision only — hard off, hard on, or
+        passed through unchanged — not the nanosecond rounding
+        :func:`duty_to_ns`'s ``int()`` truncation performs afterwards on a
+        non-snapped value: a commanded 0.5 comes back as ``0.5`` here, not as
+        whatever nanosecond count actually lands in ``duty_cycle``.
         """
         if not isinstance(level, PwmLevel):
             raise TypeError(f"{self._actuator_id} is a PWM channel; got {type(level).__name__}")

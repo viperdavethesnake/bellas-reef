@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from bellasreef_contracts.driver import CalibrationPoint, OneWireDevice, SensorSample
+from bellasreef_hardware_io.drivers import onewire
 from bellasreef_hardware_io.drivers.onewire import DS18B20, discover_probes
 
 # A real capture from the attached probe, 2026-08-09.
@@ -41,6 +42,18 @@ def w1_root(tmp_path: Path) -> Path:
 
 def _driver(root: Path, **kw: Any) -> DS18B20:
     return DS18B20(OneWireDevice(device_id=ROM), root=root, **kw)
+
+
+@pytest.fixture(autouse=True)
+def _reset_bus_locks() -> None:
+    """``_BUS_LOCKS`` is a process-global dict, shared by every ``DS18B20``
+    instance in this file that uses the default ``bus_master``. Clearing it
+    around each test makes the get-or-create invariant (one lock object per
+    bus master, enforced by ``dict.setdefault``) explicit rather than merely
+    true by accident because no test's lock happens to survive long enough
+    to leak into the next one.
+    """
+    onewire._BUS_LOCKS.clear()
 
 
 class TestParsing:
@@ -207,6 +220,7 @@ class TestBusLockSurvivesTimeout:
         probe1_entered = threading.Event()
         release_probe1 = threading.Event()
         probe1_finished = threading.Event()
+        second_thread_started = threading.Event()
         second_entered = threading.Event()
         overlap_detected = threading.Event()
 
@@ -220,6 +234,17 @@ class TestBusLockSurvivesTimeout:
                 return GOOD
 
         class SecondProbe(DS18B20):
+            def _read_locked(self, lock: threading.Lock) -> str:
+                # Set BEFORE contesting the lock, so the test can wait for
+                # this thread to have actually started — deterministically —
+                # rather than guessing how long "a moment" is. The lock is
+                # still held by the straggler at this point, so whatever
+                # scheduling gap exists between this line and the
+                # ``with lock:`` below cannot let this thread reach
+                # ``_blocking_read`` early; it can only block on acquire.
+                second_thread_started.set()
+                return super()._read_locked(lock)
+
             def _blocking_read(self) -> str:
                 if not probe1_finished.is_set():
                     overlap_detected.set()
@@ -241,10 +266,12 @@ class TestBusLockSurvivesTimeout:
                 assert not probe1_finished.is_set()
 
                 probe2_task = asyncio.create_task(probe2.read())
-                # Give probe 2's worker thread a moment to reach the lock. It
-                # must be unable to pass it while probe 1's straggler still
-                # holds it — this is the assertion the old code failed.
-                await asyncio.sleep(0.05)
+                # Deterministic: wait for probe 2's worker thread to have
+                # actually started, rather than sleeping a guessed duration.
+                # It must still be unable to pass the lock while probe 1's
+                # straggler holds it — this is the assertion the old code
+                # failed.
+                await asyncio.to_thread(second_thread_started.wait)
                 assert not second_entered.is_set(), (
                     "probe 2 entered the blocking body while probe 1's "
                     "straggler thread was still running — the bus lock was "

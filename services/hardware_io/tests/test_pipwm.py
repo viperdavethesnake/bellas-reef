@@ -421,6 +421,39 @@ def test_effective_level_refuses_a_binary_level() -> None:
         channel.effective_level(BinaryLevel(on=True))
 
 
+@pytest.mark.parametrize("duty", [0.05, MIN_USABLE_DUTY, 0.0, 1.0])
+def test_apply_lands_what_effective_level_predicted(duty: float) -> None:
+    """Round-trip: the nanoseconds ``apply()`` actually wrote to
+    ``duty_cycle`` on the fake, decoded back to a fraction of the period,
+    must agree with ``effective_level``'s prediction for the same input.
+
+    Exact agreement everywhere except ``MIN_USABLE_DUTY``: that row is
+    honoured rather than snapped, so it also carries the nanosecond
+    truncation ``effective_level`` explicitly does not predict (see its
+    docstring).
+    """
+
+    async def scenario() -> FakeSysfs:
+        sysfs = FakeSysfs()
+        channel = _channel(sysfs)
+        await channel.open()
+        await channel.apply(PwmLevel(duty=duty))
+        return sysfs
+
+    sysfs = run(scenario)
+    landed_ns = int(sysfs.values["/sys/class/pwm/pwmchip0/pwm0/duty_cycle"])
+    landed = landed_ns / DEFAULT_PERIOD_NS
+
+    predicted_level = _channel(FakeSysfs()).effective_level(PwmLevel(duty=duty))
+    assert isinstance(predicted_level, PwmLevel)
+    predicted = predicted_level.duty
+
+    if duty == MIN_USABLE_DUTY:
+        assert landed == pytest.approx(predicted, abs=1 / DEFAULT_PERIOD_NS)
+    else:
+        assert landed == predicted
+
+
 # ------------------------------------------------------------ off the event loop
 #
 # Every sysfs write here is a blocking syscall (`path.write_text`), reached
@@ -451,6 +484,35 @@ class BlockingSysfs(FakeSysfs):
         if self.blocking:
             self._never.wait(timeout=self._block_s)
         super().write(path, value)
+
+
+def test_a_blocked_open_write_does_not_stall_the_event_loop() -> None:
+    """Same shape as the apply/drive_safe liveness tests below, but for
+    open()'s own sysfs writes — these used to run straight on the loop with
+    no offload at all, so a wedged pwmchip during bring-up stalled the whole
+    process before the channel was even usable, heartbeat watcher included."""
+    sysfs = BlockingSysfs(block_s=0.05)
+    channel = _channel(sysfs)
+    sysfs.blocking = True
+    ticks = 0
+
+    async def scenario() -> None:
+        nonlocal ticks
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        t = asyncio.create_task(ticker())
+        await channel.open()
+        t.cancel()
+
+    run(scenario)
+    # Six writes at ~50 ms each (~300 ms total); ~30 ticks expected. A
+    # blocked loop would yield ~0.
+    assert ticks > 10, f"event loop was stalled by open() (only {ticks} ticks)"
 
 
 def test_a_blocked_apply_write_does_not_stall_the_event_loop() -> None:
@@ -593,6 +655,64 @@ def test_a_cancelled_apply_write_cannot_land_after_a_later_drive_safe() -> None:
     duty_writes = [v for name, v in sysfs.writes if name == "duty_cycle"]
     assert duty_writes == [str(duty_to_ns(0.5, DEFAULT_PERIOD_NS)), "0"], (
         f"drive_safe's 0 must land after the cancelled apply's stale write, "
+        f"never before it: {duty_writes}"
+    )
+
+
+def test_a_twice_cancelled_apply_write_cannot_land_after_a_later_drive_safe() -> None:
+    """The guarantee above must survive a REPEATED cancellation, not just one.
+
+    Same failure mode as the PCA9685 driver's twin test: the original fix's
+    recovery wait (``await asyncio.gather(task, ...)`` after the first
+    ``CancelledError``) is itself an await, and a second cancellation
+    delivered while sitting in *that* wait would have escaped uncaught,
+    before the write had actually landed — letting a caller's very next
+    ``drive_safe()`` land first after all.
+    """
+    sysfs = ReleasableSysfs()
+    channel = _channel(sysfs)
+
+    async def scenario() -> None:
+        await channel.open()
+        sysfs.writes.clear()
+        sysfs.block_next()
+
+        apply_task = asyncio.create_task(channel.apply(PwmLevel(duty=0.5)))
+        await asyncio.to_thread(sysfs.write_started.wait)
+
+        apply_task.cancel()
+        try:
+            # Let the first cancellation actually reach
+            # _to_thread_uncancellable and land it in its "wait for the real
+            # completion" phase.
+            await asyncio.sleep(0.02)
+            assert not apply_task.done(), (
+                "the first cancellation completed apply() before its own write landed"
+            )
+
+            apply_task.cancel()  # a second cancellation, on the same in-flight write
+            await asyncio.sleep(0.05)
+            assert not apply_task.done(), (
+                "a second cancellation let apply() finish before its own write landed"
+            )
+        finally:
+            # Whichever assert above lands (or fails), the real (background)
+            # write is blocked on `_release` and must be let go — otherwise
+            # this leaves a `ThreadPoolExecutor` worker parked forever,
+            # hanging the whole process at interpreter exit rather than just
+            # failing this test.
+            sysfs.release()
+
+        with pytest.raises(asyncio.CancelledError):
+            await apply_task
+
+        # Only after apply() has genuinely finished does the caller drive safe.
+        await channel.drive_safe()
+
+    run(scenario)
+    duty_writes = [v for name, v in sysfs.writes if name == "duty_cycle"]
+    assert duty_writes == [str(duty_to_ns(0.5, DEFAULT_PERIOD_NS)), "0"], (
+        f"drive_safe's 0 must land after the twice-cancelled apply's stale write, "
         f"never before it: {duty_writes}"
     )
 
