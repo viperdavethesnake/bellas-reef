@@ -22,6 +22,8 @@ EXPECTED = {
     "deploy/avahi/bellasreef.service",
     "deploy/config/devices.yaml.example",
     "scripts/install-hub.sh",
+    "scripts/update-hub.sh",
+    "scripts/factory-reset-hub.sh",
     "docs/host-setup.md",
     "docs/hub-platform-requirements.md",
     "docs/backup-restore.md",

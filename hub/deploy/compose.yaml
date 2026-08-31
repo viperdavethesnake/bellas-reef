@@ -14,8 +14,8 @@
 # not have a Docker Hub answer today.
 #
 # App images (hardware-io, control-engine, api) are pulled by SHA tag.
-# BELLASREEF_TAG is set by deploy-pi.sh to the commit SHA it just verified;
-# it defaults to :latest for local dev.
+# BELLASREEF_TAG is written into deploy/.env by install-hub.sh from
+# deploy/release.env; it defaults to :latest for local dev.
 
 name: bellasreef
 

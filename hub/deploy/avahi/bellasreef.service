@@ -11,13 +11,12 @@
   Install to /etc/avahi/services/bellasreef.service on the host.
 
   The contracts= value below is not maintained by hand, and must not be.
-  scripts/deploy-pi.sh rewrites it from the installed bellasreef-contracts
-  package as it installs this file, so the hub advertises what it actually
-  speaks. The literal here is the fallback for the manual `cp` in
-  docs/host-setup.md, and scripts/check.sh fails if it stops matching the
-  package — it sat at 2.0.0 while the package was at 3.3.0, derived from nothing
-  and tested by nothing, which is a client refusing a hub it could have talked
-  to (or accepting one it could not) on step 1 of the pairing flow.
+  scripts/install-hub.sh installs this file as it is; scripts/check.sh fails
+  if the value stops matching the bellasreef-contracts package. The literal
+  here is the fallback for the manual `cp` in docs/host-setup.md — it sat at
+  2.0.0 while the package was at 3.3.0, derived from nothing and tested by
+  nothing, which is a client refusing a hub it could have talked to (or
+  accepting one it could not) on step 1 of the pairing flow.
 -->
 <service-group>
   <name replace-wildcards="yes">Bella's Reef on %h</name>
