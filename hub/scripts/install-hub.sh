@@ -26,6 +26,7 @@ IH_ROOT="${IH_ROOT:-}"
 IH_DRY_RUN=0
 IH_CHECK_ONLY=0
 IH_YES=0
+IH_UNINSTALL=0
 IH_FAILURES=()
 IH_UNVERIFIED=()
 
@@ -94,6 +95,7 @@ Run this on the hub itself, from a clone of this repo.
   --check-only   phases 1 to 3 only: already deployed, requirements, hardware
   --dry-run      report every action, mutate nothing
   --yes          accept every offered action without prompting
+  --uninstall    remove the stack, the boot unit and deploy/.env from this machine; keeps backups, /etc/bellasreef, host config, images, and this checkout
   --help         this text
 
 Phases:
@@ -112,12 +114,20 @@ ih_parse_args() {
             --check-only) IH_CHECK_ONLY=1; shift ;;
             --dry-run)    IH_DRY_RUN=1; shift ;;
             --yes)        IH_YES=1; shift ;;
+            --uninstall)  IH_UNINSTALL=1; shift ;;
             --help|-h)    ih_usage; exit 0 ;;
             *)            printf 'install-hub: unknown option %s\n' "$1" >&2
                           ih_usage >&2
                           exit 2 ;;
         esac
     done
+    # --check-only reports and mutates nothing; --uninstall reports nothing
+    # and only mutates. Together they say opposite things about the same run.
+    if (( IH_CHECK_ONLY && IH_UNINSTALL )); then
+        printf 'install-hub: --check-only and --uninstall are contradictory\n' >&2
+        ih_usage >&2
+        exit 2
+    fi
 }
 
 # ------------------------------------------------------------------ phase 1
@@ -1117,6 +1127,145 @@ ih_phase5_deploy() {
 }
 
 
+# ------------------------------------------------------------------ uninstall
+
+# Removes the stack from this machine: the containers and their data volumes,
+# the boot unit, and deploy/.env. Runs instead of the six phases (see
+# ih_main), works from any state — a full install, a half-created one, or
+# nothing at all — and reports what it found with the same ih_pass/ih_warn
+# vocabulary the phases use.
+#
+# Kept, deliberately: the backups directory, /etc/bellasreef, docker's own
+# log-rotation config, avahi's config, a docker login, pulled images, and
+# this checkout. None of those are this script's to remove.
+IH_UNINSTALL_VOLUMES=(bellasreef_postgres-data bellasreef_vm-data bellasreef_nats-data)
+
+# Destructive enough to ask every time — --yes is for the install's offered
+# remediations, not for this. There is no bypass flag for this prompt.
+ih_uninstall_confirm() {
+    printf '\n'
+    printf '  This removes the Bella'"'"'s Reef stack from this machine.\n'
+    printf '\n'
+    printf '  This permanently deletes:\n'
+    printf '    - the data volumes: %s\n' "${IH_UNINSTALL_VOLUMES[*]}"
+    printf '      (every pairing, every device, all history)\n'
+    printf '    - the bellasreef.service boot unit\n'
+    printf '    - deploy/.env\n'
+    printf '\n'
+    printf '  This keeps:\n'
+    printf '    - the backups directory\n'
+    printf '    - /etc/bellasreef\n'
+    printf '    - /etc/docker/daemon.json\n'
+    printf '    - the avahi configuration\n'
+    printf '    - the docker login on this machine\n'
+    printf '    - the pulled images\n'
+    printf '    - this checkout\n'
+    printf '\n'
+    # A plain `read -p` prints nothing at all when stdin is not a terminal —
+    # which is exactly how the test suite drives this — so the prompt is
+    # printed here rather than left to -p, and read separately.
+    printf "  Type 'uninstall' to proceed: "
+    local answer
+    read -r answer
+    [[ "$answer" == "uninstall" ]]
+}
+
+# Step 2: stack + volumes down. A working deploy/.env means docker compose
+# knows how to do this properly; anything else (no env file, or compose
+# itself failing) falls back to removing by name — the volumes are named the
+# same regardless of what wrote them.
+ih_uninstall_stack() {
+    local envfile="$1"
+
+    if (( IH_DRY_RUN )); then
+        ih_would "docker compose -f ${IH_COMPOSE} down -v --remove-orphans"
+        ih_would "remove any leftover bellasreef-* containers and the data volumes by name"
+        return 0
+    fi
+
+    if [[ -s "$envfile" ]]; then
+        if ih_compose down -v --remove-orphans; then
+            ih_pass "stack stopped and volumes removed (docker compose down -v)"
+            return 0
+        fi
+        ih_warn "docker compose down failed; removing containers and volumes by name instead"
+    else
+        ih_warn "no deploy/.env found; removing containers and volumes by name"
+    fi
+
+    local -a ids=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && ids+=("$line")
+    done < <(docker ps -aq --filter 'name=bellasreef-' 2>/dev/null)
+    if (( ${#ids[@]} > 0 )); then
+        ih_run "removing ${#ids[@]} leftover container(s)" docker rm -f "${ids[@]}"
+    else
+        ih_warn "no leftover bellasreef-* containers found"
+    fi
+
+    local existing_volumes
+    existing_volumes="$(docker volume ls -q 2>/dev/null)"
+    local vol
+    for vol in "${IH_UNINSTALL_VOLUMES[@]}"; do
+        if grep -qx "$vol" <<<"$existing_volumes"; then
+            ih_run "removing volume ${vol}" docker volume rm "$vol"
+        else
+            ih_warn "volume ${vol} not present"
+        fi
+    done
+}
+
+ih_uninstall_summary() {
+    printf '\n'
+    ih_step "uninstall complete"
+    printf '      Removed: the stack, its data volumes, the boot unit, deploy/.env.\n'
+    printf '      Kept: backups, /etc/bellasreef, /etc/docker/daemon.json, avahi\n'
+    printf '      configuration, docker login, pulled images, this checkout.\n'
+    printf '\n'
+    printf '      This checkout remains; rm -rf %s removes it.\n' "$REPO_DIR"
+    printf '      Host configuration the installer offered (docker log rotation,\n'
+    printf '      avahi) was left in place.\n'
+}
+
+ih_uninstall() {
+    ih_step "Bella's Reef uninstall"
+
+    if (( IH_DRY_RUN )); then
+        ih_would "prompt for typed confirmation ('uninstall')"
+    elif ! ih_uninstall_confirm; then
+        ih_warn "uninstall not confirmed; nothing was changed"
+        return 1
+    fi
+
+    local unit_file="${IH_ROOT}/etc/systemd/system/bellasreef.service"
+    local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
+    local had_unit=0
+    [[ -f "$unit_file" ]] && had_unit=1
+
+    if (( had_unit )); then
+        ih_run "boot unit disabled and stopped" sudo systemctl disable --now bellasreef.service
+    else
+        ih_warn "no boot unit installed"
+    fi
+
+    ih_uninstall_stack "$envfile"
+
+    if (( had_unit )); then
+        ih_run "boot unit file removed" sudo rm -f "$unit_file"
+        ih_run "systemd reloaded" sudo systemctl daemon-reload
+    fi
+
+    if [[ -f "$envfile" ]]; then
+        ih_run "deploy/.env removed" rm -f "$envfile"
+    else
+        ih_warn "no deploy/.env to remove"
+    fi
+
+    ih_uninstall_summary
+    return 0
+}
+
 # ------------------------------------------------------------------ phase 6
 
 IH_API_INFO_URL="http://127.0.0.1:8000/api/v1/info"
@@ -1350,6 +1499,10 @@ ih_gate_summary() {
 
 ih_main() {
     ih_parse_args "$@"
+    if (( IH_UNINSTALL )); then
+        ih_uninstall
+        return $?
+    fi
     ih_step "Bella's Reef first-run install"
     if ih_phase1_already_deployed; then
         exit 0

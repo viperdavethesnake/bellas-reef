@@ -91,6 +91,13 @@ pairing, every device, the audit log, all telemetry history. It takes a
 backup before it destroys anything, and it will not proceed until you
 type `factory-reset` at the prompt.
 
+`scripts/install-hub.sh --uninstall` removes the stack instead of resetting
+it: the data volumes (once you type `uninstall`), the boot unit, and
+`deploy/.env`. It keeps your backups, `/etc/bellasreef`, the host
+configuration the installer set up, the pulled images, and this checkout.
+It also cleans up after a failed or partial install, whatever state it was
+left in.
+
 ## If you get locked out
 
 If you can't authenticate to the API anymore, `bellasreef pair` and
