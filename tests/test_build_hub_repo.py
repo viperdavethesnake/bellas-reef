@@ -100,3 +100,21 @@ def test_assembler_never_packs_a_secrets_file(tmp_path: Path) -> None:
         assert (out / "deploy/.env.example").exists()
     finally:
         dev_env.unlink(missing_ok=True)
+
+
+def test_git_would_track_every_payload_file(tmp_path: Path) -> None:
+    # The release workflow publishes the payload with `git add -A` into the
+    # bellasreef-hub repo, so the payload's own .gitignore decides what a
+    # user's clone actually receives. rc.2 shipped without .env.example
+    # because `deploy/.env.*` swallowed it; this runs git over the assembled
+    # payload exactly the way the workflow does and asserts nothing is lost.
+    out = tmp_path / "out"
+    assert build(out).returncode == 0
+    subprocess.run(["git", "init", "-q", str(out)], check=True)
+    subprocess.run(["git", "-C", str(out), "add", "-A"], check=True)
+    tracked = set(
+        subprocess.run(
+            ["git", "-C", str(out), "ls-files"], capture_output=True, text=True, check=True
+        ).stdout.splitlines()
+    )
+    assert tracked == EXPECTED, tracked

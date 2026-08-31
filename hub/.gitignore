@@ -2,3 +2,5 @@
 # GIDs, image tag). Never commit it; never let `git clean` remove it.
 deploy/.env
 deploy/.env.*
+# .env.* above must not swallow the example a fresh install renders from.
+!deploy/.env.example
