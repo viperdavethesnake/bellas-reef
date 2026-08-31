@@ -83,8 +83,12 @@ docker compose -f deploy/compose.yaml --env-file deploy/.env \
 
 ## Later
 
-`scripts/update-hub.sh` moves a hub to a newer release. It isn't
-implemented yet; running it says so and exits.
+`scripts/update-hub.sh` moves a hub to a newer release: it picks the
+newest stable `v*` tag (`--pre` for the newest pre-release, `--ref` to pin
+one, never `main`, never a downgrade on a plain run), checks it out and
+re-execs itself, takes a mandatory backup, pulls/migrates/recreates the
+three app services only, and verifies — PASS (fresh telemetry on the
+wire), NO DEVICES (empty registry; complete; adopt from the app), or FAIL.
 
 `scripts/factory-reset-hub.sh` wipes the hub back to nothing: every
 pairing, every device, the audit log, all telemetry history. It takes a
