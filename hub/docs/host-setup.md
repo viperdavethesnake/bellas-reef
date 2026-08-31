@@ -22,8 +22,9 @@ credentials. For what any machine has to provide before either is worth
 running, see `docs/hub-platform-requirements.md`.
 
 For the runtime prerequisites themselves (Docker Engine with Compose v2, the
-repo clone, `deploy/.env`, and the dev-only ghcr.io login) follow
-`docs/hub-prereqs.md`; this file assumes them and does not install them.
+repo clone, `deploy/.env`, and the ghcr.io login while images are private),
+see [`../README.md`](../README.md); this file assumes them and does not
+install them.
 
 ---
 
