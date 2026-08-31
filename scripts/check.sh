@@ -115,10 +115,8 @@ run "openapi spec drift" spec_drift
 # from nothing and tested by nothing — the same failure as the spec above, in a
 # file nobody thinks of as a contract.
 #
-# deploy-pi.sh renders the value from the installed package when it installs the
-# record, so the hub advertises the truth. This check keeps the committed file
-# honest as well, because docs/host-setup.md tells an operator to `cp` it by
-# hand and that path has no renderer in it.
+# install-hub.sh installs this file verbatim, so the committed value is what
+# every hub advertises. This check keeps it equal to the installed package.
 # Invoked indirectly as `run "..." avahi_contracts` below; see the note on
 # spec_drift above.
 # shellcheck disable=SC2329,SC2317
