@@ -708,115 +708,80 @@ ih_detect_board() {
     esac
 }
 
-# Reported, never blocking. An owner may want temperature monitoring and no
-# lights at all, so a fixed list of required interfaces would be an opinion
-# about their tank. This mirrors capabilities.py, which announces what it can
-# prove and holds no view on what should be there.
+# Reported, never required. An owner may want temperature and no lights, or
+# lights over a PCA9685 and no SoC PWM, or — on the day the hub is installed
+# — nothing attached at all. This mirrors capabilities.py, which announces
+# what it can prove and holds no view on what should be there. Nothing here
+# gates the install, prints boot-config advice, or asks a question; the
+# custom overlay procedure for RP1 PWM lives in docs/host-setup.md §9.
 ih_phase3_hardware() {
-    ih_step "3. hardware inventory"
+    ih_step "3. hardware inventory (reported, never required)"
 
-    local board
+    local board model_text
     board="$(ih_detect_board)"
-
-    # /dev/i2c-1 specifically, not a glob over /dev/i2c-*. The reference Pi has
-    # /dev/i2c-13 and /dev/i2c-14 — the HDMI DDC buses — present with i2c_arm
-    # off, so a glob announces I2C as enabled on a machine where nothing can
-    # reach a PCA9685. i2c-1 is the bus hardware-io opens.
-    local i2c_ok=0 w1_ok=0 pwm_ok=0 pwm_mux=""
-    [[ -e "${IH_ROOT}/dev/i2c-1" ]] && i2c_ok=1
-    [[ -d "${IH_ROOT}/sys/bus/w1/devices" ]] && w1_ok=1
-    compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1 && pwm_ok=1
-
-    # A channel that exports in sysfs while its pin reads `none` is the
-    # standing trap (CLAUDE.md, verified host facts): the chip is there, the
-    # header pin carries nothing, and a PWM inventory built on the sysfs
-    # directory alone says everything is fine. pinctrl is what proves the mux,
-    # and it is the same evidence hardware-io's discovery uses. Without it the
-    # honest answer is that the mux was not checked.
-    if (( pwm_ok )) && command -v pinctrl >/dev/null 2>&1; then
-        local muxed
-        muxed="$(pinctrl get 12,13,18,19 2>/dev/null | grep -c 'PWM')"
-        [[ "$muxed" =~ ^[0-9]+$ ]] || muxed=0
-        if (( muxed > 0 )); then
-            pwm_mux="${muxed} of 4 header pins muxed to PWM"
-        else
-            # Not a pass. The overlay is missing or wrong, which is precisely
-            # what the config.txt guidance below fixes.
-            pwm_ok=0
-            pwm_mux="no header pin is muxed to PWM"
-        fi
-    fi
-
-    if (( i2c_ok )); then
-        ih_pass "I2C          enabled       PCA9685 and other I2C devices available"
-    else
-        ih_warn "I2C          not enabled   no PCA9685 or I2C sensors"
-    fi
-
-    if (( w1_ok )); then
-        ih_pass "1-Wire       enabled       DS18B20 temperature probes available"
-    else
-        ih_warn "1-Wire       not enabled   no temperature probes"
-    fi
-
-    if (( pwm_ok )); then
-        ih_pass "SoC PWM      enabled       ${pwm_mux:-sysfs PWM chips present; pin mux not verified}"
-    elif [[ -n "$pwm_mux" ]]; then
-        ih_warn "SoC PWM      not usable    sysfs PWM chips present but ${pwm_mux}"
-    else
-        ih_warn "SoC PWM      not enabled   a PCA9685 still works over I2C"
-    fi
-
-    if (( i2c_ok && w1_ok && pwm_ok )); then
-        return 0
-    fi
-
-    printf '\n'
+    model_text="$(tr -d '\0' < "${IH_ROOT}/proc/device-tree/model" 2>/dev/null || true)"
     case "$board" in
-        pi5|pi)
-            ih_warn "To enable the missing interfaces, add to /boot/firmware/config.txt:"
-            (( i2c_ok )) || printf '      dtparam=i2c_arm=on\n'
-            if (( ! w1_ok )); then
-                if [[ "$board" == "pi5" ]]; then
-                    printf '      [pi5]\n      dtoverlay=w1-gpio-pi5,gpiopin=4\n'
-                else
-                    printf '      dtoverlay=w1-gpio,gpiopin=4\n'
-                fi
-            fi
-            # pwm-4chan is our custom overlay, compiled on the Pi 5 with dtc
-            # (docs/host-setup.md §9) — it names RP1 hardware and is not in
-            # the stock overlay set. On older Pis hardware-io cannot use SoC
-            # PWM at all (discover_pwm is pinned to the RP1 device), so the
-            # honest advice there is the PCA9685-over-I2C path, not an
-            # overlay that does not exist.
-            if (( ! pwm_ok )); then
-                if [[ "$board" == "pi5" ]]; then
-                    printf '      dtoverlay=pwm-4chan\n'
-                else
-                    ih_warn "SoC PWM is Pi 5-only in this stack; use a PCA9685 over I2C for PWM on this board."
-                fi
-            fi
-            ih_warn "Never put a trailing # comment on those lines; the parser folds it in."
-            ih_warn "Then reboot and run this script again."
-            ;;
-        other)
-            ih_warn "This is not a Raspberry Pi, so boot config was not inspected."
-            ih_warn "Enable the interfaces you need however this board does it, then re-run."
-            ;;
+        pi5)   ih_pass "board        ${model_text} (RP1 present)" ;;
+        pi)    ih_pass "board        ${model_text} (no RP1: SoC PWM unavailable in this stack; a PCA9685 over I2C works)" ;;
+        *)     ih_warn "board        ${model_text:-unknown} — not a Raspberry Pi" ;;
     esac
 
-    # --check-only is a read-only inspection: there is nothing to proceed to,
-    # so asking would stall a non-interactive run at a question with no
-    # consequence. Report the inventory and let ih_main's --check-only exit
-    # handle the rest.
-    if (( IH_CHECK_ONLY )); then
-        return 0
+    # /dev/i2c-1 specifically, not a glob over /dev/i2c-*: the Pi's HDMI DDC
+    # buses are i2c-13/14 and are present with i2c_arm off. One MODE1 read at
+    # 0x40 if i2c-tools is here; 0x70 (ALLCALL) is never addressed.
+    if [[ -e "${IH_ROOT}/dev/i2c-1" ]]; then
+        local pca
+        if command -v i2cget >/dev/null 2>&1; then
+            if i2cget -y 1 0x40 0x00 >/dev/null 2>&1; then
+                pca="PCA9685 at 0x40: answering"
+            else
+                pca="PCA9685 at 0x40: not answering"
+            fi
+        else
+            pca="PCA9685 not probed (i2c-tools not installed)"
+        fi
+        ih_pass "I2C          bus 1 present; ${pca}"
+    else
+        ih_warn "I2C          bus 1 absent"
     fi
 
-    printf '\n'
-    if ! ih_confirm "proceed with only the interfaces above?"; then
-        ih_warn "stopped at your request; nothing has been changed"
-        exit 0
+    # 28-* is a DS18B20. 00-* entries are what a floating bus enumerates when
+    # nothing (or nothing pulled up) is on it — reported as such, so "probes:
+    # 0" on a bus that is clearly searching is not mistaken for a dead bus.
+    local w1="${IH_ROOT}/sys/bus/w1/devices"
+    if [[ -d "$w1" ]]; then
+        local probes phantoms
+        probes="$(find "$w1" -maxdepth 1 -name '28-*' 2>/dev/null | wc -l | tr -d ' ')"
+        phantoms="$(find "$w1" -maxdepth 1 -name '00-*' 2>/dev/null | wc -l | tr -d ' ')"
+        if (( probes > 0 )); then
+            ih_pass "1-Wire       bus present; DS18B20 probes: ${probes}"
+        elif (( phantoms > 0 )); then
+            ih_pass "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering — no probe, or no pull-up)"
+        else
+            ih_pass "1-Wire       bus present; DS18B20 probes: 0"
+        fi
+    else
+        ih_warn "1-Wire       no bus"
+    fi
+
+    # A pwmchip in sysfs says nothing about the header: the standing trap
+    # (CLAUDE.md, verified host facts) is a chip that exports while every pin
+    # reads `none`. pinctrl is the evidence, the same one hardware-io uses.
+    if compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1; then
+        if command -v pinctrl >/dev/null 2>&1; then
+            local muxed
+            muxed="$(pinctrl get 12,13,18,19 2>/dev/null | grep -c 'PWM')"
+            [[ "$muxed" =~ ^[0-9]+$ ]] || muxed=0
+            if (( muxed > 0 )); then
+                ih_pass "SoC PWM      pwmchip present; ${muxed} of 4 header pins muxed to PWM"
+            else
+                ih_warn "SoC PWM      pwmchip present but no header pin is muxed to PWM (optional; docs/host-setup.md §9)"
+            fi
+        else
+            ih_pass "SoC PWM      pwmchip present; pin mux not verified (pinctrl not installed)"
+        fi
+    else
+        ih_warn "SoC PWM      no pwmchip (optional; RP1 PWM needs the overlay in docs/host-setup.md §9)"
     fi
     return 0
 }

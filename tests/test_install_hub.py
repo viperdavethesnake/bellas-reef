@@ -81,6 +81,9 @@ HIDDEN_FROM_PATH = frozenset(
         # present" into "pins muxed" — and its absence has to be testable on a
         # machine that has it.
         "pinctrl",
+        # Phase 3's PCA9685 probe. Hidden so a bench machine with i2c-tools
+        # does not answer for a fixture that never had a bus.
+        "i2cget",
         # Phase 6's boot-unit checks. systemd-analyze absent means the check
         # is skipped, which is what the script must do on a host without it;
         # a runner's own systemd-analyze answering here would make that path
@@ -1397,20 +1400,6 @@ def test_phase3_reports_interfaces_without_blocking(tmp_path: Path) -> None:
     assert result.returncode == 0, "a missing interface must not fail the run"
 
 
-def test_phase3_says_which_interfaces_are_absent(tmp_path: Path) -> None:
-    stubs = make_stubs(tmp_path)
-    root = tmp_path / "root"
-    write_good_avahi_fixture(root)
-    # A Pi 5, so the config.txt guidance (specific dtparam/dtoverlay lines) is
-    # expected rather than the "not a Raspberry Pi" branch.
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
-    result = run_script("--check-only", root=root, stubs=stubs)
-    assert "not enabled" in result.stdout.lower()
-    assert "dtparam=i2c_arm=on" in result.stdout
-    assert result.returncode == 0
-
-
 def full_root(tmp_path: Path) -> Path:
     """A fixture root that clears every phase-1/2/3 gate cleanly, so a test
     using it reaches phase 4.
@@ -1840,8 +1829,7 @@ def test_phase3_ignores_the_hdmi_i2c_buses(tmp_path: Path) -> None:
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "I2C          not enabled" in result.stdout, result.stdout
-    assert "dtparam=i2c_arm=on" in result.stdout
+    assert "I2C          bus 1 absent" in result.stdout, result.stdout
 
 
 def test_phase3_reports_the_pin_mux_when_pinctrl_is_available(tmp_path: Path) -> None:
@@ -1873,50 +1861,91 @@ def test_phase3_says_the_pin_mux_is_unverified_without_pinctrl(tmp_path: Path) -
     stubs = make_stubs(tmp_path)
     root = full_root(tmp_path)
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "pin mux not verified" in result.stdout, result.stdout
+    assert "pin mux not verified (pinctrl not installed)" in result.stdout, result.stdout
     assert result.returncode == 0, "an unverified pin mux must not fail a non-blocking phase"
 
 
 def test_phase3_flags_pwm_chips_with_no_muxed_pins(tmp_path: Path) -> None:
-    # The trap in full: sysfs says four channels, pinctrl says no header pin
-    # carries any of them. That is the overlay problem, and the config.txt
-    # guidance is exactly what fixes it.
+    # The trap in full: sysfs says a chip, pinctrl says no header pin carries
+    # any of its channels. That is the overlay problem, and the custom
+    # overlay procedure is documented, not reprinted here.
     stubs = make_stubs(tmp_path)
     write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
     root = full_root(tmp_path)
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "no header pin" in result.stdout, result.stdout
-    assert "dtoverlay=pwm-4chan" in result.stdout
+    assert "no header pin is muxed to PWM" in result.stdout, result.stdout
+    assert "docs/host-setup.md" in result.stdout, result.stdout
 
 
-def test_phase3_never_advises_pwm4chan_on_a_non_pi5(tmp_path: Path) -> None:
-    # pwm-4chan is OUR overlay, compiled on the Pi 5 with dtc (host-setup §9).
-    # It is not in the stock overlay set and names RP1 hardware a BCM2837 does
-    # not have — and hardware-io's discover_pwm() is hard-pinned to the RP1
-    # device anyway, so SoC PWM on an older Pi is unusable by the stack no
-    # matter what overlay is loaded. A 3B+ owner must be pointed at the
-    # PCA9685-over-I2C path, not at an overlay that does not exist. The
-    # 1-Wire advice above it already branches per board; this is its twin.
-    stubs = make_stubs(tmp_path)
-    write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
-    root = full_root(tmp_path)
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
-    result = run_script("--check-only", root=root, stubs=stubs)
-    assert "dtoverlay=pwm-4chan" not in result.stdout, result.stdout
-    assert "PCA9685" in result.stdout, "the operator needs the path that works, not just a gap"
-
-
-def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
+def test_phase3_reports_the_board(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
     (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Some Other Board\x00")
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "not a raspberry pi" in result.stdout.lower()
+    assert "board        Raspberry Pi 5 Model B Rev 1.1 (RP1 present)" in result.stdout, (
+        result.stdout
+    )
+    assert result.returncode == 0
+
+
+def test_phase3_probes_for_a_pca9685_when_i2c_tools_exist(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    log = tmp_path / "i2cget.log"
+    write_stub(stubs, "i2cget", f'echo "$*" >> "{log}"; echo 0x11; exit 0')
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-1").write_text("")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "I2C          bus 1 present; PCA9685 at 0x40: answering" in result.stdout, result.stdout
+    # One MODE1 read at 0x40. 0x70 is the chip's all-call address and is
+    # never addressed (CLAUDE.md, verified host facts).
+    assert log.read_text().strip() == "-y 1 0x40 0x00"
+
+
+def test_phase3_says_not_probed_without_i2c_tools(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-1").write_text("")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "PCA9685 not probed (i2c-tools not installed)" in result.stdout, result.stdout
+
+
+def test_phase3_counts_ds18b20_probes_and_names_a_floating_bus(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    devices = root / "sys/bus/w1/devices"
+    for name in ("w1_bus_master1", "00-100000000000", "00-600000000000"):
+        (devices / name).mkdir(parents=True)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert (
+        "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering" in result.stdout
+    ), result.stdout
+
+    (devices / "28-000000bfe244").mkdir()
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "1-Wire       bus present; DS18B20 probes: 1" in result.stdout, result.stdout
+
+
+def test_phase3_never_prescribes_boot_config_and_never_prompts(tmp_path: Path) -> None:
+    # Nothing hardware-side is required to deploy the stack (ruled
+    # 2026-08-30). No config.txt paste, no "reboot and re-run", no
+    # "proceed with only these?" — a hub with no PWM and no probes is a
+    # valid hub that happens to have nothing attached yet.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    for forbidden in ("dtoverlay=", "dtparam=", "reboot", "proceed with only"):
+        assert forbidden not in result.stdout, (forbidden, result.stdout)
+    assert result.returncode == 0
 
 
 # install-hub calls compose as `docker compose -f <file> --env-file <file>
