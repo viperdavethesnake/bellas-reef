@@ -1395,9 +1395,7 @@ def test_phase4_writes_the_two_directory_keys(tmp_path: Path) -> None:
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
 
-    result = run_script(
-        "--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"}
-    )
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
     assert result.returncode == 0, result.stdout + result.stderr
     text = envfile.read_text()
     assert "BELLASREEF_BACKUP_DIR=/home/tester/backups" in text, text

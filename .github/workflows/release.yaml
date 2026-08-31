@@ -76,4 +76,4 @@ jobs:
           git add -A
           git commit --quiet -m "release ${GITHUB_REF_NAME} from bellas-reef@${GITHUB_SHA}"
           git tag "${GITHUB_REF_NAME}"
-          git push --quiet origin HEAD:main "${GITHUB_REF_NAME}"
+          git push --quiet --atomic origin HEAD:main "${GITHUB_REF_NAME}"
