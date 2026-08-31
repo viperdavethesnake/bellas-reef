@@ -45,9 +45,10 @@ def run_script(
     root: Path,
     stubs: Path | None = None,
     env: dict[str, str] | None = None,
+    input: str | None = None,  # noqa: A002 - matches subprocess.run's own kwarg
 ) -> subprocess.CompletedProcess[str]:
     """Run install-hub.sh against a fixture root."""
-    return run_any_script(SCRIPT, *args, root=root, stubs=stubs, env=env)
+    return run_any_script(SCRIPT, *args, root=root, stubs=stubs, env=env, input=input)
 
 
 def test_the_isolated_path_hides_the_machines_own_tools(tmp_path: Path) -> None:
@@ -2560,3 +2561,153 @@ def test_phase6_dry_run_probes_nothing(tmp_path: Path) -> None:
     assert "would" in result.stdout.lower()
     for name in ("curl", "journalctl", "exec"):
         assert not markers[name].exists(), f"--dry-run ran {name}"
+
+
+# ------------------------------------------------------------------ --uninstall
+#
+# --uninstall bypasses the six phases entirely (see ih_main), so these tests
+# build the smallest fixture that exercises it directly rather than reusing
+# full_root/phase5_root, which stage a machine for the *install* phases.
+
+
+def uninstall_stub_log(tmp_path: Path) -> Path:
+    return tmp_path / "actions.log"
+
+
+def write_uninstall_systemctl_stub(stubs: Path, log: Path) -> None:
+    write_stub(stubs, "systemctl", f'echo "systemctl $*" >> "{log}"\nexit 0')
+
+
+def write_uninstall_sudo_stub(stubs: Path, log: Path) -> None:
+    write_stub(stubs, "sudo", f'echo "sudo $*" >> "{log}"\n"$@"')
+
+
+def test_uninstall_removes_a_full_install(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    envfile = staged_env_path(root)
+    envfile.write_text("POSTGRES_PASSWORD=x\n")
+
+    log = uninstall_stub_log(tmp_path)
+    stubs = tmp_path / "bin"
+    write_uninstall_systemctl_stub(stubs, log)
+    write_uninstall_sudo_stub(stubs, log)
+    write_stub(
+        stubs,
+        "docker",
+        f'echo "docker $*" >> "{log}"\nif [[ "$1" == "compose" ]]; then exit 0; fi\nexit 0',
+    )
+
+    result = run_script("--uninstall", root=root, stubs=stubs, input="uninstall\n")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "Type 'uninstall' to proceed" in combined, combined
+
+    log_text = log.read_text()
+    assert "disable --now" in log_text, log_text
+    assert "down -v --remove-orphans" in log_text, log_text
+    assert log_text.index("disable --now") < log_text.index("down -v --remove-orphans"), log_text
+
+    assert not unit.exists(), "the boot unit file was not removed"
+    assert not envfile.exists(), "deploy/.env was not removed"
+    assert "kept" in combined.lower(), combined
+    assert "backups" in combined.lower() and "checkout" in combined.lower(), combined
+
+
+def test_uninstall_cleans_a_partial_install(tmp_path: Path) -> None:
+    # Unit installed, but deploy/.env was never written — the state a run
+    # that failed at the registry pull leaves behind.
+    root = tmp_path / "root"
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    assert not staged_env_path(root).exists()
+
+    log = uninstall_stub_log(tmp_path)
+    stubs = tmp_path / "bin"
+    write_uninstall_systemctl_stub(stubs, log)
+    write_uninstall_sudo_stub(stubs, log)
+    write_stub(
+        stubs,
+        "docker",
+        f'echo "docker $*" >> "{log}"\n'
+        'if [[ "$1" == "ps" ]]; then echo "aaa111"; echo "bbb222"; exit 0; fi\n'
+        'if [[ "$1" == "volume" && "$2" == "ls" ]]; then\n'
+        '    echo "bellasreef_postgres-data"; exit 0\n'
+        "fi\n"
+        "exit 0",
+    )
+
+    result = run_script("--uninstall", root=root, stubs=stubs, input="uninstall\n")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+
+    log_text = log.read_text()
+    assert "rm -f aaa111 bbb222" in log_text, log_text
+    assert "volume rm bellasreef_postgres-data" in log_text, log_text
+    assert "volume rm bellasreef_vm-data" not in log_text, log_text
+    assert "volume rm bellasreef_nats-data" not in log_text, log_text
+    assert "not present" in combined.lower(), combined
+    assert not unit.exists()
+
+
+def test_uninstall_declined_touches_nothing(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    envfile = staged_env_path(root)
+    envfile.write_text("POSTGRES_PASSWORD=x\n")
+
+    log = uninstall_stub_log(tmp_path)
+    stubs = tmp_path / "bin"
+    write_uninstall_systemctl_stub(stubs, log)
+    write_uninstall_sudo_stub(stubs, log)
+    write_stub(stubs, "docker", f'echo "docker $*" >> "{log}"\nexit 0')
+
+    result = run_script("--uninstall", root=root, stubs=stubs, input="no\n")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "not confirmed" in combined.lower(), combined
+    assert not log.exists() or log.read_text() == "", "a mutating command ran: " + (
+        log.read_text() if log.exists() else ""
+    )
+    assert unit.exists()
+    assert envfile.exists()
+
+
+def test_uninstall_dry_run_prompts_nothing_and_changes_nothing(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    envfile = staged_env_path(root)
+    envfile.write_text("POSTGRES_PASSWORD=x\n")
+
+    log = uninstall_stub_log(tmp_path)
+    stubs = tmp_path / "bin"
+    write_uninstall_systemctl_stub(stubs, log)
+    write_uninstall_sudo_stub(stubs, log)
+    write_stub(stubs, "docker", f'echo "docker $*" >> "{log}"\nexit 0')
+
+    result = run_script("--dry-run", "--uninstall", root=root, stubs=stubs)
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "would" in combined.lower(), combined
+    assert "Type 'uninstall'" not in combined, combined
+    assert not log.exists() or log.read_text() == "", "a mutating command ran: " + (
+        log.read_text() if log.exists() else ""
+    )
+    assert unit.exists()
+    assert envfile.exists()
+
+
+def test_check_only_uninstall_is_an_error(tmp_path: Path) -> None:
+    result = run_script("--check-only", "--uninstall", root=tmp_path / "root")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "contradictory" in result.stderr.lower() or "--check-only" in result.stderr, (
+        result.stderr
+    )
+    assert "install-hub.sh" in result.stderr, result.stderr
