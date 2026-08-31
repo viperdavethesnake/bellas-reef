@@ -967,11 +967,16 @@ ih_phase5_deploy() {
             printf '      using a token with the read:packages scope, then re-run.\n'
         else
             ih_fail "docker compose pull failed"
-            # The tag is this checkout's commit, so the other likely answer is
-            # that the images for it do not exist yet. "manifest unknown" names
-            # a tag that is perfectly correct and simply not published.
-            printf '      The image for this commit may not be published yet (CI still\n'
-            printf '      running?) — check out a commit on origin/main whose CI has finished.\n'
+            # The tag came from deploy/release.env, not this checkout's git
+            # history — the release workflow publishes
+            # ghcr.io/viperdavethesnake/bellasreef-<svc>:<sha> when it retags,
+            # so "manifest unknown" means that release's images are not on the
+            # registry, not that this commit's CI is still running.
+            local version tag
+            version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" | head -1)"
+            tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" | head -1)"
+            printf '      Release %s (%s) has no images on the registry.\n' "$version" "${tag:0:12}"
+            printf '      Re-clone bellasreef-hub at a released tag, or check the release workflow run for this version.\n'
             printf '%s\n' "$pull_output" | sed 's/^/      /'
         fi
         return 1

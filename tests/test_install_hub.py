@@ -304,9 +304,11 @@ GOOD_GETENT = (
     'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'
 )
 
-# What git answers for a clean checkout sitting on a published commit. Phase 4
-# asks three questions before it will pin an image tag: is the tree dirty, is
-# HEAD an ancestor of origin/main, and what is HEAD.
+# What git answers for a clean checkout that still carries its .git metadata.
+# Phase 4 asks two questions now that the tag comes from deploy/release.env
+# rather than from git: does git metadata exist at all (rev-parse
+# --is-inside-work-tree), and is the tree dirty (status) — checked only when
+# that metadata is there to check.
 FAKE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 FAKE_VERSION = "v0.2.0-rc.2"
@@ -341,7 +343,6 @@ GOOD_GIT = "\n".join(
         'case "$3" in',
         "    status) exit 0 ;;",
         f'    rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
-        "    merge-base) exit 0 ;;",
         "    *) exit 1 ;;",
         "esac",
     ]
@@ -1887,11 +1888,11 @@ def test_a_failed_deploy_does_not_wedge_the_next_run(tmp_path: Path) -> None:
 
 
 def test_phase5_names_an_unpublished_commit_on_a_pull_failure(tmp_path: Path) -> None:
-    # Now that the tag is the checkout's commit, the likeliest pull failure
-    # after credentials is a commit whose CI has not finished (or never ran):
-    # the registry answers "manifest unknown" for a tag that is perfectly
-    # correct and simply not there yet. That is not guessable from the raw
-    # error, so name it.
+    # The tag comes from deploy/release.env, not this checkout's commit, so
+    # the likeliest pull failure after credentials is a release whose images
+    # never made it to the registry: the registry answers "manifest unknown"
+    # for a tag that is perfectly correct and simply not there. That is not
+    # guessable from the raw error, so name the release.
     stubs = make_stubs(
         tmp_path,
         {
@@ -1906,7 +1907,8 @@ def test_phase5_names_an_unpublished_commit_on_a_pull_failure(tmp_path: Path) ->
     combined = result.stdout + result.stderr
     assert "5. deploy" in result.stdout, combined
     assert result.returncode != 0
-    assert "may not be published yet" in combined, combined
+    assert f"Release {FAKE_VERSION}" in combined, combined
+    assert "has no images on the registry" in combined, combined
     assert "manifest unknown" in combined, "docker's own words were swallowed"
 
 
