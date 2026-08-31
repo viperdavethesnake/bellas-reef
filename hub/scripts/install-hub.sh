@@ -717,9 +717,10 @@ ih_detect_board() {
 ih_phase3_hardware() {
     ih_step "3. hardware inventory (reported, never required)"
 
-    local board model_text
+    local board
     board="$(ih_detect_board)"
-    model_text="$(tr -d '\0' < "${IH_ROOT}/proc/device-tree/model" 2>/dev/null || true)"
+    local model="${IH_ROOT}/proc/device-tree/model" model_text=""
+    [[ -r "$model" ]] && model_text="$(tr -d '\0' < "$model")"
     case "$board" in
         pi5)   ih_pass "board        ${model_text} (RP1 present)" ;;
         pi)    ih_pass "board        ${model_text} (no RP1: SoC PWM unavailable in this stack; a PCA9685 over I2C works)" ;;

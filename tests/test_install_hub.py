@@ -1890,6 +1890,36 @@ def test_phase3_reports_the_board(tmp_path: Path) -> None:
     assert result.returncode == 0
 
 
+def test_phase3_reports_an_older_pi_without_rp1(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert (
+        "board        Raspberry Pi 3 Model B Plus Rev 1.3 "
+        "(no RP1: SoC PWM unavailable in this stack; a PCA9685 over I2C works)" in out
+    ), out
+    assert result.returncode == 0
+    assert result.stderr == "", result.stderr
+
+
+def test_phase3_reports_a_non_pi_board_quietly(tmp_path: Path) -> None:
+    # No /proc/device-tree/model at all (an x86 box, a VM). The line says
+    # so and nothing else leaks — a stray "No such file or directory" on
+    # stderr here is the bug this test pins.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "board        unknown — not a Raspberry Pi" in out, out
+    assert result.returncode == 0
+    assert result.stderr == "", result.stderr
+
+
 def test_phase3_probes_for_a_pca9685_when_i2c_tools_exist(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     log = tmp_path / "i2cget.log"
