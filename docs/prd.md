@@ -212,7 +212,7 @@ the same subjects over the network; deployment topology change only (G4).
 |---|---|---|
 | Host | ARM SBC, arm64, Linux kernel 6.x+ | Pi 5 = current test platform (RP1 outlier); one conventional-SoC board required for G6. Per-board facts live in host docs, never in code |
 | Storage | NVMe/SSD required for production hubs | SD unsupported for production (WAL + metrics ingest). Dev-box deviations recorded in Verified host facts |
-| Runtime | Native systemd services, EnvironmentFile config, journald logs | v2.0 as-deployed correction. `deploy-pi.sh`: CI-green → deploy → telemetry verified, all three |
+| Runtime | Native systemd services, EnvironmentFile config, journald logs | v2.0 as-deployed correction (`deploy-pi.sh` deleted 2026-08-30). Now: CI green → `v*` tag → release workflow green → `update-hub.sh` on the hub → telemetry verified, all of it |
 | Relational | PostgreSQL 17, Alembic forward-only | |
 | Time-series | VictoriaMetrics, push-based writer | |
 | Spine | NATS + JetStream | Durable commands (expiry + idempotency, dedup at terminal stores); retained announcements; telemetry fan-out |

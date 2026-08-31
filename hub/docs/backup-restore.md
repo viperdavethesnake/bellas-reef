@@ -89,13 +89,13 @@ export BELLASREEF_PG_BIN=/usr/local/opt/libpq/bin   # or /opt/homebrew/... on Ap
 
 On the hub, the command runs *inside* the running `api` container, via
 `docker compose exec`. `/backups` is a host bind mount
-(`/home/david/backups:/backups`, declared on the `api` service in
-`deploy/compose.yaml`), so `--out /backups/...` lands the archive on the host
-at `/home/david/backups/...` even though `pg_dump` itself ran in the
-container:
+(`${BELLASREEF_BACKUP_DIR}:/backups`, declared on the `api` service in
+`deploy/compose.yaml`; the installer sets `BELLASREEF_BACKUP_DIR` to
+`~/backups`), so `--out /backups/...` lands the archive on the host at
+`~/backups/...` even though `pg_dump` itself ran in the container:
 
 ```bash
-cd /home/david/bellasreef
+cd ~/bellasreef
 docker compose -f deploy/compose.yaml --env-file deploy/.env exec api \
   bellasreef backup --out /backups/bellasreef-$(date +%Y%m%d-%H%M%S).tar.gz
 ```
@@ -108,7 +108,7 @@ From a workstation there is no direct path: the spine's ports are
 loopback-only on the hub since the 2026-08-12 cutover, and `bellasreef.local:5432`
 refuses connections *by design* — do not "fix" that by re-exposing the ports.
 Either run the command over ssh as above (the archive is already on the host
-filesystem at `/home/david/backups/...`; `scp` it off from there), or tunnel:
+filesystem at `~/backups/...`; `scp` it off from there), or tunnel:
 
 ```bash
 ssh -L 5432:localhost:5432 -L 8428:localhost:8428 bellasreef.local
@@ -195,13 +195,13 @@ image already has `postgresql-client-17` and the `bellasreef` CLI baked in
 installed on the host first:
 
 ```bash
-cd /home/david/bellasreef
+cd ~/bellasreef
 docker compose -f deploy/compose.yaml --env-file deploy/.env run --rm api \
   bellasreef restore /backups/bellasreef-<timestamp>.tar.gz
 ```
 
-(the archive must be under `/home/david/backups` on the host — that's what
-`/backups` is bind-mounted to.)
+(the archive must be under `~/backups` on the host, which is what `/backups`
+is bind-mounted to by default.)
 
 **6. Start the rest of the stack.**
 

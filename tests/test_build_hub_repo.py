@@ -15,6 +15,7 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 # test fails, which is the point: the payload is reviewed, not accumulated.
 EXPECTED = {
     "LICENSE",
+    "README.md",
     "deploy/compose.yaml",
     "deploy/.env.example",
     "deploy/release.env",

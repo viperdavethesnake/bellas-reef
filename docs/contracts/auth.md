@@ -72,8 +72,8 @@ operation, and any paired device can do it.
 
 A hub that has never completed a pairing is **in setup mode**
 (`hub_identity.setup_completed_at` IS NULL; `/info` reports `setup_mode`). On
-such a hub `bellasreef setup-code` — run by `scripts/deploy-pi.sh` and
-`scripts/factory-reset-pi.sh`, and by hand over SSH — mints an eight-character
+such a hub `bellasreef setup-code` — run by `hub/scripts/install-hub.sh` and
+`hub/scripts/factory-reset-hub.sh` on the hub, and by hand — mints an eight-character
 code, prints it once (grouped for reading as `7KF2-9QMD`; the dash and case are
 ignored on entry), and stores **only its hash**. There is no plaintext to
 reprint from: "I forgot it" is answered by minting a new one, which rotates the

@@ -84,18 +84,25 @@ carrying that decision").
 - No dev launchers. `scripts/dev/run-*.sh` are deleted, not deprecated. An
   unsupervised process that exits stays exited, which is the second half of the
   same 2026-08-10 outage.
-- No rsync, no editing on the Pi, no uncommitted state. `/home/david/bellasreef`
-  is a git clone reset to `origin/main`; anything not pushed does not run.
-- Deploy with `scripts/deploy-pi.sh`. It refuses a dirty or unpushed tree,
-  resets the Pi to the pushed commit, pulls the three app images by
-  digest-verified SHA tag, applies migrations via a one-off `docker compose
-  run --rm api`, recreates hardware-io/control-engine/api, and then
-  **verifies fresh telemetry on the wire** before reporting success. A
-  process check is not a deploy check: hardware-io without
-  `BELLASREEF_NATS_URL` starts cleanly, serves metrics and publishes nothing.
+- No rsync, no editing on the hub, no uncommitted state. `~/bellasreef` is the
+  `bellasreef-hub` clone, checked out at a released `v*` tag; nothing runs
+  that was not shipped in a tagged release.
+- **The hub is the only machine.** A user clones `bellasreef-hub` on the Pi
+  and runs `scripts/install-hub.sh` there; updates are
+  `scripts/update-hub.sh` on the Pi; a reset is `scripts/factory-reset-hub.sh`
+  on the Pi. There is no workstation-side deploy tool and there must never be
+  one again: `deploy-pi.sh` (2026-08-12 → 2026-08-30) encoded the Mac→dev-Pi
+  loop as if it were the product and was deleted by ruling ("it should never
+  have existed"). `bellasreef-hub` is generated from this repo's `hub/` by
+  `.github/workflows/release.yaml` on every `v*` tag and is never edited by
+  hand; `scripts/build-hub-repo.sh` is the one assembler.
 - **A backend pass is not done at CI green.** The stop condition is
-  **CI green → `scripts/deploy-pi.sh` → telemetry verified on the wire.** All
-  three, every time.
+  **CI green → `v*` tag → release workflow green → `update-hub.sh` on the hub
+  → telemetry verified on the wire.** All of it, every time. Until
+  `update-hub.sh` is implemented, the last two are a fresh
+  `install-hub.sh` from the new release on a machine that is not yet a hub,
+  or the documented manual steps, never a hand-applied fix around a script
+  failure ("if the script fails, we fail", 2026-08-30).
 
   Green-and-undeployed is a state that reads as finished and is not. The Pi
   drifted four commits behind main that way in one session, which meant the hub
@@ -121,9 +128,9 @@ carrying that decision").
   whole stack, including the data services, recreating the exact
   durable-contention risk the environment boundary rule above exists to
   prevent.
-  The one sanctioned exception is `scripts/factory-reset-pi.sh` (spec
-  2026-08-15): a deliberate, typed-confirmation wipe of the three data
-  volumes with a mandatory pre-reset backup.
+  The one sanctioned exception is `scripts/factory-reset-hub.sh` (spec
+  2026-08-15), run on the hub: a deliberate, typed-confirmation wipe of the
+  three data volumes with a mandatory pre-reset backup.
 - A fresh registry means no devices. After any factory wipe, sensors must be
   re-imported (`docker compose exec api bellasreef devices import
   /etc/bellasreef/devices.import.yaml`, which needs an API token via the
@@ -181,7 +188,7 @@ Code comments follow the same rule: a driver may record *what was ruled* and
 
 - Dev machine: macOS. Project root: this repo.
 - Target: Raspberry Pi 5, NVMe (SD unsupported), Raspberry Pi OS/Debian arm64, kernel 6.x+. Reachable via `ssh <pi-host>` (see `.env.local`, never committed).
-- Workflow: code + unit tests on Mac; integration tests against loopback dev containers or in CI, never against the hub. Deploy with `scripts/deploy-pi.sh`.
+- Workflow: code + unit tests on Mac; integration tests against loopback dev containers or in CI, never against the hub. Releases: tag `v*` on main; the hub installs/updates itself from `bellasreef-hub`.
 - Hardware access in containers: pass specific `/dev` nodes to hardware-io only. No privileged containers.
 - Host-touching config (dtoverlays: w1-gpio, i2c enable) is documented in `docs/host-setup.md` as the ONLY host mutation.
 
@@ -734,6 +741,12 @@ The plain overlay is the pre-Pi-5 variant and silently fails to bring up the bus
 Current setting: `dtoverlay=w1-gpio-pi5,gpiopin=4` in the `[pi5]` section.
 DS18B20 DATA needs a physical 4.7 kΩ pull-up to 3V3; the overlay's internal
 pull-up is too weak for tank-length probe cables.
+
+Observed on the dev Pi only. On coco-bellasreef (2026-08-30, same kernel
+string) the plain `w1-gpio,gpiopin=4` brought up `w1_bus_master1` on RP1
+GPIO4 (dmesg `gpio-573 (onewire@4)`); whether a probe reads through it is
+unmeasured. Ruled: the installer reports what the kernel exposes and never
+prescribes an overlay name; probes are optional.
 
 ## Boot configuration
 

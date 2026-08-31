@@ -16,7 +16,8 @@ See [`docs/prd.md`](docs/prd.md) for what this is and why, and
 | `contracts/` | Versioned wire contracts — NATS subjects, payload models, driver interface |
 | `services/` | `hardware-io`, `control-engine`, `api` |
 | `db/` | PostgreSQL schema and Alembic migrations |
-| `deploy/` | Compose stack, Dockerfiles, systemd units |
+| `hub/` | Exactly what a hub runs from, generated into `bellasreef-hub` on each release |
+| `deploy/` | Dockerfiles, bench drill override, custom overlay source |
 | `docs/` | PRD, contract specs, host setup, session log |
 | `clients/` | Web SPA, and a pointer to the iOS app |
 
@@ -25,11 +26,12 @@ See [`docs/prd.md`](docs/prd.md) for what this is and why, and
 Nobody should be, so there is a way back in from the hub itself. Both commands
 are `bellasreef`, installed with the API package, and both talk to Postgres
 directly rather than through the API, because the API is the thing you cannot
-authenticate to. Full procedures in
-[`docs/host-setup.md`](docs/host-setup.md#10-getting-back-in-bellasreef-pair-and-bellasreef-revoke).
+authenticate to. Run this on the hub, in the `bellasreef-hub` clone. Full
+procedures in
+[`hub/docs/host-setup.md`](hub/docs/host-setup.md#10-getting-back-in-bellasreef-pair-and-bellasreef-revoke).
 
 ```bash
-cd /home/david/bellasreef
+cd ~/bellasreef
 alias br='docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef'
 
 br pair --ttl 600     # open a 10-minute window; pair a replacement device
@@ -83,6 +85,6 @@ rights to. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Status
 
-Pre-release. No tagged version yet. Safety framework, contracts, schema v1, the
-DS18B20 driver and the NATS spine are implemented and CI-verified; control
-modules and clients are not.
+Pre-release. `v0.2.0-rc.*` tags; hubs install from `bellasreef-hub`. Safety
+framework, contracts, schema v1, the DS18B20 driver and the NATS spine are
+implemented and CI-verified; control modules and clients are not.
