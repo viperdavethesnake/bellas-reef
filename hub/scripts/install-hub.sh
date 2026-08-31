@@ -383,6 +383,27 @@ ih_lan_interfaces() {
     printf '%s' "$names"
 }
 
+ih_avahi_allow_interfaces_set() {
+    grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$1"
+}
+
+# Inserts the line directly under [server]. Rendered with awk into a temp
+# file and installed over the original, rather than sed -i: the two seds
+# disagree on `a\` and this has to behave the same on the Pi and on the
+# machine running the tests. `sudo install` is what puts it back, so the
+# file keeps root ownership and 0644.
+ih_set_avahi_allow_interfaces() {
+    local conf="$1" lan="$2" tmp rc
+    tmp="$(mktemp)" || return 1
+    if ! awk -v line="allow-interfaces=${lan}" \
+            '{ print } /^\[server\]/ && !done { print line; done=1 }' "$conf" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    sudo install -m 0644 "$tmp" "$conf"; rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
     local rc=0
@@ -392,13 +413,12 @@ ih_check_avahi() {
         return 1
     fi
 
-    if grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$conf"; then
+    if ih_avahi_allow_interfaces_set "$conf"; then
         ih_pass "avahi allow-interfaces is set"
     else
-        # Nothing in this script edits avahi-daemon.conf, so this line is the
-        # whole remedy. The path and the line are printed as instructions —
-        # they are text for a human, not a path this script touches, which is
-        # why they carry no $IH_ROOT.
+        # Phase 2 offers to write this line (ih_set_avahi_allow_interfaces);
+        # the printed remedy below is for the cases it will not touch: no
+        # [server] section, or interfaces it could not read.
         ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
         local lan
         printf '      Add to /etc/avahi/avahi-daemon.conf, under [server]:\n'
@@ -567,8 +587,8 @@ ih_phase2_requirements() {
         # script cp-ing a record into a services/ directory that was never
         # created, or reloading a daemon that is not there.
         #
-        # Neither prompt ever touches avahi-daemon.conf's allow-interfaces —
-        # ih_check_avahi prints that remedy for the operator to apply.
+        # The allowlist is offered below; the printed remedy in ih_check_avahi
+        # covers what the offer will not touch.
         if ! ih_avahi_daemon_present; then
             ih_offer_install "avahi-daemon" avahi-daemon
         fi
@@ -578,6 +598,21 @@ ih_phase2_requirements() {
                     sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
                             "${IH_ROOT}/etc/avahi/services/bellasreef.service"
                 ih_run "reloading avahi" sudo systemctl reload avahi-daemon
+            fi
+        fi
+
+        # The allowlist. Only when the daemon is present, the line is absent,
+        # this machine's interfaces could be read, and there is a [server]
+        # section to put it under — a guessed list or an invented section
+        # would be worse than the printed remedy.
+        local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf" lan
+        if ih_avahi_daemon_present && ! ih_avahi_allow_interfaces_set "$conf" \
+                && lan="$(ih_lan_interfaces)" && grep -q '^\[server\]' "$conf"; then
+            if ih_confirm "set avahi allow-interfaces=${lan}?"; then
+                if ih_run "setting avahi allow-interfaces=${lan}" ih_set_avahi_allow_interfaces "$conf" "$lan"; then
+                    # restart, not reload: interface config is read at start.
+                    ih_run "restarting avahi" sudo systemctl restart avahi-daemon
+                fi
             fi
         fi
     fi

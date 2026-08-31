@@ -226,6 +226,17 @@ def test_unknown_flag_fails_loudly(tmp_path: Path) -> None:
     assert "--wat" in result.stderr
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Strip SGR color codes so a status-line assertion can match the label
+    and its message as one run, the way a person reading the terminal would
+    — ih_pass/ih_would wrap only the label word in color, so the reset code
+    sits directly after it and breaks a literal "PASS  " substring check."""
+    return _ANSI_RE.sub("", text)
+
+
 def write_stub(stubs: Path, name: str, body: str) -> None:
     """Create a stub executable on the fake PATH."""
     stubs.mkdir(parents=True, exist_ok=True)
@@ -433,7 +444,7 @@ def make_stubs(tmp_path: Path, overrides: dict[str, str] | None = None) -> Path:
 # every marker is absent — a regression that lets a mutating command through
 # leaves evidence instead of silently curling and running a real installer,
 # editing group membership, or touching a real avahi config.
-_MUTATION_GUARD_COMMANDS = ("sh", "curl", "usermod", "apt-get", "cp")
+_MUTATION_GUARD_COMMANDS = ("sh", "curl", "usermod", "apt-get", "cp", "install")
 
 
 def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
@@ -455,7 +466,8 @@ def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
     write_stub(
         stubs,
         "systemctl",
-        f'case "$1" in enable|reload) touch "{systemctl_marker}"; exit 0 ;; *) exit 1 ;; esac',
+        f'case "$1" in enable|reload|restart) touch "{systemctl_marker}"; exit 0 ;;'
+        " *) exit 1 ;; esac",
     )
     markers["systemctl"] = systemctl_marker
     return markers
@@ -477,6 +489,7 @@ def systemctl_stub(marker: Path, log: Path | None = None) -> str:
             'case "$1" in',
             f"    daemon-reload) {record}exit 0 ;;",
             f'    enable) {record}touch "{marker}"; exit 0 ;;',
+            f"    restart) {record}exit 0 ;;",
             f'    is-enabled) if [[ -f "{marker}" ]]; then echo enabled; exit 0; fi;'
             " echo disabled; exit 1 ;;",
             "    *) exit 1 ;;",
@@ -745,6 +758,100 @@ def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "service record" in result.stdout.lower()
     assert result.returncode != 0
+
+
+STOCK_AVAHI_CONF = "[server]\n#host-name=foo\n#allow-interfaces=eth0\n\n[wide-area]\n"
+
+
+def test_phase2_offers_to_set_avahi_allow_interfaces(tmp_path: Path) -> None:
+    # A stock image ships the line commented out, so every clean install
+    # used to stop here with a paste-this-yourself message for a value the
+    # script had already computed. The list is an exclusion of Docker's
+    # bridges, not a choice of the live NIC — a down interface in it is inert.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", install_stub())
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "set avahi allow-interfaces=end0,wlan0? [y/N] y (--yes)" in result.stdout, result.stdout
+    text = conf.read_text()
+    assert text.startswith("[server]\nallow-interfaces=end0,wlan0\n#host-name=foo\n"), text
+    assert "#allow-interfaces=eth0" in text, "the stock commented line must be left alone"
+    assert "PASS  avahi allow-interfaces is set" in strip_ansi(result.stdout), result.stdout
+
+
+def test_phase2_declining_allow_interfaces_leaves_the_printed_remedy(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script(root=root, stubs=stubs, env={"IH_ASSUME_NO_TTY": "1"})
+    assert result.returncode == 1
+    assert conf.read_text() == STOCK_AVAHI_CONF
+    assert "Add to /etc/avahi/avahi-daemon.conf, under [server]:" in result.stdout
+
+
+def test_phase2_never_touches_an_existing_allow_interfaces_line(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    before = conf.read_text()
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    assert "set avahi allow-interfaces" not in result.stdout
+    assert conf.read_text() == before
+
+
+def test_phase2_no_allow_interfaces_offer_without_a_server_section(tmp_path: Path) -> None:
+    # Nothing to insert after. Inventing a [server] header in someone's
+    # config is not this script's call; the printed remedy stands.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text("# empty\n")
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "set avahi allow-interfaces" not in result.stdout, result.stdout
+    assert conf.read_text() == "# empty\n"
+
+
+def test_phase2_allow_interfaces_dry_run_writes_nothing(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
+    assert "would  setting avahi allow-interfaces=end0,wlan0" in strip_ansi(result.stdout), (
+        result.stdout
+    )
+    assert conf.read_text() == STOCK_AVAHI_CONF
+    assert not markers["install"].exists()
+    assert not markers["systemctl"].exists()
 
 
 def test_dry_run_reports_actions_without_running_them(tmp_path: Path) -> None:
