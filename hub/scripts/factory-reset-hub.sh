@@ -107,10 +107,10 @@ docker volume rm "${VOLUMES[@]}" \
 # --------------------------------------------------------- 4. redeploy clean
 step "migrating the empty database"
 compose run --rm api sh -c 'cd /app/db && alembic upgrade head' \
-    || die "migrations failed after the wipe — the hub has NO data volumes and is not running; do not treat this as a completed reset"
+    || die "migrations failed after the wipe. The hub has NO data volumes and is not running. Recover by hand: docker compose -f deploy/compose.yaml --env-file deploy/.env run --rm api sh -c 'cd /app/db && alembic upgrade head', then sudo systemctl start bellasreef.service"
 step "starting bellasreef.service (the boot unit brings the stack up)"
 sudo systemctl start bellasreef.service \
-    || die "bellasreef.service did not start after the wipe — the hub is not confirmed running"
+    || die "bellasreef.service did not start after the wipe. The hub is not confirmed running. Recover with: sudo systemctl start bellasreef.service (then re-run this script's checks by hand)"
 
 # ------------------------------------------------------ 5. verify fresh state
 step "verifying factory-fresh state"

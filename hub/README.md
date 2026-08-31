@@ -69,16 +69,16 @@ A fresh hub has no devices to read or show. To tell it what's attached,
 copy the example device file and edit it for your hardware:
 
 ```bash
-cp deploy/config/devices.yaml.example /etc/bellasreef/devices.import.yaml
+sudo cp deploy/config/devices.yaml.example /etc/bellasreef/devices.import.yaml
 ```
 
-Then, with a token from pairing, run the import command the installer
-printed at the end of setup:
+Then, with an access token from a paired client (docs/host-setup.md section
+10), run the import command the installer printed at the end of setup:
 
 ```bash
 cd ~/bellasreef
 docker compose -f deploy/compose.yaml --env-file deploy/.env \
-  exec api bellasreef devices import /etc/bellasreef/devices.import.yaml
+  exec api bellasreef devices import /etc/bellasreef/devices.import.yaml --token <access token>
 ```
 
 ## Later

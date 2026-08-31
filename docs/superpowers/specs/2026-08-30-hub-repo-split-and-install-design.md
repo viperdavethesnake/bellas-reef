@@ -404,6 +404,10 @@ Decisions left to David, deliberately not taken here:
   an Actions secret on `bellas-reef`.
 - **`update-hub.sh` main-tracking** (§6).
 
+A re-run of `release.yaml` for a version whose tag already exists in
+`bellasreef-hub`, including after a workstation publish of that same
+version, fails at `git tag` by design. Bump the version instead.
+
 ## 10. Not in this spec
 
 - The 2 GB RAM floor (measure on coco first).

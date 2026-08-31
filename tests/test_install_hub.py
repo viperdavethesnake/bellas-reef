@@ -2237,6 +2237,7 @@ def test_phase6_hands_off_the_device_import_step(tmp_path: Path) -> None:
     assert "/etc/bellasreef/devices.import.yaml" in result.stdout, result.stdout
     assert "bellasreef devices import /etc/bellasreef/devices.import.yaml" in result.stdout
     assert "deploy/config/devices.yaml.example" in result.stdout
+    assert "--token <access token>" in result.stdout, result.stdout
 
 
 def test_phase6_prints_the_hub_identity(tmp_path: Path) -> None:

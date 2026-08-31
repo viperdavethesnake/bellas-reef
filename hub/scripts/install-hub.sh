@@ -1319,9 +1319,10 @@ ih_phase6_handoff() {
     ih_step "Next: tell the hub what is attached"
     printf '      A fresh hub has no devices, so nothing to read and nothing to show.\n'
     printf '      Copy deploy/config/devices.yaml.example to %s/devices.import.yaml,\n' "$etc_dir"
-    printf '      edit it for your hardware, then with a token from pairing:\n'
+    printf '      edit it for your hardware, then run the import with an access token\n'
+    printf '      from a paired client (docs/host-setup.md section 10):\n'
     printf '        docker compose -f %s --env-file %s \\\n' "$IH_COMPOSE" "${IH_ENVFILE#"$IH_ROOT"}"
-    printf '          exec api bellasreef devices import /etc/bellasreef/devices.import.yaml\n'
+    printf '          exec api bellasreef devices import /etc/bellasreef/devices.import.yaml --token <access token>\n'
 
     version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
     tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"

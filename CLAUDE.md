@@ -73,7 +73,7 @@ alternative.
 
 ## Deployment discipline (non-negotiable)
 
-**The Pi runs the whole stack as supervised containers, from pushed commits,
+**The Pi runs the whole stack as supervised containers, from tagged releases,
 only.** All five services — nats, postgres, victoria-metrics, hardware-io,
 control-engine, api — are containers under one boot unit,
 `bellasreef.service`; Docker's own restart policies (`restart:
@@ -102,7 +102,9 @@ carrying that decision").
   `update-hub.sh` is implemented, the last two are a fresh
   `install-hub.sh` from the new release on a machine that is not yet a hub,
   or the documented manual steps, never a hand-applied fix around a script
-  failure ("if the script fails, we fail", 2026-08-30).
+  failure ("if the script fails, we fail", 2026-08-30). Until `update-hub.sh`
+  exists, "telemetry verified on the wire" is done by hand on the hub with
+  `curl -s 'http://127.0.0.1:8428/api/v1/query?query=count({__name__=~"bellasreef.*"})'`.
 
   Green-and-undeployed is a state that reads as finished and is not. The Pi
   drifted four commits behind main that way in one session, which meant the hub
@@ -190,7 +192,7 @@ Code comments follow the same rule: a driver may record *what was ruled* and
 - Target: Raspberry Pi 5, NVMe (SD unsupported), Raspberry Pi OS/Debian arm64, kernel 6.x+. Reachable via `ssh <pi-host>` (see `.env.local`, never committed).
 - Workflow: code + unit tests on Mac; integration tests against loopback dev containers or in CI, never against the hub. Releases: tag `v*` on main; the hub installs/updates itself from `bellasreef-hub`.
 - Hardware access in containers: pass specific `/dev` nodes to hardware-io only. No privileged containers.
-- Host-touching config (dtoverlays: w1-gpio, i2c enable) is documented in `docs/host-setup.md` as the ONLY host mutation.
+- Host-touching config (dtoverlays: w1-gpio, i2c enable) is documented in `hub/docs/host-setup.md` as the ONLY host mutation.
 
 ## Code standards
 
@@ -279,7 +281,7 @@ independent channels and every one reaches a header pin on this board:
 | PWM0_CHAN3 | 19 | 35 | **2** | a3 |
 
 All four measured muxed with `pinctrl get 12,13,18,19` after the custom
-`pwm-4chan` overlay (see `docs/host-setup.md` §9 — built on the Pi with `dtc`;
+`pwm-4chan` overlay (see `hub/docs/host-setup.md` §9 — built on the Pi with `dtc`;
 current `config.txt` runs `dtoverlay=pwm-4chan`). The legacy function values
 are NOT the RP1 alt numbers: 12/13 take `4` (legacy ALT0) but 18/19 take `2`
 (legacy ALT5, the BCM-era PWM position — the compat layer translates per-pin).
@@ -847,7 +849,7 @@ This is an artefact of the kill API, **not** of the recovery path — a genuine
 stall exits the process with nobody calling `docker kill`. It matters because
 testing recovery the obvious way reports a failure that production would not
 have, and could be misread as "the restart policy is broken." Signal PID 1 from
-inside. `scripts/drill-restart.sh` does, and `docs/host-setup.md` §7 records
+inside. `scripts/drill-restart.sh` does, and `hub/docs/host-setup.md` §7 records
 both rows.
 
 Related: `.State.ExitCode` reads `0` on a *running* container even when its
@@ -859,7 +861,7 @@ bites — hardware-io without it reads the probe, serves metrics and logs a
 clean startup while publishing nothing at all. Metrics are not the telemetry
 path — check the wire, not the gauge. (Formerly documented against the
 deleted `scripts/dev/run-*.sh` dev launchers; the lesson outlives the
-scripts — it applies equally to `deploy/compose.yaml`'s `environment:`
+scripts — it applies equally to `hub/deploy/compose.yaml`'s `environment:`
 block for hardware-io.)
 
 ## Readiness check

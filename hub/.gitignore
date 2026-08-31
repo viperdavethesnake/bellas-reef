@@ -1,0 +1,4 @@
+# Written by scripts/install-hub.sh: the per-host secrets (Postgres password,
+# GIDs, image tag). Never commit it; never let `git clean` remove it.
+deploy/.env
+deploy/.env.*
