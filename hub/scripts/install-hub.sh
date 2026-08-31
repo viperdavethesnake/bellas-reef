@@ -854,7 +854,7 @@ ih_phase4_configure() {
     ih_pass "generated a Postgres password (32 chars, not shown)"
 
     if (( IH_DRY_RUN )); then
-        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${commit:0:12}"
+        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${commit:0:12} BELLASREEF_BACKUP_DIR=${HOME}/backups"
         return 0
     fi
 
@@ -893,6 +893,8 @@ ih_phase4_configure() {
         -e "s|^I2C_GID=.*|I2C_GID=${i2c_gid}|" \
         -e "s|^GPIO_GID=.*|GPIO_GID=${gpio_gid}|" \
         -e "s|^BELLASREEF_TAG=.*|BELLASREEF_TAG=${commit}|" \
+        -e "s|^BELLASREEF_BACKUP_DIR=.*|BELLASREEF_BACKUP_DIR=${HOME}/backups|" \
+        -e "s|^BELLASREEF_ETC_DIR=.*|BELLASREEF_ETC_DIR=/etc/bellasreef|" \
         "$example" > "$tmpfile"; then
         rm -f "$tmpfile"
         ih_fail "could not generate deploy/.env from deploy/.env.example"
@@ -905,7 +907,7 @@ ih_phase4_configure() {
     # ${VAR:?} — which refuses to start the entire stack, phases later, with a
     # message that names a variable rather than a cause.
     local key
-    for key in POSTGRES_PASSWORD BELLASREEF_DATABASE_URL I2C_GID GPIO_GID BELLASREEF_TAG; do
+    for key in POSTGRES_PASSWORD BELLASREEF_DATABASE_URL I2C_GID GPIO_GID BELLASREEF_TAG BELLASREEF_BACKUP_DIR BELLASREEF_ETC_DIR; do
         if ! grep -qE "^${key}=." "$tmpfile"; then
             rm -f "$tmpfile"
             ih_fail "the generated deploy/.env has no ${key} value; deploy/.env.example may have changed"

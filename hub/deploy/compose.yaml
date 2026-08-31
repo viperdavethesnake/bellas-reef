@@ -13,11 +13,9 @@
 # mainline. If an OSS LTS line is wanted, that question is unresolved and does
 # not have a Docker Hub answer today.
 #
-# App images (hardware-io, control-engine, api) are pulled by SHA tag —
-# `image:` is set alongside `build:` so `docker compose pull` (deploys) and
-# `docker compose build` (dev) both work from the same file; compose prefers
-# `image:` unless `--build` is given. BELLASREEF_TAG is set by deploy-pi.sh
-# to the commit SHA it just verified; it defaults to :latest for local dev.
+# App images (hardware-io, control-engine, api) are pulled by SHA tag.
+# BELLASREEF_TAG is set by deploy-pi.sh to the commit SHA it just verified;
+# it defaults to :latest for local dev.
 
 name: bellasreef
 
@@ -79,9 +77,6 @@ services:
   # --------------------------------------------------------------- application
   hardware-io:
     image: ghcr.io/viperdavethesnake/bellasreef-hardware-io:${BELLASREEF_TAG:-latest}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.hardware-io
     depends_on:
       nats: { condition: service_healthy }
     # SOLE owner of hardware. Specific device nodes only — never privileged.
@@ -160,9 +155,6 @@ services:
 
   control-engine:
     image: ghcr.io/viperdavethesnake/bellasreef-control-engine:${BELLASREEF_TAG:-latest}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.control-engine
     depends_on:
       nats: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -190,9 +182,6 @@ services:
 
   api:
     image: ghcr.io/viperdavethesnake/bellasreef-api:${BELLASREEF_TAG:-latest}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.api
     depends_on:
       nats: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -224,11 +213,11 @@ services:
       - "9103"
     volumes:
       # `bellasreef backup --out /backups/...` lands archives on the host here.
-      - /home/david/backups:/backups
+      - ${BELLASREEF_BACKUP_DIR:?}:/backups
       # Read-only: the device-import manifest the docs tell the operator to
       # pass lives here on the host, and the documented command runs inside
       # this container (rehearsal 2026-08-24, F1).
-      - /etc/bellasreef:/etc/bellasreef:ro
+      - ${BELLASREEF_ETC_DIR:?}:/etc/bellasreef:ro
     restart: unless-stopped
 
 volumes:

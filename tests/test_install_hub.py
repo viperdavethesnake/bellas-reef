@@ -1385,6 +1385,25 @@ def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
     assert leftovers == [], f"phase 4 left temporary files behind: {leftovers}"
 
 
+def test_phase4_writes_the_two_directory_keys(tmp_path: Path) -> None:
+    # compose.yaml bind-mounts the backup directory and /etc/bellasreef by
+    # variable now, both interpolated as ${VAR:?} — an .env without them
+    # refuses to start the whole stack with an error naming the variable.
+    # The backup dir is the operating user's, not a literal /home/david.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = envfile.read_text()
+    assert "BELLASREEF_BACKUP_DIR=/home/tester/backups" in text, text
+    assert "BELLASREEF_ETC_DIR=/etc/bellasreef" in text, text
+
+
 def test_phase4_pins_the_image_tag_to_the_checkouts_commit(tmp_path: Path) -> None:
     # BELLASREEF_TAG=latest meant the images came from whatever CI last pushed
     # while the compose file, the migrations and the contracts came from this
