@@ -14,7 +14,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.hub_script_harness import run_any_script, strip_ansi, write_release_env, write_stub
+from tests.hub_script_harness import (
+    FAKE_COMMIT,
+    run_any_script,
+    strip_ansi,
+    write_release_env,
+    write_stub,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HUB_ROOT = REPO_ROOT / "hub"
@@ -26,7 +32,7 @@ NEW_SHA = "89d143f0123456789abcdef0123456789abcdef0"
 FAST = {"UH_TELEMETRY_DEADLINE_SECS": "2", "UH_POLL_SECS": "1"}
 
 
-def hub_fixture(tmp_path: Path) -> Path:
+def hub_fixture(tmp_path: Path, deployed_tag: str = "oldsha") -> Path:
     """A root that phase 1 accepts: the boot unit and a populated deploy/.env.
 
     The .env lives at IH_ROOT + <real repo>/hub/deploy/.env, the same seam
@@ -39,7 +45,8 @@ def hub_fixture(tmp_path: Path) -> Path:
     envdir = root / str(HUB_ROOT / "deploy").lstrip("/")
     envdir.mkdir(parents=True)
     (envdir / ".env").write_text(
-        "POSTGRES_PASSWORD=x\nBELLASREEF_TAG=oldsha\nBELLASREEF_BACKUP_DIR=/home/tester/backups\n"
+        f"POSTGRES_PASSWORD=x\nBELLASREEF_TAG={deployed_tag}\n"
+        "BELLASREEF_BACKUP_DIR=/home/tester/backups\n"
     )
     return root
 
@@ -163,7 +170,7 @@ def test_pre_flag_allows_the_newest_prerelease(tmp_path: Path) -> None:
 
 
 def test_ref_pins_a_specific_tag(tmp_path: Path) -> None:
-    root = hub_fixture(tmp_path)
+    root = hub_fixture(tmp_path, deployed_tag=NEW_SHA)
     stubs = tmp_path / "bin"
     logs = write_update_stubs(stubs, tmp_path)
     write_release_env(tmp_path / "release.env", version="v0.1.0", tag=NEW_SHA)
@@ -181,7 +188,7 @@ def test_ref_pins_a_specific_tag(tmp_path: Path) -> None:
 
 
 def test_already_current_deploys_nothing(tmp_path: Path) -> None:
-    root = hub_fixture(tmp_path)
+    root = hub_fixture(tmp_path, deployed_tag=FAKE_COMMIT)
     stubs = tmp_path / "bin"
     logs = write_update_stubs(stubs, tmp_path, current="v0.2.0")
     result = run_update(root=root, stubs=stubs)
@@ -247,7 +254,7 @@ def test_a_plain_run_never_downgrades(tmp_path: Path) -> None:
     # Real trap from the real tag list: v0.1.0 is the newest STABLE tag while
     # the hub runs v0.2.0-rc.4. "Newest stable" must never mean "older than
     # what is running" — that is a downgrade wearing an update's clothes.
-    root = hub_fixture(tmp_path)
+    root = hub_fixture(tmp_path, deployed_tag=FAKE_COMMIT)
     stubs = tmp_path / "bin"
     logs = write_update_stubs(stubs, tmp_path, tags="v0.1.0\nv0.2.0-rc.4", current="v0.2.0-rc.4")
     result = run_update(root=root, stubs=stubs)
@@ -273,3 +280,37 @@ def test_graduation_from_rc_to_the_same_version_is_an_upgrade(tmp_path: Path) ->
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "checkout --quiet v0.2.0" in logs["git"].read_text(), logs["git"].read_text()
+
+
+def test_checkout_already_on_target_but_undeployed_still_deploys(tmp_path: Path) -> None:
+    # The bootstrap case, verbatim from coco: the rc.4 clone carries only the
+    # skeleton, so the first real update is `git checkout v0.2.0-rc.5` by
+    # hand and THEN this script. The checkout now matches the target tag, but
+    # deploy/.env still names the old image sha — "already on the tag" must
+    # mean "already DEPLOYED", or this exits 0 with the old release running.
+    root = hub_fixture(tmp_path)
+    stubs = tmp_path / "bin"
+    logs = write_update_stubs(stubs, tmp_path, current="v0.2.0")
+    write_release_env(tmp_path / "release.env", version="v0.2.0", tag=NEW_SHA)
+    result = run_update(
+        root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "release.env")}
+    )
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    docker = logs["docker"].read_text()
+    assert "pull" in docker, "an undeployed checkout was left undeployed:\n" + out
+    envfile = root / str(HUB_ROOT / "deploy").lstrip("/") / ".env"
+    assert f"BELLASREEF_TAG={NEW_SHA}" in envfile.read_text()
+
+
+def test_checkout_on_target_and_deployed_is_a_true_no_op(tmp_path: Path) -> None:
+    root = hub_fixture(tmp_path, deployed_tag=NEW_SHA)
+    stubs = tmp_path / "bin"
+    logs = write_update_stubs(stubs, tmp_path, current="v0.2.0")
+    write_release_env(tmp_path / "release.env", version="v0.2.0", tag=NEW_SHA)
+    result = run_update(
+        root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "release.env")}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "already" in strip_ansi(result.stdout).lower()
+    assert not logs["docker"].exists(), "a truly deployed no-op ran docker anyway"

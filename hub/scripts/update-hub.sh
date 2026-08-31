@@ -104,8 +104,21 @@ if [[ -z "$STAGE2" ]]; then
     fi
 
     if [[ -n "$current" && "$current" == "$target" ]]; then
-        pass "already on ${target}; nothing to update"
-        exit 0
+        # Same tag is not the same as deployed: "on the tag" is a property of
+        # the checkout, "deployed" is deploy/.env naming the tag's image sha.
+        # The first run of this script on any hub arrives exactly this way —
+        # the older release shipped only the skeleton, so the operator
+        # checks the new tag out by hand and THEN runs this; exiting 0 here
+        # would leave the old images running while everything says updated.
+        deployed="$(sed -n 's/^BELLASREEF_TAG=//p' "$ENV_FILE" | head -1)"
+        manifest="$(sed -n 's/^BELLASREEF_TAG=//p' "$RELEASE_ENV" 2>/dev/null | head -1)"
+        if [[ -n "$manifest" && "$deployed" == "$manifest" ]]; then
+            pass "already on ${target} and its images are deployed; nothing to update"
+            exit 0
+        fi
+        # Fall through: the checkout below is a no-op at the same tag, and
+        # the re-exec lands in stage 2, which is the deploy this hub needs.
+        step "checkout already at ${target}; deploy/.env is behind — deploying"
     fi
     # Never move backwards on a plain run: with only pre-releases shipped,
     # "newest stable" can be OLDER than what is running (v0.1.0 vs
