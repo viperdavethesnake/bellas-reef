@@ -137,9 +137,7 @@ def test_phase4_writes_the_two_directory_keys(tmp_path: Path) -> None:
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
 
-    result = run_script(
-        "--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"}
-    )
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
     assert result.returncode == 0, result.stdout + result.stderr
     text = envfile.read_text()
     assert "BELLASREEF_BACKUP_DIR=/home/tester/backups" in text, text
@@ -260,7 +258,9 @@ EXPECTED = {
 }
 
 
-def build(out: Path, version: str = "v0.2.0-rc.2", sha: str = SHA) -> subprocess.CompletedProcess[str]:
+def build(
+    out: Path, version: str = "v0.2.0-rc.2", sha: str = SHA
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(SCRIPT), str(out), version, sha], capture_output=True, text=True, check=False
     )
@@ -717,7 +717,9 @@ def test_phase2_offers_to_set_avahi_allow_interfaces(tmp_path: Path) -> None:
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "install", install_stub())
     write_stub(
-        stubs, "systemctl", 'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac'
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
     )
     root = tmp_path / "root"
     (root / "etc/avahi/services").mkdir(parents=True)
@@ -756,7 +758,9 @@ def test_phase2_never_touches_an_existing_allow_interfaces_line(tmp_path: Path) 
     conf = root / "etc/avahi/avahi-daemon.conf"
     before = conf.read_text()
 
-    result = run_script("--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")})
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
     assert "set avahi allow-interfaces" not in result.stdout
     assert conf.read_text() == before
 
@@ -867,7 +871,9 @@ git commit -m "feat(install): offer to write avahi allow-interfaces for this mac
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-DAEMON_JSON = '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+DAEMON_JSON = (
+    '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+)
 
 
 def test_phase2_offers_docker_log_rotation_when_daemon_json_is_absent(tmp_path: Path) -> None:
@@ -878,12 +884,20 @@ def test_phase2_offers_docker_log_rotation_when_daemon_json_is_absent(tmp_path: 
     stubs = make_stubs(tmp_path)
     write_stub(stubs, "sudo", '"$@"')
     write_stub(stubs, "install", install_stub())
-    write_stub(stubs, "systemctl", 'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac')
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
+    )
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
 
-    result = run_script("--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")})
-    assert "configure docker log rotation (json-file, 10m x 3)? [y/N] y (--yes)" in result.stdout, result.stdout
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    assert "configure docker log rotation (json-file, 10m x 3)? [y/N] y (--yes)" in result.stdout, (
+        result.stdout
+    )
     assert (root / "etc/docker/daemon.json").read_text() == DAEMON_JSON
     assert "PASS  docker log rotation configured" in result.stdout, result.stdout
 
@@ -896,9 +910,13 @@ def test_phase2_reports_but_never_rewrites_an_existing_daemon_json(tmp_path: Pat
     (root / "etc/docker").mkdir(parents=True)
     (root / "etc/docker/daemon.json").write_text('{"data-root": "/mnt/docker"}\n')
 
-    result = run_script("--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")})
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
     assert "configure docker log rotation" not in result.stdout, result.stdout
-    assert "WARN  /etc/docker/daemon.json exists but sets no log rotation" in result.stdout, result.stdout
+    assert "WARN  /etc/docker/daemon.json exists but sets no log rotation" in result.stdout, (
+        result.stdout
+    )
     assert (root / "etc/docker/daemon.json").read_text() == '{"data-root": "/mnt/docker"}\n'
 
 
@@ -1001,7 +1019,9 @@ def test_phase3_reports_the_board(tmp_path: Path) -> None:
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "board        Raspberry Pi 5 Model B Rev 1.1 (RP1 present)" in result.stdout, result.stdout
+    assert "board        Raspberry Pi 5 Model B Rev 1.1 (RP1 present)" in result.stdout, (
+        result.stdout
+    )
     assert result.returncode == 0
 
 
@@ -1038,7 +1058,9 @@ def test_phase3_counts_ds18b20_probes_and_names_a_floating_bus(tmp_path: Path) -
     for name in ("w1_bus_master1", "00-100000000000", "00-600000000000"):
         (devices / name).mkdir(parents=True)
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering" in result.stdout, result.stdout
+    assert (
+        "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering" in result.stdout
+    ), result.stdout
 
     (devices / "28-000000bfe244").mkdir()
     result = run_script("--check-only", root=root, stubs=stubs)
@@ -1205,7 +1227,9 @@ def test_phase5_creates_the_bind_mount_directories_owned_by_the_image_uid(tmp_pa
     assert result.returncode == 0, result.stdout + result.stderr
     assert (root / "home/tester/backups").is_dir()
     assert (root / "etc/bellasreef").is_dir()
-    assert "creating /home/tester/backups (owned by the container uid 1000)" in result.stdout, result.stdout
+    assert "creating /home/tester/backups (owned by the container uid 1000)" in result.stdout, (
+        result.stdout
+    )
 
 
 def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
@@ -1659,7 +1683,9 @@ def test_destroys_in_order_and_redeploys_through_the_boot_unit(tmp_path: Path) -
     down = next(i for i, ln in enumerate(lines) if " down" in ln)
     rm = next(i for i, ln in enumerate(lines) if "volume rm" in ln)
     migrate = next(i for i, ln in enumerate(lines) if "alembic upgrade head" in ln)
-    start = next(i for i, ln in enumerate(lines) if ln.startswith("sudo systemctl start bellasreef"))
+    start = next(
+        i for i, ln in enumerate(lines) if ln.startswith("sudo systemctl start bellasreef")
+    )
     assert stop < down < rm < migrate < start, lines
     assert "systemctl restart" not in log
     assert "7KF2-9QMD" in result.stdout
