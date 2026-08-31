@@ -105,7 +105,7 @@ allowlist or it advertises unreachable bridge addresses.
 
 ## Reference platform: Raspberry Pi 5
 
-Everything in `docs/host-setup.md`. Verified host facts are in CLAUDE.md.
+Everything in `host-setup.md`. Verified host facts are in CLAUDE.md.
 Summarised here only for comparison:
 
 ```

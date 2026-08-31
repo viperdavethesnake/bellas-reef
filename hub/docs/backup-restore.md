@@ -160,9 +160,10 @@ Containers-only shortened this considerably: there is one unit, one env file,
 and the app image carries its own pg tools, so most of the old per-service
 setup steps are gone. The order still matters.
 
-**1. Prepare the host.** Follow `docs/host-setup.md` — overlays, chrony,
-avahi, and `deploy/.env` including the ghcr.io pull credential (§1c). None of
-it is in the archive.
+**1. Prepare the host.** Follow `docs/host-setup.md`: overlays, chrony,
+avahi, `deploy/.env`, and the ghcr.io pull credential (§1c). That credential
+lives in `~/.docker/config.json` from `docker login`, not in `deploy/.env`.
+None of it is in the archive.
 
 **2. Recreate `deploy/.env`** from `deploy/.env.example` — the database
 password and the `i2c`/`gpio` group IDs (host-setup §1b). It is the only

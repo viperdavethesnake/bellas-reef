@@ -308,11 +308,20 @@ contention risk the environment-boundary rule in CLAUDE.md exists to prevent.
 
 Deploy with `scripts/install-hub.sh`, run on the hub from the `bellasreef-hub`
 clone: it pulls the three app images at the commit-sha tag recorded in
-`deploy/release.env`, migrates, brings the stack up, and waits for a fresh
-sample to reach VictoriaMetrics before reporting success. `scripts/update-hub.sh`
-is meant to move an already-installed hub to a newer release the same way; it
-is not implemented yet (see `../README.md`), so an update today is a fresh
+`deploy/release.env`, migrates, brings the stack up, and then phase 6 checks
+that every compose service is running, `bellasreef.service` is enabled and
+rendered for this host, the API answers on port 8000, avahi's service record
+is published, and prints the setup code. `scripts/update-hub.sh` is meant to
+move an already-installed hub to a newer release the same way; it is not
+implemented yet (see `../README.md`), so an update today is a fresh
 `install-hub.sh` run from the new release, or the manual steps below.
+
+None of that reads a telemetry sample. Until `update-hub.sh` lands, confirm
+telemetry is actually on the wire by hand by asking VictoriaMetrics directly:
+
+```bash
+curl -s 'http://127.0.0.1:8428/api/v1/query?query=count({__name__=~"bellasreef.*"})'
+```
 
 ### Service configuration: `deploy/.env` + compose, not a directory per service
 
