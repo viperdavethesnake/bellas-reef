@@ -255,6 +255,20 @@ def write_good_avahi_fixture(root: Path) -> None:
     )
 
 
+def write_good_docker_daemon_fixture(root: Path) -> None:
+    """Populate an $IH_ROOT fixture with a daemon.json that already sets log
+    rotation, so ih_check_docker_logging's phase-2 offer never fires.
+
+    A test reaching phase 4/5/6 has nothing to do with docker log rotation,
+    and the offer's sudo calls (write, then `systemctl restart docker`) are
+    exactly the kind of incidental mutation the phase-5/6 fixture helpers
+    below (write_phase5_stubs et al.) exist to keep out of an unrelated
+    test's way — this is the same idea applied to phase 2's own offer.
+    """
+    (root / "etc/docker").mkdir(parents=True, exist_ok=True)
+    (root / "etc/docker/daemon.json").write_text(DAEMON_JSON)
+
+
 def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
     # Phase 1 finding nothing means ih_main falls through into phase 2, so a
     # clean-machine fixture here needs phase 2 to also see a good machine —
@@ -854,6 +868,65 @@ def test_phase2_allow_interfaces_dry_run_writes_nothing(tmp_path: Path) -> None:
     assert not markers["systemctl"].exists()
 
 
+DAEMON_JSON = (
+    '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+)
+
+
+def test_phase2_offers_docker_log_rotation_when_daemon_json_is_absent(tmp_path: Path) -> None:
+    # Docker's default json-file driver never rotates, and compose.yaml
+    # deliberately carries no per-service logging: block. Six always-on
+    # services fill a disk eventually, silently. hub-prereqs documented this
+    # as a hand step; the installer does it.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", install_stub())
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    stdout = strip_ansi(result.stdout)
+    assert "configure docker log rotation (json-file, 10m x 3)? [y/N] y (--yes)" in stdout, stdout
+    assert (root / "etc/docker/daemon.json").read_text() == DAEMON_JSON
+    assert "PASS  docker log rotation configured" in stdout, stdout
+
+
+def test_phase2_reports_but_never_rewrites_an_existing_daemon_json(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "etc/docker").mkdir(parents=True)
+    (root / "etc/docker/daemon.json").write_text('{"data-root": "/mnt/docker"}\n')
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    stdout = strip_ansi(result.stdout)
+    assert "configure docker log rotation" not in stdout, stdout
+    assert "WARN  /etc/docker/daemon.json exists but sets no log rotation" in stdout, stdout
+    assert (root / "etc/docker/daemon.json").read_text() == '{"data-root": "/mnt/docker"}\n'
+
+
+def test_phase2_declined_log_rotation_is_a_warn_not_a_gate(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--check-only", root=root, stubs=stubs)
+    stdout = strip_ansi(result.stdout)
+    assert "WARN  no /etc/docker/daemon.json" in stdout, stdout
+    assert result.returncode == 0, "a missing daemon.json must not fail the run"
+
+
 def test_dry_run_reports_actions_without_running_them(tmp_path: Path) -> None:
     # No avahi fixture, so avahi is broken too: both the docker branch and
     # the avahi branch have something to offer, exercising every mutating
@@ -1093,6 +1166,11 @@ def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
     markers = write_mutation_guard_stubs(stubs, tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    # Otherwise phase 2's own docker-log-rotation offer (docker is present
+    # and reachable here) fires under --yes and its `systemctl restart
+    # docker` trips this test's systemctl marker for a reason that has
+    # nothing to do with the clock.
+    write_good_docker_daemon_fixture(root)
     result = run_script("--yes", root=root, stubs=stubs)
     assert "UNVERIFIED" in result.stdout
     assert result.returncode != 0
@@ -1347,6 +1425,7 @@ def full_root(tmp_path: Path) -> Path:
     """
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_good_docker_daemon_fixture(root)
     (root / "dev").mkdir(parents=True, exist_ok=True)
     (root / "dev/i2c-1").write_text("")
     (root / "sys/bus/w1/devices").mkdir(parents=True)

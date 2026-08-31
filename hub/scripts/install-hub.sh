@@ -245,6 +245,40 @@ ih_check_docker() {
     return 0
 }
 
+# Docker's json-file driver never rotates on its own, and compose.yaml
+# carries no per-service logging: block on purpose — the daemon default is
+# the one place rotation exists. WARN, never FAIL: the stack runs without it;
+# the disk fills later.
+ih_docker_daemon_json() { printf '%s' "${IH_ROOT}/etc/docker/daemon.json"; }
+
+ih_check_docker_logging() {
+    local f
+    f="$(ih_docker_daemon_json)"
+    if [[ -f "$f" ]] && grep -q '"max-size"' "$f"; then
+        ih_pass "docker log rotation configured"
+        return 0
+    fi
+    if [[ -f "$f" ]]; then
+        # Present but silent on rotation. Merging a stranger's JSON blind is
+        # how a daemon stops starting, so this is reported and left alone.
+        ih_warn "/etc/docker/daemon.json exists but sets no log rotation; container logs grow without bound"
+        printf '      Add under "log-opts": { "max-size": "10m", "max-file": "3" }, then restart docker.\n'
+    else
+        ih_warn "no /etc/docker/daemon.json; container logs grow without bound"
+    fi
+    return 0
+}
+
+ih_write_docker_daemon_json() {
+    local tmp rc f
+    f="$(ih_docker_daemon_json)"
+    tmp="$(mktemp)" || return 1
+    printf '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n' > "$tmp"
+    sudo mkdir -p "$(dirname "$f")" && sudo install -m 0644 "$tmp" "$f"; rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
 ih_check_arch() {
     local arch
     arch="$(uname -m 2>/dev/null)"
@@ -555,6 +589,15 @@ ih_phase2_requirements() {
         fi
     fi
 
+    # Offered only when the file is absent — see ih_check_docker_logging.
+    if (( ! IH_CHECK_ONLY )) && ih_docker_present && [[ ! -f "$(ih_docker_daemon_json)" ]]; then
+        if ih_confirm "configure docker log rotation (json-file, 10m x 3)?"; then
+            if ih_run "writing /etc/docker/daemon.json" ih_write_docker_daemon_json; then
+                ih_run "restarting docker" sudo systemctl restart docker
+            fi
+        fi
+    fi
+
     ih_check_quietly ih_check_arch
     ih_check_quietly ih_check_kernel
     ih_check_quietly ih_check_memory
@@ -634,6 +677,7 @@ ih_phase2_requirements() {
     printf '\n'
     ih_step "2. hard requirements (re-checking)"
     ih_check_docker
+    ih_check_docker_logging
     ih_check_arch
     ih_check_kernel
     ih_check_memory
