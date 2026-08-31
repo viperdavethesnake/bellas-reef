@@ -16,6 +16,7 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 EXPECTED = {
     "LICENSE",
     "README.md",
+    ".gitignore",
     "deploy/compose.yaml",
     "deploy/.env.example",
     "deploy/release.env",
@@ -82,3 +83,20 @@ def test_refuses_a_non_empty_output_directory(tmp_path: Path) -> None:
     result = build(out)
     assert result.returncode == 1
     assert "not empty" in result.stderr
+
+
+def test_assembler_never_packs_a_secrets_file(tmp_path: Path) -> None:
+    # A developer's own hub/deploy/.env (or a stray hub/deploy/.env.local)
+    # must never ride along into the payload just because it happens to
+    # exist in the dev tree when the assembler runs.
+    dev_env = REPO_ROOT / "hub/deploy/.env"
+    assert not dev_env.exists(), "dev tree already has hub/deploy/.env; refusing to overwrite it"
+    dev_env.write_text("POSTGRES_PASSWORD=should-never-ship\n")
+    try:
+        out = tmp_path / "out"
+        result = build(out)
+        assert result.returncode == 0, result.stderr
+        assert not (out / "deploy/.env").exists()
+        assert (out / "deploy/.env.example").exists()
+    finally:
+        dev_env.unlink(missing_ok=True)

@@ -38,6 +38,13 @@ mkdir -p "$out"
 cp -R "${repo}/hub/." "${out}/"
 cp "${repo}/LICENSE" "${out}/LICENSE"
 find "$out" -name '.DS_Store' -delete
+
+# A developer's own hub/deploy/.env (or a stray hub/deploy/.env.local) must
+# never ship: `cp -R` copies whatever is sitting in the dev tree, gitignored
+# or not, so this is the one place that guarantees a secrets file never
+# leaves the assembler. .env.example is the committed template and stays.
+find "${out}/deploy" -maxdepth 1 \( -name '.env' -o -name '.env.*' \) ! -name '.env.example' -delete
+
 printf 'BELLASREEF_VERSION=%s\nBELLASREEF_TAG=%s\nBELLASREEF_CONTRACTS=%s\n' \
     "$version" "$sha" "$contracts" > "${out}/deploy/release.env"
 
