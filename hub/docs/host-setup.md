@@ -685,6 +685,11 @@ only terminal interaction in the whole system, and you should need them roughly
 never. Read this before you need it, because the day you need it is the day the
 app will not open.
 
+A related use of pairing: `bellasreef devices import` needs an access token
+(`--token`, or `BELLASREEF_TOKEN` in the environment) from a paired client, and
+this repo's CLAUDE.md, "Deployment discipline," documents the seed-a-client-
+then-revoke-it sequence for getting one.
+
 ### Running the CLI
 
 `bellasreef` is a console script installed with the API package. It lives
