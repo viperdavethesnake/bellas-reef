@@ -101,7 +101,14 @@ services:
       - /sys/devices/w1_bus_master1:/sys/devices/w1_bus_master1:ro
       # PWM chip device dir, rw: export/period/duty writes land here. The
       # /sys/class/pwm entries are symlinks into it; the driver resolves them.
-      - /sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm:/sys/devices/platform/axi/1000120000.pcie/1f00098000.pwm
+      # The RP1's PCIe root, not the .pwm leaf: the leaf only exists when a
+      # PWM overlay is loaded, and a missing bind-mount source under /sys is
+      # uncreatable — hardware-io could never start on a hub without the
+      # overlay (coco-bellasreef, v0.2.0-rc.3). The parent always exists on a
+      # Pi 5, and when an overlay is added later the .pwm node appears inside
+      # this mount at the next boot with no compose change — discovery
+      # announces whatever the mux proves at the next service start.
+      - /sys/devices/platform/axi/1000120000.pcie:/sys/devices/platform/axi/1000120000.pcie
       # Chip identity + of_node compatible resolve into the device tree, ro.
       - /sys/class/pwm:/sys/class/pwm:ro
       # No /sys/firmware/devicetree bind mount here — tried it, and it lost to
