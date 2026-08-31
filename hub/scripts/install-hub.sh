@@ -47,7 +47,13 @@ IH_ASSUME_NO_TTY="${IH_ASSUME_NO_TTY:-0}"
 # the four-second version does not. Nobody installing a hub sets it.
 IH_API_DEADLINE_SECS="${IH_API_DEADLINE_SECS:-30}"
 
+# Where the image tag comes from. Written by the release workflow into the
+# hub checkout; the dev repo does not have one. A seam only so the tests can
+# hand the script a manifest without one existing in the tree.
+IH_RELEASE_ENV="${IH_RELEASE_ENV:-}"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+: "${IH_RELEASE_ENV:=${REPO_DIR}/deploy/release.env}"
 
 # ------------------------------------------------------------------ output
 
@@ -239,6 +245,40 @@ ih_check_docker() {
     return 0
 }
 
+# Docker's json-file driver never rotates on its own, and compose.yaml
+# carries no per-service logging: block on purpose — the daemon default is
+# the one place rotation exists. WARN, never FAIL: the stack runs without it;
+# the disk fills later.
+ih_docker_daemon_json() { printf '%s' "${IH_ROOT}/etc/docker/daemon.json"; }
+
+ih_check_docker_logging() {
+    local f
+    f="$(ih_docker_daemon_json)"
+    if [[ -f "$f" ]] && grep -q '"max-size"' "$f"; then
+        ih_pass "docker log rotation configured"
+        return 0
+    fi
+    if [[ -f "$f" ]]; then
+        # Present but silent on rotation. Merging a stranger's JSON blind is
+        # how a daemon stops starting, so this is reported and left alone.
+        ih_warn "/etc/docker/daemon.json exists but sets no log rotation; container logs grow without bound"
+        printf '      Add under "log-opts": { "max-size": "10m", "max-file": "3" }, then restart docker.\n'
+    else
+        ih_warn "no /etc/docker/daemon.json; container logs grow without bound"
+    fi
+    return 0
+}
+
+ih_write_docker_daemon_json() {
+    local tmp rc f
+    f="$(ih_docker_daemon_json)"
+    tmp="$(mktemp)" || return 1
+    printf '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n' > "$tmp"
+    sudo mkdir -p "$(dirname "$f")" && sudo install -m 0644 "$tmp" "$f"; rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
 ih_check_arch() {
     local arch
     arch="$(uname -m 2>/dev/null)"
@@ -377,6 +417,27 @@ ih_lan_interfaces() {
     printf '%s' "$names"
 }
 
+ih_avahi_allow_interfaces_set() {
+    grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$1"
+}
+
+# Inserts the line directly under [server]. Rendered with awk into a temp
+# file and installed over the original, rather than sed -i: the two seds
+# disagree on `a\` and this has to behave the same on the Pi and on the
+# machine running the tests. `sudo install` is what puts it back, so the
+# file keeps root ownership and 0644.
+ih_set_avahi_allow_interfaces() {
+    local conf="$1" lan="$2" tmp rc
+    tmp="$(mktemp)" || return 1
+    if ! awk -v line="allow-interfaces=${lan}" \
+            '{ print } /^\[server\]/ && !done { print line; done=1 }' "$conf" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    sudo install -m 0644 "$tmp" "$conf"; rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
 ih_check_avahi() {
     local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf"
     local rc=0
@@ -386,13 +447,12 @@ ih_check_avahi() {
         return 1
     fi
 
-    if grep -qE '^[[:space:]]*allow-interfaces[[:space:]]*=' "$conf"; then
+    if ih_avahi_allow_interfaces_set "$conf"; then
         ih_pass "avahi allow-interfaces is set"
     else
-        # Nothing in this script edits avahi-daemon.conf, so this line is the
-        # whole remedy. The path and the line are printed as instructions —
-        # they are text for a human, not a path this script touches, which is
-        # why they carry no $IH_ROOT.
+        # Phase 2 offers to write this line (ih_set_avahi_allow_interfaces);
+        # the printed remedy below is for the cases it will not touch: no
+        # [server] section, or interfaces it could not read.
         ih_fail "avahi allow-interfaces is unset; it will advertise Docker bridges"
         local lan
         printf '      Add to /etc/avahi/avahi-daemon.conf, under [server]:\n'
@@ -529,6 +589,15 @@ ih_phase2_requirements() {
         fi
     fi
 
+    # Offered only when the file is absent — see ih_check_docker_logging.
+    if (( ! IH_CHECK_ONLY )) && ih_docker_present && [[ ! -f "$(ih_docker_daemon_json)" ]]; then
+        if ih_confirm "configure docker log rotation (json-file, 10m x 3)?"; then
+            if ih_run "writing /etc/docker/daemon.json" ih_write_docker_daemon_json; then
+                ih_run "restarting docker" sudo systemctl restart docker
+            fi
+        fi
+    fi
+
     ih_check_quietly ih_check_arch
     ih_check_quietly ih_check_kernel
     ih_check_quietly ih_check_memory
@@ -561,8 +630,8 @@ ih_phase2_requirements() {
         # script cp-ing a record into a services/ directory that was never
         # created, or reloading a daemon that is not there.
         #
-        # Neither prompt ever touches avahi-daemon.conf's allow-interfaces —
-        # ih_check_avahi prints that remedy for the operator to apply.
+        # The allowlist is offered below; the printed remedy in ih_check_avahi
+        # covers what the offer will not touch.
         if ! ih_avahi_daemon_present; then
             ih_offer_install "avahi-daemon" avahi-daemon
         fi
@@ -572,6 +641,21 @@ ih_phase2_requirements() {
                     sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
                             "${IH_ROOT}/etc/avahi/services/bellasreef.service"
                 ih_run "reloading avahi" sudo systemctl reload avahi-daemon
+            fi
+        fi
+
+        # The allowlist. Only when the daemon is present, the line is absent,
+        # this machine's interfaces could be read, and there is a [server]
+        # section to put it under — a guessed list or an invented section
+        # would be worse than the printed remedy.
+        local conf="${IH_ROOT}/etc/avahi/avahi-daemon.conf" lan
+        if ih_avahi_daemon_present && ! ih_avahi_allow_interfaces_set "$conf" \
+                && lan="$(ih_lan_interfaces)" && grep -q '^\[server\]' "$conf"; then
+            if ih_confirm "set avahi allow-interfaces=${lan}?"; then
+                if ih_run "setting avahi allow-interfaces=${lan}" ih_set_avahi_allow_interfaces "$conf" "$lan"; then
+                    # restart, not reload: interface config is read at start.
+                    ih_run "restarting avahi" sudo systemctl restart avahi-daemon
+                fi
             fi
         fi
     fi
@@ -593,6 +677,7 @@ ih_phase2_requirements() {
     printf '\n'
     ih_step "2. hard requirements (re-checking)"
     ih_check_docker
+    ih_check_docker_logging
     ih_check_arch
     ih_check_kernel
     ih_check_memory
@@ -623,115 +708,81 @@ ih_detect_board() {
     esac
 }
 
-# Reported, never blocking. An owner may want temperature monitoring and no
-# lights at all, so a fixed list of required interfaces would be an opinion
-# about their tank. This mirrors capabilities.py, which announces what it can
-# prove and holds no view on what should be there.
+# Reported, never required. An owner may want temperature and no lights, or
+# lights over a PCA9685 and no SoC PWM, or — on the day the hub is installed
+# — nothing attached at all. This mirrors capabilities.py, which announces
+# what it can prove and holds no view on what should be there. Nothing here
+# gates the install, prints boot-config advice, or asks a question; the
+# custom overlay procedure for RP1 PWM lives in docs/host-setup.md §9.
 ih_phase3_hardware() {
-    ih_step "3. hardware inventory"
+    ih_step "3. hardware inventory (reported, never required)"
 
     local board
     board="$(ih_detect_board)"
-
-    # /dev/i2c-1 specifically, not a glob over /dev/i2c-*. The reference Pi has
-    # /dev/i2c-13 and /dev/i2c-14 — the HDMI DDC buses — present with i2c_arm
-    # off, so a glob announces I2C as enabled on a machine where nothing can
-    # reach a PCA9685. i2c-1 is the bus hardware-io opens.
-    local i2c_ok=0 w1_ok=0 pwm_ok=0 pwm_mux=""
-    [[ -e "${IH_ROOT}/dev/i2c-1" ]] && i2c_ok=1
-    [[ -d "${IH_ROOT}/sys/bus/w1/devices" ]] && w1_ok=1
-    compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1 && pwm_ok=1
-
-    # A channel that exports in sysfs while its pin reads `none` is the
-    # standing trap (CLAUDE.md, verified host facts): the chip is there, the
-    # header pin carries nothing, and a PWM inventory built on the sysfs
-    # directory alone says everything is fine. pinctrl is what proves the mux,
-    # and it is the same evidence hardware-io's discovery uses. Without it the
-    # honest answer is that the mux was not checked.
-    if (( pwm_ok )) && command -v pinctrl >/dev/null 2>&1; then
-        local muxed
-        muxed="$(pinctrl get 12,13,18,19 2>/dev/null | grep -c 'PWM')"
-        [[ "$muxed" =~ ^[0-9]+$ ]] || muxed=0
-        if (( muxed > 0 )); then
-            pwm_mux="${muxed} of 4 header pins muxed to PWM"
-        else
-            # Not a pass. The overlay is missing or wrong, which is precisely
-            # what the config.txt guidance below fixes.
-            pwm_ok=0
-            pwm_mux="no header pin is muxed to PWM"
-        fi
-    fi
-
-    if (( i2c_ok )); then
-        ih_pass "I2C          enabled       PCA9685 and other I2C devices available"
-    else
-        ih_warn "I2C          not enabled   no PCA9685 or I2C sensors"
-    fi
-
-    if (( w1_ok )); then
-        ih_pass "1-Wire       enabled       DS18B20 temperature probes available"
-    else
-        ih_warn "1-Wire       not enabled   no temperature probes"
-    fi
-
-    if (( pwm_ok )); then
-        ih_pass "SoC PWM      enabled       ${pwm_mux:-sysfs PWM chips present; pin mux not verified}"
-    elif [[ -n "$pwm_mux" ]]; then
-        ih_warn "SoC PWM      not usable    sysfs PWM chips present but ${pwm_mux}"
-    else
-        ih_warn "SoC PWM      not enabled   a PCA9685 still works over I2C"
-    fi
-
-    if (( i2c_ok && w1_ok && pwm_ok )); then
-        return 0
-    fi
-
-    printf '\n'
+    local model="${IH_ROOT}/proc/device-tree/model" model_text=""
+    [[ -r "$model" ]] && model_text="$(tr -d '\0' < "$model")"
     case "$board" in
-        pi5|pi)
-            ih_warn "To enable the missing interfaces, add to /boot/firmware/config.txt:"
-            (( i2c_ok )) || printf '      dtparam=i2c_arm=on\n'
-            if (( ! w1_ok )); then
-                if [[ "$board" == "pi5" ]]; then
-                    printf '      [pi5]\n      dtoverlay=w1-gpio-pi5,gpiopin=4\n'
-                else
-                    printf '      dtoverlay=w1-gpio,gpiopin=4\n'
-                fi
-            fi
-            # pwm-4chan is our custom overlay, compiled on the Pi 5 with dtc
-            # (docs/host-setup.md §9) — it names RP1 hardware and is not in
-            # the stock overlay set. On older Pis hardware-io cannot use SoC
-            # PWM at all (discover_pwm is pinned to the RP1 device), so the
-            # honest advice there is the PCA9685-over-I2C path, not an
-            # overlay that does not exist.
-            if (( ! pwm_ok )); then
-                if [[ "$board" == "pi5" ]]; then
-                    printf '      dtoverlay=pwm-4chan\n'
-                else
-                    ih_warn "SoC PWM is Pi 5-only in this stack; use a PCA9685 over I2C for PWM on this board."
-                fi
-            fi
-            ih_warn "Never put a trailing # comment on those lines; the parser folds it in."
-            ih_warn "Then reboot and run this script again."
-            ;;
-        other)
-            ih_warn "This is not a Raspberry Pi, so boot config was not inspected."
-            ih_warn "Enable the interfaces you need however this board does it, then re-run."
-            ;;
+        pi5)   ih_pass "board        ${model_text} (RP1 present)" ;;
+        pi)    ih_pass "board        ${model_text} (no RP1: SoC PWM unavailable in this stack; a PCA9685 over I2C works)" ;;
+        *)     ih_warn "board        ${model_text:-unknown} — not a Raspberry Pi" ;;
     esac
 
-    # --check-only is a read-only inspection: there is nothing to proceed to,
-    # so asking would stall a non-interactive run at a question with no
-    # consequence. Report the inventory and let ih_main's --check-only exit
-    # handle the rest.
-    if (( IH_CHECK_ONLY )); then
-        return 0
+    # /dev/i2c-1 specifically, not a glob over /dev/i2c-*: the Pi's HDMI DDC
+    # buses are i2c-13/14 and are present with i2c_arm off. One MODE1 read at
+    # 0x40 if i2c-tools is here; 0x70 (ALLCALL) is never addressed.
+    if [[ -e "${IH_ROOT}/dev/i2c-1" ]]; then
+        local pca
+        if command -v i2cget >/dev/null 2>&1; then
+            if i2cget -y 1 0x40 0x00 >/dev/null 2>&1; then
+                pca="PCA9685 at 0x40: answering"
+            else
+                pca="PCA9685 at 0x40: not answering"
+            fi
+        else
+            pca="PCA9685 not probed (i2c-tools not installed)"
+        fi
+        ih_pass "I2C          bus 1 present; ${pca}"
+    else
+        ih_warn "I2C          bus 1 absent"
     fi
 
-    printf '\n'
-    if ! ih_confirm "proceed with only the interfaces above?"; then
-        ih_warn "stopped at your request; nothing has been changed"
-        exit 0
+    # 28-* is a DS18B20. 00-* entries are what a floating bus enumerates when
+    # nothing (or nothing pulled up) is on it — reported as such, so "probes:
+    # 0" on a bus that is clearly searching is not mistaken for a dead bus.
+    local w1="${IH_ROOT}/sys/bus/w1/devices"
+    if [[ -d "$w1" ]]; then
+        local probes phantoms
+        probes="$(find "$w1" -maxdepth 1 -name '28-*' 2>/dev/null | wc -l | tr -d ' ')"
+        phantoms="$(find "$w1" -maxdepth 1 -name '00-*' 2>/dev/null | wc -l | tr -d ' ')"
+        if (( probes > 0 )); then
+            ih_pass "1-Wire       bus present; DS18B20 probes: ${probes}"
+        elif (( phantoms > 0 )); then
+            ih_pass "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering — no probe, or no pull-up)"
+        else
+            ih_pass "1-Wire       bus present; DS18B20 probes: 0"
+        fi
+    else
+        ih_warn "1-Wire       no bus"
+    fi
+
+    # A pwmchip in sysfs says nothing about the header: the standing trap
+    # (CLAUDE.md, verified host facts) is a chip that exports while every pin
+    # reads `none`. pinctrl is the evidence, the same one hardware-io uses.
+    if compgen -G "${IH_ROOT}/sys/class/pwm/pwmchip*" >/dev/null 2>&1; then
+        if command -v pinctrl >/dev/null 2>&1; then
+            local muxed
+            muxed="$(pinctrl get 12,13,18,19 2>/dev/null | grep -c 'PWM')"
+            [[ "$muxed" =~ ^[0-9]+$ ]] || muxed=0
+            if (( muxed > 0 )); then
+                ih_pass "SoC PWM      pwmchip present; ${muxed} of 4 header pins muxed to PWM"
+            else
+                ih_warn "SoC PWM      pwmchip present but no header pin is muxed to PWM (optional; docs/host-setup.md §9)"
+            fi
+        else
+            ih_pass "SoC PWM      pwmchip present; pin mux not verified (pinctrl not installed)"
+        fi
+    else
+        ih_warn "SoC PWM      no pwmchip (optional; RP1 PWM needs the overlay in docs/host-setup.md §9)"
     fi
     return 0
 }
@@ -806,39 +857,36 @@ ih_phase4_configure() {
         return 1
     fi
 
-    # The images come from the registry; the compose file, the migrations and
-    # the contracts come from this checkout. BELLASREEF_TAG is the only thing
-    # holding those two halves to the same commit, and `latest` does not hold
-    # them at all — it resolves to whatever CI pushed most recently, so a hub
-    # ends up running migrations from one commit against images built from
-    # another. The tag is this checkout's commit: the same thing CI publishes
-    # and the same thing deploy-pi.sh pins to.
-    if ! command -v git >/dev/null 2>&1; then
-        ih_fail "git is not installed; the image tag is this checkout's commit and cannot be derived without it"
+    # The images come from the registry; compose and the scripts come from
+    # this checkout. What holds them to the same build is the release
+    # manifest the release workflow wrote beside compose.yaml — this
+    # checkout's own git commit is a bellasreef-hub commit and says nothing
+    # about which images exist.
+    if [[ ! -r "$IH_RELEASE_ENV" ]]; then
+        ih_fail "no deploy/release.env; this checkout is not a released hub"
+        printf '      Clone the hub repo instead: https://github.com/viperdavethesnake/bellasreef-hub\n'
         return 1
     fi
-    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
-        ih_fail "this checkout has uncommitted changes; no image is published for what is on disk"
+    local version tag
+    version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" | head -1)"
+    tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" | head -1)"
+    if [[ -z "$version" || ! "$tag" =~ ^[0-9a-f]{40}$ ]]; then
+        ih_fail "deploy/release.env is malformed (version='${version}', tag='${tag}'); it is written by the release workflow, not by hand"
         return 1
     fi
-    # Unknown is not the same as wrong. A clone with no remote, or one that has
-    # never fetched, cannot answer whether this commit was ever published — so
-    # it is recorded as unverified rather than guessed either way.
-    if ! git -C "$REPO_DIR" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
-        ih_unverified "origin/main is unknown here; cannot confirm images were published for this commit"
-        return 1
+    # An edited hub checkout is not a release. Checked only when there is
+    # git metadata to check against: the release tarball has none, and that
+    # is a limit on what can be verified, not evidence of edits.
+    if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
+            ih_fail "this checkout has uncommitted changes; an edited hub checkout is not a release"
+            return 1
+        fi
+    else
+        ih_warn "not a git checkout; cannot confirm these files are unmodified"
     fi
-    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD origin/main; then
-        ih_fail "HEAD is not on origin/main; CI publishes images only for commits that landed there"
-        return 1
-    fi
-    local commit
-    commit="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
-    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
-        ih_fail "could not read this checkout's commit; the image tag would be a guess"
-        return 1
-    fi
-    ih_pass "image tag ${commit:0:12} (this checkout's commit)"
+    ih_pass "image tag ${version} (${tag:0:12})"
+    local commit="$tag"
 
     # Checked, not assumed. /dev/urandom missing, a busybox tr without -dc, a
     # locale that makes the class match nothing: each of those yields a short
@@ -854,7 +902,7 @@ ih_phase4_configure() {
     ih_pass "generated a Postgres password (32 chars, not shown)"
 
     if (( IH_DRY_RUN )); then
-        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${commit:0:12} BELLASREEF_BACKUP_DIR=${HOME}/backups"
+        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${version} BELLASREEF_BACKUP_DIR=${HOME}/backups"
         return 0
     fi
 
@@ -944,6 +992,7 @@ ih_phase5_deploy() {
     if (( IH_DRY_RUN )); then
         ih_would "docker compose pull"
         ih_would "docker compose run --rm api alembic upgrade head"
+        ih_would "create the backup and /etc/bellasreef directories"
         ih_would "install and enable bellasreef.service"
         ih_would "docker compose up -d"
         return 0
@@ -964,11 +1013,16 @@ ih_phase5_deploy() {
             printf '      using a token with the read:packages scope, then re-run.\n'
         else
             ih_fail "docker compose pull failed"
-            # The tag is this checkout's commit, so the other likely answer is
-            # that the images for it do not exist yet. "manifest unknown" names
-            # a tag that is perfectly correct and simply not published.
-            printf '      The image for this commit may not be published yet (CI still\n'
-            printf '      running?) — check out a commit on origin/main whose CI has finished.\n'
+            # The tag came from deploy/release.env, not this checkout's git
+            # history — the release workflow publishes
+            # ghcr.io/viperdavethesnake/bellasreef-<svc>:<sha> when it retags,
+            # so "manifest unknown" means that release's images are not on the
+            # registry, not that this commit's CI is still running.
+            local version tag
+            version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" | head -1)"
+            tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" | head -1)"
+            printf '      Release %s (%s) has no images on the registry.\n' "$version" "${tag:0:12}"
+            printf '      Re-clone bellasreef-hub at a released tag, or check the release workflow run for this version.\n'
             printf '%s\n' "$pull_output" | sed 's/^/      /'
         fi
         return 1
@@ -988,6 +1042,28 @@ ih_phase5_deploy() {
         return 1
     fi
     ih_pass "migrations applied"
+
+    # The two host paths compose.yaml bind-mounts into api. Docker would
+    # auto-create a missing one as root:root, and the container runs as
+    # 1000 — so `bellasreef backup` would fail on the day it was needed.
+    # Created here owned by the image uid; an existing directory is left
+    # exactly as found. `${IH_ROOT}` prefixes the host path; the value in
+    # .env stays the bare path the container sees on a real machine.
+    local backup_dir etc_dir d
+    backup_dir="$(sed -n 's/^BELLASREEF_BACKUP_DIR=//p' "$IH_ENVFILE" | head -1)"
+    etc_dir="$(sed -n 's/^BELLASREEF_ETC_DIR=//p' "$IH_ENVFILE" | head -1)"
+    if [[ -z "$backup_dir" || -z "$etc_dir" ]]; then
+        ih_fail "deploy/.env has no BELLASREEF_BACKUP_DIR / BELLASREEF_ETC_DIR; cannot create the bind-mount directories"
+        return 1
+    fi
+    for d in "$backup_dir" "$etc_dir"; do
+        if [[ -d "${IH_ROOT}${d}" ]]; then
+            ih_pass "directory ${d} exists; left as is"
+        else
+            ih_run "creating ${d} (owned by the container uid 1000)" \
+                sudo install -d -m 0755 -o 1000 -g 1000 "${IH_ROOT}${d}" || return 1
+        fi
+    done
 
     # Rendered for this host, not copied. The checked-in unit is written for
     # the reference Pi — User=david, WorkingDirectory=/home/david/bellasreef,
@@ -1228,7 +1304,38 @@ ih_phase6_verify() {
         esac
     fi
 
+    ih_phase6_handoff
+
     (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))
+}
+
+# The two things the setup code does not say: what to do next, and which
+# machine this transcript is about.
+ih_phase6_handoff() {
+    local etc_dir version tag
+    etc_dir="$(sed -n 's/^BELLASREEF_ETC_DIR=//p' "$IH_ENVFILE" | head -1)"
+    etc_dir="${etc_dir:-/etc/bellasreef}"
+    printf '\n'
+    ih_step "Next: tell the hub what is attached"
+    printf '      A fresh hub has no devices, so nothing to read and nothing to show.\n'
+    printf '      Copy deploy/config/devices.yaml.example to %s/devices.import.yaml,\n' "$etc_dir"
+    printf '      edit it for your hardware, then with a token from pairing:\n'
+    printf '        docker compose -f %s --env-file %s \\\n' "$IH_COMPOSE" "${IH_ENVFILE#"$IH_ROOT"}"
+    printf '          exec api bellasreef devices import /etc/bellasreef/devices.import.yaml\n'
+
+    version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
+    tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
+    printf '\n'
+    ih_step "This hub"
+    local model="${IH_ROOT}/proc/device-tree/model" board="unknown"
+    [[ -r "$model" ]] && board="$(tr -d '\0' < "$model")"
+    printf '      hostname   %s\n' "$(command -v hostname >/dev/null 2>&1 && hostname 2>/dev/null || echo unknown)"
+    printf '      board      %s\n' "$board"
+    printf '      memory     %s MB\n' "$(awk '/^Mem/ {print int($2/1024); exit}' <(free -k 2>/dev/null) 2>/dev/null)"
+    printf '      free disk  %s GB\n' "$(df -k --output=avail "${IH_ROOT}/" 2>/dev/null | tail -1 | awk '{print int($1/1000/1000)}')"
+    printf '      addresses  %s\n' "$(hostname -I 2>/dev/null | sed 's/ *$//')"
+    printf '      release    %s (%s)\n' "${version:-unknown}" "${tag:0:12}"
+    printf '      checkout   %s\n' "$REPO_DIR"
 }
 
 # The three counts a gate reports, printed the same way wherever a gate fires.

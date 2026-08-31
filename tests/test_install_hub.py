@@ -81,6 +81,9 @@ HIDDEN_FROM_PATH = frozenset(
         # present" into "pins muxed" — and its absence has to be testable on a
         # machine that has it.
         "pinctrl",
+        # Phase 3's PCA9685 probe. Hidden so a bench machine with i2c-tools
+        # does not answer for a fixture that never had a bus.
+        "i2cget",
         # Phase 6's boot-unit checks. systemd-analyze absent means the check
         # is skipped, which is what the script must do on a host without it;
         # a runner's own systemd-analyze answering here would make that path
@@ -91,6 +94,8 @@ HIDDEN_FROM_PATH = frozenset(
         # the real `id` says yes and on a laptop it says no, which would make
         # the offered remediation a property of the machine running the suite.
         "id",
+        # Phase 6's identity block. The runner's own hostname is not the hub's.
+        "hostname",
         # Phase 2's avahi remedy names this machine's own interfaces, read
         # from `ip -br link`. A runner's real `ip` would make the suggested
         # allow-interfaces line a property of the machine running the suite.
@@ -163,6 +168,7 @@ def script_env(
     environ["IH_ROOT"] = str(root)
     environ["PATH"] = f"{stubs}{os.pathsep}{farm}" if stubs is not None else str(farm)
     environ["IH_TEST_REAL_BIN"] = str(farm)
+    environ["IH_RELEASE_ENV"] = str(default_release_env())
     if extra:
         environ.update(extra)
     return environ
@@ -225,6 +231,17 @@ def test_unknown_flag_fails_loudly(tmp_path: Path) -> None:
     assert "--wat" in result.stderr
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Strip SGR color codes so a status-line assertion can match the label
+    and its message as one run, the way a person reading the terminal would
+    — ih_pass/ih_would wrap only the label word in color, so the reset code
+    sits directly after it and breaks a literal "PASS  " substring check."""
+    return _ANSI_RE.sub("", text)
+
+
 def write_stub(stubs: Path, name: str, body: str) -> None:
     """Create a stub executable on the fake PATH."""
     stubs.mkdir(parents=True, exist_ok=True)
@@ -241,6 +258,20 @@ def write_good_avahi_fixture(root: Path) -> None:
     (root / "etc/avahi/services/bellasreef.service").write_text(
         "<service-group><name>bellasreef</name></service-group>\n"
     )
+
+
+def write_good_docker_daemon_fixture(root: Path) -> None:
+    """Populate an $IH_ROOT fixture with a daemon.json that already sets log
+    rotation, so ih_check_docker_logging's phase-2 offer never fires.
+
+    A test reaching phase 4/5/6 has nothing to do with docker log rotation,
+    and the offer's sudo calls (write, then `systemctl restart docker`) are
+    exactly the kind of incidental mutation the phase-5/6 fixture helpers
+    below (write_phase5_stubs et al.) exist to keep out of an unrelated
+    test's way — this is the same idea applied to phase 2's own offer.
+    """
+    (root / "etc/docker").mkdir(parents=True, exist_ok=True)
+    (root / "etc/docker/daemon.json").write_text(DAEMON_JSON)
 
 
 def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
@@ -303,16 +334,45 @@ GOOD_GETENT = (
     'case "$2" in i2c) echo "i2c:x:988:david" ;; gpio) echo "gpio:x:986:david" ;; *) exit 2 ;; esac'
 )
 
-# What git answers for a clean checkout sitting on a published commit. Phase 4
-# asks three questions before it will pin an image tag: is the tree dirty, is
-# HEAD an ancestor of origin/main, and what is HEAD.
+# What git answers for a clean checkout that still carries its .git metadata.
+# Phase 4 asks two questions now that the tag comes from deploy/release.env
+# rather than from git: does git metadata exist at all (rev-parse
+# --is-inside-work-tree), and is the tree dirty (status) — checked only when
+# that metadata is there to check.
 FAKE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+FAKE_VERSION = "v0.2.0-rc.2"
+
+
+def write_release_env(path: Path, version: str = FAKE_VERSION, tag: str = FAKE_COMMIT) -> Path:
+    """A deploy/release.env as the release workflow writes it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"BELLASREEF_VERSION={version}\nBELLASREEF_TAG={tag}\nBELLASREEF_CONTRACTS=4.2.0\n"
+    )
+    return path
+
+
+_default_release_env: Path | None = None
+
+
+def default_release_env() -> Path:
+    """The manifest every run sees unless a test says otherwise. The dev repo
+    has no deploy/release.env — the release workflow writes it — so the
+    script is pointed at one through the IH_RELEASE_ENV seam."""
+    global _default_release_env
+    if _default_release_env is None:
+        _default_release_env = write_release_env(
+            Path(tempfile.mkdtemp(prefix="ih-release-")) / "release.env"
+        )
+    return _default_release_env
+
+
 GOOD_GIT = "\n".join(
     [
         'case "$3" in',
         "    status) exit 0 ;;",
         f'    rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
-        "    merge-base) exit 0 ;;",
         "    *) exit 1 ;;",
         "esac",
     ]
@@ -384,6 +444,9 @@ FULL_STUBS = {
     "ip": IP_BR_LINK,
     # Not in the docker group — the ordinary case before an install.
     "id": ID_NOT_IN_DOCKER_GROUP,
+    "hostname": (
+        'case "${1:-}" in -I) echo "192.168.33.105 172.17.0.1 " ;; *) echo coco-test ;; esac'
+    ),
 }
 
 
@@ -403,7 +466,7 @@ def make_stubs(tmp_path: Path, overrides: dict[str, str] | None = None) -> Path:
 # every marker is absent — a regression that lets a mutating command through
 # leaves evidence instead of silently curling and running a real installer,
 # editing group membership, or touching a real avahi config.
-_MUTATION_GUARD_COMMANDS = ("sh", "curl", "usermod", "apt-get", "cp")
+_MUTATION_GUARD_COMMANDS = ("sh", "curl", "usermod", "apt-get", "cp", "install")
 
 
 def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
@@ -425,7 +488,8 @@ def write_mutation_guard_stubs(stubs: Path, tmp_path: Path) -> dict[str, Path]:
     write_stub(
         stubs,
         "systemctl",
-        f'case "$1" in enable|reload) touch "{systemctl_marker}"; exit 0 ;; *) exit 1 ;; esac',
+        f'case "$1" in enable|reload|restart) touch "{systemctl_marker}"; exit 0 ;;'
+        " *) exit 1 ;; esac",
     )
     markers["systemctl"] = systemctl_marker
     return markers
@@ -447,6 +511,7 @@ def systemctl_stub(marker: Path, log: Path | None = None) -> str:
             'case "$1" in',
             f"    daemon-reload) {record}exit 0 ;;",
             f'    enable) {record}touch "{marker}"; exit 0 ;;',
+            f"    restart) {record}exit 0 ;;",
             f'    is-enabled) if [[ -f "{marker}" ]]; then echo enabled; exit 0; fi;'
             " echo disabled; exit 1 ;;",
             "    *) exit 1 ;;",
@@ -465,9 +530,12 @@ def install_stub(log: Path | None = None) -> str:
     check. The real `install` is hidden from PATH (it writes to /etc), so this
     is the only thing that ever runs.
     """
-    record = f'echo install-unit >> "{log}"\n' if log is not None else ""
+    record_unit = f'echo install-unit >> "{log}"\n' if log is not None else ""
+    record_dir = f'echo install-dir >> "{log}"; ' if log is not None else ""
     return (
-        record + 'src="${@: -2:1}"; dst="${@: -1}"\n'
+        f'if [[ "$1" == "-d" ]]; then {record_dir}mkdir -p "${{@: -1}}"; exit 0; fi\n'
+        + record_unit
+        + 'src="${@: -2:1}"; dst="${@: -1}"\n'
         # `install` takes either a file or a directory as its destination.
         'if [[ "$dst" == */ || -d "$dst" ]]; then dst="${dst%/}/$(basename "$src")"; fi\n'
         'mkdir -p "$(dirname "$dst")" || exit 1\n'
@@ -717,6 +785,159 @@ def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None
     assert result.returncode != 0
 
 
+STOCK_AVAHI_CONF = "[server]\n#host-name=foo\n#allow-interfaces=eth0\n\n[wide-area]\n"
+
+
+def test_phase2_offers_to_set_avahi_allow_interfaces(tmp_path: Path) -> None:
+    # A stock image ships the line commented out, so every clean install
+    # used to stop here with a paste-this-yourself message for a value the
+    # script had already computed. The list is an exclusion of Docker's
+    # bridges, not a choice of the live NIC — a down interface in it is inert.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", install_stub())
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "set avahi allow-interfaces=end0,wlan0? [y/N] y (--yes)" in result.stdout, result.stdout
+    text = conf.read_text()
+    assert text.startswith("[server]\nallow-interfaces=end0,wlan0\n#host-name=foo\n"), text
+    assert "#allow-interfaces=eth0" in text, "the stock commented line must be left alone"
+    assert "PASS  avahi allow-interfaces is set" in strip_ansi(result.stdout), result.stdout
+
+
+def test_phase2_declining_allow_interfaces_leaves_the_printed_remedy(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script(root=root, stubs=stubs, env={"IH_ASSUME_NO_TTY": "1"})
+    assert result.returncode == 1
+    assert conf.read_text() == STOCK_AVAHI_CONF
+    assert "Add to /etc/avahi/avahi-daemon.conf, under [server]:" in result.stdout
+
+
+def test_phase2_never_touches_an_existing_allow_interfaces_line(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    before = conf.read_text()
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    assert "set avahi allow-interfaces" not in result.stdout
+    assert conf.read_text() == before
+
+
+def test_phase2_no_allow_interfaces_offer_without_a_server_section(tmp_path: Path) -> None:
+    # Nothing to insert after. Inventing a [server] header in someone's
+    # config is not this script's call; the printed remedy stands.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text("# empty\n")
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "set avahi allow-interfaces" not in result.stdout, result.stdout
+    assert conf.read_text() == "# empty\n"
+
+
+def test_phase2_allow_interfaces_dry_run_writes_nothing(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    (root / "etc/avahi/services").mkdir(parents=True)
+    conf = root / "etc/avahi/avahi-daemon.conf"
+    conf.write_text(STOCK_AVAHI_CONF)
+    (root / "etc/avahi/services/bellasreef.service").write_text("<service-group/>")
+
+    result = run_script("--dry-run", "--yes", root=root, stubs=stubs)
+    assert "would  setting avahi allow-interfaces=end0,wlan0" in strip_ansi(result.stdout), (
+        result.stdout
+    )
+    assert conf.read_text() == STOCK_AVAHI_CONF
+    assert not markers["install"].exists()
+    assert not markers["systemctl"].exists()
+
+
+DAEMON_JSON = (
+    '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+)
+
+
+def test_phase2_offers_docker_log_rotation_when_daemon_json_is_absent(tmp_path: Path) -> None:
+    # Docker's default json-file driver never rotates, and compose.yaml
+    # deliberately carries no per-service logging: block. Six always-on
+    # services fill a disk eventually, silently. hub-prereqs documented this
+    # as a hand step; the installer does it.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    write_stub(stubs, "install", install_stub())
+    write_stub(
+        stubs,
+        "systemctl",
+        'case "$1" in restart|reload|enable|daemon-reload) exit 0 ;; *) exit 1 ;; esac',
+    )
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    stdout = strip_ansi(result.stdout)
+    assert "configure docker log rotation (json-file, 10m x 3)? [y/N] y (--yes)" in stdout, stdout
+    assert (root / "etc/docker/daemon.json").read_text() == DAEMON_JSON
+    assert "PASS  docker log rotation configured" in stdout, stdout
+
+
+def test_phase2_reports_but_never_rewrites_an_existing_daemon_json(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "etc/docker").mkdir(parents=True)
+    (root / "etc/docker/daemon.json").write_text('{"data-root": "/mnt/docker"}\n')
+
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "none")}
+    )
+    stdout = strip_ansi(result.stdout)
+    assert "configure docker log rotation" not in stdout, stdout
+    assert "WARN  /etc/docker/daemon.json exists but sets no log rotation" in stdout, stdout
+    assert (root / "etc/docker/daemon.json").read_text() == '{"data-root": "/mnt/docker"}\n'
+
+
+def test_phase2_declined_log_rotation_is_a_warn_not_a_gate(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", "exit 1")
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+
+    result = run_script("--check-only", root=root, stubs=stubs)
+    stdout = strip_ansi(result.stdout)
+    assert "WARN  no /etc/docker/daemon.json" in stdout, stdout
+    assert result.returncode == 0, "a missing daemon.json must not fail the run"
+
+
 def test_dry_run_reports_actions_without_running_them(tmp_path: Path) -> None:
     # No avahi fixture, so avahi is broken too: both the docker branch and
     # the avahi branch have something to offer, exercising every mutating
@@ -956,6 +1177,11 @@ def test_unverified_clock_does_not_trigger_remediation(tmp_path: Path) -> None:
     markers = write_mutation_guard_stubs(stubs, tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    # Otherwise phase 2's own docker-log-rotation offer (docker is present
+    # and reachable here) fires under --yes and its `systemctl restart
+    # docker` trips this test's systemctl marker for a reason that has
+    # nothing to do with the clock.
+    write_good_docker_daemon_fixture(root)
     result = run_script("--yes", root=root, stubs=stubs)
     assert "UNVERIFIED" in result.stdout
     assert result.returncode != 0
@@ -1182,20 +1408,6 @@ def test_phase3_reports_interfaces_without_blocking(tmp_path: Path) -> None:
     assert result.returncode == 0, "a missing interface must not fail the run"
 
 
-def test_phase3_says_which_interfaces_are_absent(tmp_path: Path) -> None:
-    stubs = make_stubs(tmp_path)
-    root = tmp_path / "root"
-    write_good_avahi_fixture(root)
-    # A Pi 5, so the config.txt guidance (specific dtparam/dtoverlay lines) is
-    # expected rather than the "not a Raspberry Pi" branch.
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
-    result = run_script("--check-only", root=root, stubs=stubs)
-    assert "not enabled" in result.stdout.lower()
-    assert "dtparam=i2c_arm=on" in result.stdout
-    assert result.returncode == 0
-
-
 def full_root(tmp_path: Path) -> Path:
     """A fixture root that clears every phase-1/2/3 gate cleanly, so a test
     using it reaches phase 4.
@@ -1210,6 +1422,7 @@ def full_root(tmp_path: Path) -> Path:
     """
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_good_docker_daemon_fixture(root)
     (root / "dev").mkdir(parents=True, exist_ok=True)
     (root / "dev/i2c-1").write_text("")
     (root / "sys/bus/w1/devices").mkdir(parents=True)
@@ -1316,7 +1529,17 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     root = full_root(tmp_path)
     envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
-    sentinel = "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
+    # Phase 5 now reads BELLASREEF_BACKUP_DIR/BELLASREEF_ETC_DIR out of this
+    # same file to create the bind-mount directories, and this test's whole
+    # point is that phase 4 leaves an existing file untouched rather than
+    # regenerating it — so the sentinel has to carry both keys itself, or a
+    # run through the stubbed-inert phases 5/6 fails on a guard this test
+    # isn't about.
+    sentinel = (
+        "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
+        "BELLASREEF_BACKUP_DIR=/home/tester/backups\n"
+        "BELLASREEF_ETC_DIR=/etc/bellasreef\n"
+    )
     envfile.write_text(sentinel)
 
     real_envfile = HUB_ROOT / "deploy" / ".env"
@@ -1402,24 +1625,22 @@ def test_phase4_writes_the_two_directory_keys(tmp_path: Path) -> None:
     assert "BELLASREEF_ETC_DIR=/etc/bellasreef" in text, text
 
 
-def test_phase4_pins_the_image_tag_to_the_checkouts_commit(tmp_path: Path) -> None:
-    # BELLASREEF_TAG=latest meant the images came from whatever CI last pushed
-    # while the compose file, the migrations and the contracts came from this
-    # clone. The two drift apart silently, and the symptom is migrations from
-    # one commit running against images built from another. The tag is the
-    # checkout's own commit — the same thing CI publishes and deploy-pi.sh
-    # pins to.
+def test_phase4_reads_the_tag_from_release_env(tmp_path: Path) -> None:
+    # The hub checkout is bellasreef-hub, not the dev repo: its commit says
+    # nothing about which images were built. The release workflow writes the
+    # image SHA into deploy/release.env and that is the only source.
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = HUB_ROOT / "deploy" / ".env"
-    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+    manifest = write_release_env(tmp_path / "release.env", version="v0.3.0", tag="f" * 40)
 
-    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={**FAST_POLL, "IH_RELEASE_ENV": str(manifest)}
+    )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"BELLASREEF_TAG={FAKE_COMMIT}" in envfile.read_text(), envfile.read_text()
-    assert "BELLASREEF_TAG=latest" not in envfile.read_text()
+    assert "image tag v0.3.0 (ffffffffffff)" in result.stdout, result.stdout
+    assert f"BELLASREEF_TAG={'f' * 40}" in envfile.read_text()
 
 
 def test_phase4_refuses_a_dirty_checkout(tmp_path: Path) -> None:
@@ -1445,67 +1666,47 @@ def test_phase4_refuses_a_dirty_checkout(tmp_path: Path) -> None:
     assert not envfile.exists(), "a dirty checkout still wrote deploy/.env"
 
 
-def test_phase4_refuses_a_commit_that_never_landed_on_main(tmp_path: Path) -> None:
-    # CI publishes images for commits on main. A checkout on a branch (or on a
-    # commit that was rebased away) has no image, and the pull fails several
-    # phases later with a manifest error that names none of this.
-    stubs = make_stubs(
-        tmp_path,
-        {
-            "getent": GOOD_GETENT,
-            "git": GOOD_GIT.replace("merge-base) exit 0 ;;", "merge-base) exit 1 ;;"),
-        },
-    )
-    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
-    root = full_root(tmp_path)
-    envfile = staged_env_path(root)
-
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "origin/main" in result.stdout, result.stdout
-    assert not envfile.exists()
-
-
-def test_phase4_is_unverified_when_origin_main_is_unknown(tmp_path: Path) -> None:
-    # A clone with no remote, or one that has never fetched, cannot answer
-    # whether this commit was published. That is not evidence that it was —
-    # and a check that could not run is not a check that passed.
-    stubs = make_stubs(
-        tmp_path,
-        {
-            "getent": GOOD_GETENT,
-            "git": GOOD_GIT.replace(
-                f'rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
-                'rev-parse) if [[ "$4" == "--verify" ]]; then exit 1; fi;'
-                f' echo "{FAKE_COMMIT}"; exit 0 ;;',
-            ),
-        },
-    )
-    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
-    root = full_root(tmp_path)
-    envfile = staged_env_path(root)
-
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "UNVERIFIED" in result.stdout, result.stdout
-    assert "origin/main" in result.stdout
-    assert not envfile.exists()
-
-
-def test_phase4_fails_without_git(tmp_path: Path) -> None:
-    # The tag is derived from the checkout, so without git there is nothing to
-    # derive it from. Falling back to :latest is exactly the drift this change
-    # removes, so the honest answer is to stop.
+def test_phase4_stops_without_a_release_manifest(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
-    (stubs / "git").unlink()
     write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
 
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "git is not installed" in result.stdout, result.stdout
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "absent")}
+    )
+    assert result.returncode != 0
+    assert "not a released hub" in result.stdout, result.stdout
+    assert "bellasreef-hub" in result.stdout
     assert not envfile.exists()
+
+
+def test_phase4_rejects_a_malformed_release_tag(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
+    write_stub(stubs, "sudo", "exit 1")
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    manifest = write_release_env(tmp_path / "release.env", tag="latest")
+
+    result = run_script("--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(manifest)})
+    assert result.returncode != 0
+    assert "malformed" in result.stdout, result.stdout
+    assert not envfile.exists()
+
+
+def test_phase4_warns_without_git_metadata_and_continues(tmp_path: Path) -> None:
+    # The release tarball has no .git. That is not a dirty checkout; it is a
+    # checkout whose cleanliness cannot be checked, and the run says so.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    (stubs / "git").unlink()
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not a git checkout" in result.stdout, result.stdout
+    assert envfile.exists()
 
 
 def test_phase4_rejects_an_env_missing_a_substituted_key(tmp_path: Path) -> None:
@@ -1646,8 +1847,7 @@ def test_phase3_ignores_the_hdmi_i2c_buses(tmp_path: Path) -> None:
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "I2C          not enabled" in result.stdout, result.stdout
-    assert "dtparam=i2c_arm=on" in result.stdout
+    assert "I2C          bus 1 absent" in result.stdout, result.stdout
 
 
 def test_phase3_reports_the_pin_mux_when_pinctrl_is_available(tmp_path: Path) -> None:
@@ -1679,50 +1879,121 @@ def test_phase3_says_the_pin_mux_is_unverified_without_pinctrl(tmp_path: Path) -
     stubs = make_stubs(tmp_path)
     root = full_root(tmp_path)
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "pin mux not verified" in result.stdout, result.stdout
+    assert "pin mux not verified (pinctrl not installed)" in result.stdout, result.stdout
     assert result.returncode == 0, "an unverified pin mux must not fail a non-blocking phase"
 
 
 def test_phase3_flags_pwm_chips_with_no_muxed_pins(tmp_path: Path) -> None:
-    # The trap in full: sysfs says four channels, pinctrl says no header pin
-    # carries any of them. That is the overlay problem, and the config.txt
-    # guidance is exactly what fixes it.
+    # The trap in full: sysfs says a chip, pinctrl says no header pin carries
+    # any of its channels. That is the overlay problem, and the custom
+    # overlay procedure is documented, not reprinted here.
     stubs = make_stubs(tmp_path)
     write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
     root = full_root(tmp_path)
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.0\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "no header pin" in result.stdout, result.stdout
-    assert "dtoverlay=pwm-4chan" in result.stdout
+    assert "no header pin is muxed to PWM" in result.stdout, result.stdout
+    assert "docs/host-setup.md" in result.stdout, result.stdout
 
 
-def test_phase3_never_advises_pwm4chan_on_a_non_pi5(tmp_path: Path) -> None:
-    # pwm-4chan is OUR overlay, compiled on the Pi 5 with dtc (host-setup §9).
-    # It is not in the stock overlay set and names RP1 hardware a BCM2837 does
-    # not have — and hardware-io's discover_pwm() is hard-pinned to the RP1
-    # device anyway, so SoC PWM on an older Pi is unusable by the stack no
-    # matter what overlay is loaded. A 3B+ owner must be pointed at the
-    # PCA9685-over-I2C path, not at an overlay that does not exist. The
-    # 1-Wire advice above it already branches per board; this is its twin.
-    stubs = make_stubs(tmp_path)
-    write_stub(stubs, "pinctrl", "echo '12: no    pd | lo // GPIO12 = none'\nexit 0")
-    root = full_root(tmp_path)
-    (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
-    result = run_script("--check-only", root=root, stubs=stubs)
-    assert "dtoverlay=pwm-4chan" not in result.stdout, result.stdout
-    assert "PCA9685" in result.stdout, "the operator needs the path that works, not just a gap"
-
-
-def test_phase3_skips_boot_config_on_a_non_pi(tmp_path: Path) -> None:
+def test_phase3_reports_the_board(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
     (root / "proc/device-tree").mkdir(parents=True)
-    (root / "proc/device-tree/model").write_text("Some Other Board\x00")
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
-    assert "not a raspberry pi" in result.stdout.lower()
+    assert "board        Raspberry Pi 5 Model B Rev 1.1 (RP1 present)" in result.stdout, (
+        result.stdout
+    )
+    assert result.returncode == 0
+
+
+def test_phase3_reports_an_older_pi_without_rp1(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert (
+        "board        Raspberry Pi 3 Model B Plus Rev 1.3 "
+        "(no RP1: SoC PWM unavailable in this stack; a PCA9685 over I2C works)" in out
+    ), out
+    assert result.returncode == 0
+    assert result.stderr == "", result.stderr
+
+
+def test_phase3_reports_a_non_pi_board_quietly(tmp_path: Path) -> None:
+    # No /proc/device-tree/model at all (an x86 box, a VM). The line says
+    # so and nothing else leaks — a stray "No such file or directory" on
+    # stderr here is the bug this test pins.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "board        unknown — not a Raspberry Pi" in out, out
+    assert result.returncode == 0
+    assert result.stderr == "", result.stderr
+
+
+def test_phase3_probes_for_a_pca9685_when_i2c_tools_exist(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    log = tmp_path / "i2cget.log"
+    write_stub(stubs, "i2cget", f'echo "$*" >> "{log}"; echo 0x11; exit 0')
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-1").write_text("")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "I2C          bus 1 present; PCA9685 at 0x40: answering" in result.stdout, result.stdout
+    # One MODE1 read at 0x40. 0x70 is the chip's all-call address and is
+    # never addressed (CLAUDE.md, verified host facts).
+    assert log.read_text().strip() == "-y 1 0x40 0x00"
+
+
+def test_phase3_says_not_probed_without_i2c_tools(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "dev").mkdir(parents=True)
+    (root / "dev/i2c-1").write_text("")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "PCA9685 not probed (i2c-tools not installed)" in result.stdout, result.stdout
+
+
+def test_phase3_counts_ds18b20_probes_and_names_a_floating_bus(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    devices = root / "sys/bus/w1/devices"
+    for name in ("w1_bus_master1", "00-100000000000", "00-600000000000"):
+        (devices / name).mkdir(parents=True)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert (
+        "1-Wire       bus present; DS18B20 probes: 0 (bus up, nothing answering" in result.stdout
+    ), result.stdout
+
+    (devices / "28-000000bfe244").mkdir()
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "1-Wire       bus present; DS18B20 probes: 1" in result.stdout, result.stdout
+
+
+def test_phase3_never_prescribes_boot_config_and_never_prompts(tmp_path: Path) -> None:
+    # Nothing hardware-side is required to deploy the stack (ruled
+    # 2026-08-30). No config.txt paste, no "reboot and re-run", no
+    # "proceed with only these?" — a hub with no PWM and no probes is a
+    # valid hub that happens to have nothing attached yet.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "proc/device-tree").mkdir(parents=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
+    result = run_script("--check-only", root=root, stubs=stubs)
+    for forbidden in ("dtoverlay=", "dtparam=", "reboot", "proceed with only"):
+        assert forbidden not in result.stdout, (forbidden, result.stdout)
+    assert result.returncode == 0
 
 
 # install-hub calls compose as `docker compose -f <file> --env-file <file>
@@ -1813,6 +2084,69 @@ def phase5_root(tmp_path: Path) -> Path:
     return root
 
 
+def test_phase5_creates_the_bind_mount_directories_owned_by_the_image_uid(tmp_path: Path) -> None:
+    # compose.yaml bind-mounts both; a missing host path is auto-created by
+    # Docker as root:root, and the api container (uid 1000) then cannot write
+    # a backup. The installer creates them owned by the container uid, which
+    # makes the operating user's own uid irrelevant.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / "home/tester/backups").is_dir()
+    assert (root / "etc/bellasreef").is_dir()
+    assert "creating /home/tester/backups (owned by the container uid 1000)" in strip_ansi(
+        result.stdout
+    ), result.stdout
+
+
+def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+    (root / "home/tester/backups").mkdir(parents=True)
+    (root / "etc/bellasreef").mkdir(parents=True)
+
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "install-dir" not in log.read_text()
+    assert "directory /home/tester/backups exists; left as is" in strip_ansi(result.stdout), (
+        result.stdout
+    )
+
+
+def test_phase5_fails_before_creating_anything_when_a_directory_key_is_missing(
+    tmp_path: Path,
+) -> None:
+    # A deploy/.env from before the two directory keys existed. The guard
+    # has to stop the run before `install -d` runs at all — a half-created,
+    # root-owned pair of directories is the state the keys exist to prevent.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+    envfile = staged_env_path(root)
+    envfile.write_text(
+        "POSTGRES_USER=bellasreef\nPOSTGRES_DB=bellasreef\nPOSTGRES_PASSWORD=x\n"
+        "BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:x@postgres:5432/bellasreef\n"
+        f"NATS_URL=nats://nats:4222\nBELLASREEF_TAG={FAKE_COMMIT}\nVM_RETENTION=24\n"
+        "I2C_GID=988\nGPIO_GID=986\n"
+    )
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BELLASREEF_BACKUP_DIR" in result.stdout, result.stdout
+    assert "install-dir" not in (log.read_text() if log.exists() else "")
+    assert not (root / "etc/bellasreef").exists()
+
+
 def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
     # The images are private today, so a pull with no credentials is the most
     # likely way a first install stops. A bare "pull failed" leaves the
@@ -1880,11 +2214,11 @@ def test_a_failed_deploy_does_not_wedge_the_next_run(tmp_path: Path) -> None:
 
 
 def test_phase5_names_an_unpublished_commit_on_a_pull_failure(tmp_path: Path) -> None:
-    # Now that the tag is the checkout's commit, the likeliest pull failure
-    # after credentials is a commit whose CI has not finished (or never ran):
-    # the registry answers "manifest unknown" for a tag that is perfectly
-    # correct and simply not there yet. That is not guessable from the raw
-    # error, so name it.
+    # The tag comes from deploy/release.env, not this checkout's commit, so
+    # the likeliest pull failure after credentials is a release whose images
+    # never made it to the registry: the registry answers "manifest unknown"
+    # for a tag that is perfectly correct and simply not there. That is not
+    # guessable from the raw error, so name the release.
     stubs = make_stubs(
         tmp_path,
         {
@@ -1899,7 +2233,8 @@ def test_phase5_names_an_unpublished_commit_on_a_pull_failure(tmp_path: Path) ->
     combined = result.stdout + result.stderr
     assert "5. deploy" in result.stdout, combined
     assert result.returncode != 0
-    assert "may not be published yet" in combined, combined
+    assert f"Release {FAKE_VERSION}" in combined, combined
+    assert "has no images on the registry" in combined, combined
     assert "manifest unknown" in combined, "docker's own words were swallowed"
 
 
@@ -1986,6 +2321,8 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
     assert log.read_text().split() == [
         "pull",
         "migrate",
+        "install-dir",
+        "install-dir",
         "install-unit",
         "systemctl",
         "daemon-reload",
@@ -2075,6 +2412,33 @@ def phase6_stubs(
     markers = write_phase6_stubs(stubs, tmp_path, setup_mode=setup_mode, avahi_ok=avahi_ok)
     markers["exec"] = exec_log
     return stubs, markers
+
+
+def test_phase6_hands_off_the_device_import_step(tmp_path: Path) -> None:
+    # A fresh registry has no devices, so no telemetry, so nothing for the
+    # app to show. The import is the next thing an owner does and the old
+    # hand-off never mentioned it (install-hub-3bplus-readiness, 2026-08-17).
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "/etc/bellasreef/devices.import.yaml" in result.stdout, result.stdout
+    assert "bellasreef devices import /etc/bellasreef/devices.import.yaml" in result.stdout
+    assert "deploy/config/devices.yaml.example" in result.stdout
+
+
+def test_phase6_prints_the_hub_identity(tmp_path: Path) -> None:
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    (root / "proc/device-tree").mkdir(parents=True, exist_ok=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "hostname   coco-test" in out, out
+    assert "board      Raspberry Pi 5 Model B Rev 1.1" in out, out
+    assert "addresses  192.168.33.105 172.17.0.1" in out, out
+    assert f"release    {FAKE_VERSION} ({FAKE_COMMIT[:12]})" in out, out
 
 
 def test_phase6_verifies_a_healthy_hub_and_hands_off(tmp_path: Path) -> None:
