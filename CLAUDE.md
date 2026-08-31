@@ -746,9 +746,13 @@ pull-up is too weak for tank-length probe cables.
 
 Observed on the dev Pi only. On coco-bellasreef (2026-08-30, same kernel
 string) the plain `w1-gpio,gpiopin=4` brought up `w1_bus_master1` on RP1
-GPIO4 (dmesg `gpio-573 (onewire@4)`); whether a probe reads through it is
-unmeasured. Ruled: the installer reports what the kernel exposes and never
-prescribes an overlay name; probes are optional.
+GPIO4 (dmesg `gpio-573 (onewire@4)`); measured 2026-08-31 with the dev
+probe (`28-000000bfe244`) moved to coco: 3/3 reads `crc=YES`,
+25.125–25.187 °C — the plain overlay reads, not just enumerates, on this
+board. The bus also listed a phantom `00-400000000000` (kernel w1 artifact
+of a garbled search; family `28-*` filtering handles it). Ruled: the
+installer reports what the kernel exposes and never prescribes an overlay
+name; probes are optional.
 
 ## Boot configuration
 

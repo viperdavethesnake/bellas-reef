@@ -116,6 +116,20 @@ def write_good_docker_daemon_fixture(root: Path) -> None:
     (root / "etc/docker/daemon.json").write_text(DAEMON_JSON)
 
 
+def write_manifest_host_paths(root: Path) -> None:
+    """Every host path hub/deploy/compose.yaml hard-requires: the `devices:`
+    nodes and the /sys bind-mount sources. Docker cannot create a missing
+    /dev node or a missing source under /sys, so any absence is a guaranteed
+    phase-5 wall — which is why phase 2 proves them all up front."""
+    (root / "dev").mkdir(parents=True, exist_ok=True)
+    for node in ("i2c-1", "gpiochip0", "gpiomem0", "gpiomem1", "gpiomem2", "gpiomem3", "gpiomem4"):
+        (root / "dev" / node).write_text("")
+    (root / "sys/bus/w1/devices").mkdir(parents=True, exist_ok=True)
+    (root / "sys/devices/w1_bus_master1").mkdir(parents=True, exist_ok=True)
+    (root / "sys/devices/platform/axi/1000120000.pcie").mkdir(parents=True, exist_ok=True)
+    (root / "sys/class/pwm/pwmchip0").mkdir(parents=True, exist_ok=True)
+
+
 def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
     # Phase 1 finding nothing means ih_main falls through into phase 2, so a
     # clean-machine fixture here needs phase 2 to also see a good machine —
@@ -124,6 +138,7 @@ def test_phase1_clean_machine_continues(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "no existing deployment found" in result.stdout
     assert result.returncode == 0, result.stdout + result.stderr
@@ -158,6 +173,7 @@ def test_phase1_warns_but_continues_when_deploy_env_exists(tmp_path: Path) -> No
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     # REPO_DIR (as the script computes it) is this repo's absolute path, so
     # under a fixture root the script reads ${root}${REPO_DIR}/deploy/.env.
     # Derive that nested path instead of hardcoding it.
@@ -191,10 +207,25 @@ GOOD_GIT = "\n".join(
     ]
 )
 
-# What `ip -br link` prints. Columns are name, operstate, address, flags; a
-# veth carries an @ifN suffix on the name, which is why the script strips it.
+# What `ip -br link` and `ip -br addr` print. Link columns are name,
+# operstate, address, flags; a veth carries an @ifN suffix on the name, which
+# is why the script strips it. addr columns are name, operstate, then the
+# addresses — IPv4 with a /len suffix, IPv6 alongside — and the fixture keeps
+# both docker bridges addressed because the labeled "This hub" block exists
+# to separate them from the LAN address, not to hide them.
 IP_BR_LINK = "\n".join(
     [
+        'if [[ "$1" == "-br" && "$2" == "addr" ]]; then',
+        "cat <<'EOF'",
+        "lo               UNKNOWN        127.0.0.1/8 ::1/128",
+        "end0             UP             192.168.33.105/24 fe80::aabb:ccff:fedd:ee01/64",
+        "wlan0            DOWN           ",
+        "docker0          UP             172.17.0.1/16",
+        "veth9f21c3a@if7  UP             fe80::411:22ff:fe33:4455/64",
+        "br-1a2b3c4d5e6f  UP             172.18.0.1/16",
+        "EOF",
+        "exit 0",
+        "fi",
         "cat <<'EOF'",
         "lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>",
         "end0             UP             aa:bb:cc:dd:ee:01 <BROADCAST,MULTICAST,UP,LOWER_UP>",
@@ -427,9 +458,56 @@ def test_phase2_passes_on_a_good_machine(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "FAIL" not in result.stdout, result.stdout
     assert result.returncode == 0
+
+
+def test_phase2_fails_when_a_manifest_device_node_is_missing(tmp_path: Path) -> None:
+    # Ruled 2026-08-31: a host path the compose manifest hard-requires is a
+    # phase-2 FAIL, not a phase-5 docker error. Found on coco when weighing
+    # dtparam=i2c_arm=off — docker refuses to create a container whose
+    # devices: entry names a node the host does not have.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
+    (root / "dev/i2c-1").unlink()
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "FAIL" in out, out
+    assert "/dev/i2c-1" in out, out
+    assert "config.txt" in out, "the remedy must point at the boot config:\n" + out
+    assert result.returncode != 0
+
+
+def test_phase2_fails_when_a_sys_bind_source_is_missing(tmp_path: Path) -> None:
+    # Same rule, other half: compose bind-mounts /sys/devices/w1_bus_master1,
+    # and a missing source under /sys is uncreatable (the exact failure class
+    # the PWM mount comment in compose.yaml records). A Pi with no 1-Wire
+    # overlay must hear that in phase 2.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
+    (root / "sys/devices/w1_bus_master1").rmdir()
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "FAIL" in out, out
+    assert "/sys/devices/w1_bus_master1" in out, out
+    assert result.returncode != 0
+
+
+def test_phase2_reports_manifest_host_paths_as_one_pass_line(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "PASS" in out
+    assert "compose" in out.lower() and "host path" in out.lower(), out
 
 
 def test_phase2_fails_when_docker_is_absent(tmp_path: Path) -> None:
@@ -744,6 +822,7 @@ def test_phase2_declined_log_rotation_is_a_warn_not_a_gate(tmp_path: Path) -> No
     write_stub(stubs, "sudo", "exit 1")
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
 
     result = run_script("--check-only", root=root, stubs=stubs)
     stdout = strip_ansi(result.stdout)
@@ -1212,9 +1291,7 @@ def test_phase3_reports_interfaces_without_blocking(tmp_path: Path) -> None:
     # test is about phase 3, and a phase-2 avahi FAIL would trip ih_main's
     # failure gate and exit before phase 3 ever runs.
     write_good_avahi_fixture(root)
-    (root / "dev").mkdir(parents=True)
-    (root / "dev/i2c-1").write_text("")
-    (root / "sys/bus/w1/devices").mkdir(parents=True)
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "I2C" in result.stdout
     assert "1-Wire" in result.stdout
@@ -1236,10 +1313,7 @@ def full_root(tmp_path: Path) -> Path:
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
     write_good_docker_daemon_fixture(root)
-    (root / "dev").mkdir(parents=True, exist_ok=True)
-    (root / "dev/i2c-1").write_text("")
-    (root / "sys/bus/w1/devices").mkdir(parents=True)
-    (root / "sys/class/pwm/pwmchip0").mkdir(parents=True)
+    write_manifest_host_paths(root)
     return root
 
 
@@ -1654,7 +1728,11 @@ def test_phase3_ignores_the_hdmi_i2c_buses(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
-    (root / "dev").mkdir(parents=True)
+    write_manifest_host_paths(root)
+    # No bus 1 — that is the point here. Phase 2's host-path gate rightly
+    # FAILs on it now, but --check-only still reaches the phase-3 inventory,
+    # which is what this test asserts on.
+    (root / "dev/i2c-1").unlink()
     (root / "dev/i2c-13").write_text("")
     (root / "dev/i2c-14").write_text("")
     (root / "proc/device-tree").mkdir(parents=True)
@@ -1712,6 +1790,7 @@ def test_phase3_reports_the_board(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
@@ -1725,6 +1804,7 @@ def test_phase3_reports_an_older_pi_without_rp1(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 3 Model B Plus Rev 1.3\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
@@ -1744,6 +1824,7 @@ def test_phase3_reports_a_non_pi_board_quietly(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     out = strip_ansi(result.stdout)
     assert "board        unknown — not a Raspberry Pi" in out, out
@@ -1757,8 +1838,7 @@ def test_phase3_probes_for_a_pca9685_when_i2c_tools_exist(tmp_path: Path) -> Non
     write_stub(stubs, "i2cget", f'echo "$*" >> "{log}"; echo 0x11; exit 0')
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
-    (root / "dev").mkdir(parents=True)
-    (root / "dev/i2c-1").write_text("")
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "I2C          bus 1 present; PCA9685 at 0x40: answering" in result.stdout, result.stdout
     # One MODE1 read at 0x40. 0x70 is the chip's all-call address and is
@@ -1770,8 +1850,7 @@ def test_phase3_says_not_probed_without_i2c_tools(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
-    (root / "dev").mkdir(parents=True)
-    (root / "dev/i2c-1").write_text("")
+    write_manifest_host_paths(root)
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "PCA9685 not probed (i2c-tools not installed)" in result.stdout, result.stdout
 
@@ -1780,6 +1859,7 @@ def test_phase3_counts_ds18b20_probes_and_names_a_floating_bus(tmp_path: Path) -
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     devices = root / "sys/bus/w1/devices"
     for name in ("w1_bus_master1", "00-100000000000", "00-600000000000"):
         (devices / name).mkdir(parents=True)
@@ -1801,6 +1881,7 @@ def test_phase3_never_prescribes_boot_config_and_never_prompts(tmp_path: Path) -
     stubs = make_stubs(tmp_path)
     root = tmp_path / "root"
     write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
     (root / "proc/device-tree").mkdir(parents=True)
     (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
     result = run_script("--check-only", root=root, stubs=stubs)
@@ -2207,6 +2288,20 @@ def phase6_stubs(
     evidence) and the compose `exec` that mints the setup code.
     """
     exec_log = tmp_path / "compose-exec.log"
+    # The exec stub prints what `bellasreef setup-code` REALLY prints — a
+    # labeled line plus its own instruction — not a bare code. The bare-code
+    # stub was exactly how the doubled "Setup code:  Setup code:" label
+    # escaped this suite and reached coco's maiden install (2026-08-31): the
+    # installer wrapped an already-labeled message in a second label, and the
+    # fixture couldn't see it.
+    setup_code_output = (
+        f'echo "Setup code: {setup_code}"; '
+        'echo "Open the Bella'
+        "'"
+        's Reef app on this network and enter this code when asked."'
+        if setup_code
+        else ":"
+    )
     stubs = make_stubs(
         tmp_path,
         {
@@ -2217,7 +2312,7 @@ def phase6_stubs(
                 up="exit 0",
                 config=compose_services_stub(),
                 ps=f'echo "{running_ps_lines() if ps_line is None else ps_line}"; exit 0',
-                **{"exec": f'echo "$*" >> "{exec_log}"; echo "{setup_code}"; exit 0'},
+                **{"exec": f'echo "$*" >> "{exec_log}"; {setup_code_output}; exit 0'},
             ),
         },
     )
@@ -2227,18 +2322,53 @@ def phase6_stubs(
     return stubs, markers
 
 
-def test_phase6_hands_off_the_device_import_step(tmp_path: Path) -> None:
-    # A fresh registry has no devices, so no telemetry, so nothing for the
-    # app to show. The import is the next thing an owner does and the old
-    # hand-off never mentioned it (install-hub-3bplus-readiness, 2026-08-17).
+def test_phase6_hands_off_app_adoption_not_the_import_command(tmp_path: Path) -> None:
+    # A fresh registry has no devices, and the next thing an owner does is
+    # adopt hardware FROM THE APP (System -> Hardware) — proven on coco's
+    # maiden install, 2026-08-31: probe adopted in three taps, no YAML, no
+    # token. `devices import` is the bulk/restore path ("explicitly not the
+    # product mechanism", its own docstring says) and the old hand-off
+    # prescribed it as if it were mandatory — David: "this section is messy
+    # and confusing." The rewrite points at the app and leaves the import as
+    # a one-line pointer into the docs.
     stubs, _ = phase6_stubs(tmp_path)
     root = phase5_root(tmp_path)
     result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "/etc/bellasreef/devices.import.yaml" in result.stdout, result.stdout
-    assert "bellasreef devices import /etc/bellasreef/devices.import.yaml" in result.stdout
-    assert "deploy/config/devices.yaml.example" in result.stdout
-    assert "--token <access token>" in result.stdout, result.stdout
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    assert "adopt" in out.lower(), out
+    assert "System" in out and "Hardware" in out, out
+    assert "host-setup.md" in out, "the bulk-import pointer must survive:\n" + out
+    assert "--token <access token>" not in out, "the import command is docs material now:\n" + out
+
+
+def test_phase6_prints_the_setup_code_exactly_once(tmp_path: Path) -> None:
+    # The CLI's output is already labeled and already carries its own
+    # instruction; the installer prints it verbatim (indented) rather than
+    # wrapping it in a second label and a second, differently-worded
+    # instruction. Coco's maiden install printed
+    # "Setup code:  Setup code: 6F3D-W42P" plus both instructions.
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    assert out.count("Setup code:") == 1, out
+    assert "enter this code when asked" in out, out
+    assert "pick this hub, and enter it" not in out, "the duplicate instruction is back:\n" + out
+
+
+def test_phase6_labels_lan_and_internal_addresses(tmp_path: Path) -> None:
+    # Ruled 2026-08-31: don't hide the docker bridge addresses — label them.
+    # The maiden install printed all three in one undifferentiated run and
+    # the LAN address is the only one the app can reach.
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    assert "192.168.33.105 (LAN)" in out, out
+    assert "172.17.0.1 172.18.0.1 (internal" in out, out
 
 
 def test_phase6_prints_the_hub_identity(tmp_path: Path) -> None:
@@ -2251,7 +2381,7 @@ def test_phase6_prints_the_hub_identity(tmp_path: Path) -> None:
     out = result.stdout
     assert "hostname   coco-test" in out, out
     assert "board      Raspberry Pi 5 Model B Rev 1.1" in out, out
-    assert "addresses  192.168.33.105 172.17.0.1" in out, out
+    assert "addresses  192.168.33.105 (LAN)" in out, out
     assert f"release    {FAKE_VERSION} ({FAKE_COMMIT[:12]})" in out, out
 
 
