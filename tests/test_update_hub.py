@@ -314,3 +314,21 @@ def test_checkout_on_target_and_deployed_is_a_true_no_op(tmp_path: Path) -> None
     assert result.returncode == 0, result.stdout + result.stderr
     assert "already" in strip_ansi(result.stdout).lower()
     assert not logs["docker"].exists(), "a truly deployed no-op ran docker anyway"
+
+
+def test_prerelease_bootstrap_deploys_too(tmp_path: Path) -> None:
+    # Same bootstrap as above but with a pre-release tag — coco's literal
+    # case (rc checkout by hand, then this script). The downgrade guard must
+    # not read "current == target" as "current is newer": sort -V of two
+    # identical strings returns the string, and calling that a downgrade
+    # refused the deploy.
+    root = hub_fixture(tmp_path)
+    stubs = tmp_path / "bin"
+    logs = write_update_stubs(stubs, tmp_path, current="v0.2.0-rc.9")
+    write_release_env(tmp_path / "release.env", version="v0.2.0-rc.9", tag=NEW_SHA)
+    result = run_update(
+        "--pre", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "release.env")}
+    )
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    assert "pull" in logs["docker"].read_text(), out

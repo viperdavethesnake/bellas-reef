@@ -130,7 +130,7 @@ if [[ -z "$STAGE2" ]]; then
     # this project explicitly plans as an "update to something older". Bases
     # compare by version sort; on an equal base, the tag without a
     # pre-release suffix is the newer one.
-    if [[ -z "$PIN_REF" && -n "$current" ]]; then
+    if [[ -z "$PIN_REF" && -n "$current" && "$current" != "$target" ]]; then
         current_base="${current%%-*}"
         target_base="${target%%-*}"
         current_is_newer=0
