@@ -163,6 +163,7 @@ def script_env(
     environ["IH_ROOT"] = str(root)
     environ["PATH"] = f"{stubs}{os.pathsep}{farm}" if stubs is not None else str(farm)
     environ["IH_TEST_REAL_BIN"] = str(farm)
+    environ["IH_RELEASE_ENV"] = str(default_release_env())
     if extra:
         environ.update(extra)
     return environ
@@ -307,6 +308,34 @@ GOOD_GETENT = (
 # asks three questions before it will pin an image tag: is the tree dirty, is
 # HEAD an ancestor of origin/main, and what is HEAD.
 FAKE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+FAKE_VERSION = "v0.2.0-rc.2"
+
+
+def write_release_env(path: Path, version: str = FAKE_VERSION, tag: str = FAKE_COMMIT) -> Path:
+    """A deploy/release.env as the release workflow writes it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"BELLASREEF_VERSION={version}\nBELLASREEF_TAG={tag}\nBELLASREEF_CONTRACTS=4.2.0\n"
+    )
+    return path
+
+
+_default_release_env: Path | None = None
+
+
+def default_release_env() -> Path:
+    """The manifest every run sees unless a test says otherwise. The dev repo
+    has no deploy/release.env — the release workflow writes it — so the
+    script is pointed at one through the IH_RELEASE_ENV seam."""
+    global _default_release_env
+    if _default_release_env is None:
+        _default_release_env = write_release_env(
+            Path(tempfile.mkdtemp(prefix="ih-release-")) / "release.env"
+        )
+    return _default_release_env
+
+
 GOOD_GIT = "\n".join(
     [
         'case "$3" in',
@@ -1402,24 +1431,22 @@ def test_phase4_writes_the_two_directory_keys(tmp_path: Path) -> None:
     assert "BELLASREEF_ETC_DIR=/etc/bellasreef" in text, text
 
 
-def test_phase4_pins_the_image_tag_to_the_checkouts_commit(tmp_path: Path) -> None:
-    # BELLASREEF_TAG=latest meant the images came from whatever CI last pushed
-    # while the compose file, the migrations and the contracts came from this
-    # clone. The two drift apart silently, and the symptom is migrations from
-    # one commit running against images built from another. The tag is the
-    # checkout's own commit — the same thing CI publishes and deploy-pi.sh
-    # pins to.
+def test_phase4_reads_the_tag_from_release_env(tmp_path: Path) -> None:
+    # The hub checkout is bellasreef-hub, not the dev repo: its commit says
+    # nothing about which images were built. The release workflow writes the
+    # image SHA into deploy/release.env and that is the only source.
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = HUB_ROOT / "deploy" / ".env"
-    assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
+    manifest = write_release_env(tmp_path / "release.env", version="v0.3.0", tag="f" * 40)
 
-    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={**FAST_POLL, "IH_RELEASE_ENV": str(manifest)}
+    )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"BELLASREEF_TAG={FAKE_COMMIT}" in envfile.read_text(), envfile.read_text()
-    assert "BELLASREEF_TAG=latest" not in envfile.read_text()
+    assert "image tag v0.3.0 (ffffffffffff)" in result.stdout, result.stdout
+    assert f"BELLASREEF_TAG={'f' * 40}" in envfile.read_text()
 
 
 def test_phase4_refuses_a_dirty_checkout(tmp_path: Path) -> None:
@@ -1445,67 +1472,47 @@ def test_phase4_refuses_a_dirty_checkout(tmp_path: Path) -> None:
     assert not envfile.exists(), "a dirty checkout still wrote deploy/.env"
 
 
-def test_phase4_refuses_a_commit_that_never_landed_on_main(tmp_path: Path) -> None:
-    # CI publishes images for commits on main. A checkout on a branch (or on a
-    # commit that was rebased away) has no image, and the pull fails several
-    # phases later with a manifest error that names none of this.
-    stubs = make_stubs(
-        tmp_path,
-        {
-            "getent": GOOD_GETENT,
-            "git": GOOD_GIT.replace("merge-base) exit 0 ;;", "merge-base) exit 1 ;;"),
-        },
-    )
-    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
-    root = full_root(tmp_path)
-    envfile = staged_env_path(root)
-
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "origin/main" in result.stdout, result.stdout
-    assert not envfile.exists()
-
-
-def test_phase4_is_unverified_when_origin_main_is_unknown(tmp_path: Path) -> None:
-    # A clone with no remote, or one that has never fetched, cannot answer
-    # whether this commit was published. That is not evidence that it was —
-    # and a check that could not run is not a check that passed.
-    stubs = make_stubs(
-        tmp_path,
-        {
-            "getent": GOOD_GETENT,
-            "git": GOOD_GIT.replace(
-                f'rev-parse) echo "{FAKE_COMMIT}"; exit 0 ;;',
-                'rev-parse) if [[ "$4" == "--verify" ]]; then exit 1; fi;'
-                f' echo "{FAKE_COMMIT}"; exit 0 ;;',
-            ),
-        },
-    )
-    write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
-    root = full_root(tmp_path)
-    envfile = staged_env_path(root)
-
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "UNVERIFIED" in result.stdout, result.stdout
-    assert "origin/main" in result.stdout
-    assert not envfile.exists()
-
-
-def test_phase4_fails_without_git(tmp_path: Path) -> None:
-    # The tag is derived from the checkout, so without git there is nothing to
-    # derive it from. Falling back to :latest is exactly the drift this change
-    # removes, so the honest answer is to stop.
+def test_phase4_stops_without_a_release_manifest(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
-    (stubs / "git").unlink()
     write_stub(stubs, "sudo", "exit 1")  # never legitimately reached
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
 
-    result = run_script("--yes", root=root, stubs=stubs)
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "git is not installed" in result.stdout, result.stdout
+    result = run_script(
+        "--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(tmp_path / "absent")}
+    )
+    assert result.returncode != 0
+    assert "not a released hub" in result.stdout, result.stdout
+    assert "bellasreef-hub" in result.stdout
     assert not envfile.exists()
+
+
+def test_phase4_rejects_a_malformed_release_tag(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT})
+    write_stub(stubs, "sudo", "exit 1")
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+    manifest = write_release_env(tmp_path / "release.env", tag="latest")
+
+    result = run_script("--yes", root=root, stubs=stubs, env={"IH_RELEASE_ENV": str(manifest)})
+    assert result.returncode != 0
+    assert "malformed" in result.stdout, result.stdout
+    assert not envfile.exists()
+
+
+def test_phase4_warns_without_git_metadata_and_continues(tmp_path: Path) -> None:
+    # The release tarball has no .git. That is not a dirty checkout; it is a
+    # checkout whose cleanliness cannot be checked, and the run says so.
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    (stubs / "git").unlink()
+    root = full_root(tmp_path)
+    envfile = staged_env_path(root)
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not a git checkout" in result.stdout, result.stdout
+    assert envfile.exists()
 
 
 def test_phase4_rejects_an_env_missing_a_substituted_key(tmp_path: Path) -> None:

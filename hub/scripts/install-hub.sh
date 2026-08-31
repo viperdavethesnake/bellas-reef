@@ -47,7 +47,13 @@ IH_ASSUME_NO_TTY="${IH_ASSUME_NO_TTY:-0}"
 # the four-second version does not. Nobody installing a hub sets it.
 IH_API_DEADLINE_SECS="${IH_API_DEADLINE_SECS:-30}"
 
+# Where the image tag comes from. Written by the release workflow into the
+# hub checkout; the dev repo does not have one. A seam only so the tests can
+# hand the script a manifest without one existing in the tree.
+IH_RELEASE_ENV="${IH_RELEASE_ENV:-}"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+: "${IH_RELEASE_ENV:=${REPO_DIR}/deploy/release.env}"
 
 # ------------------------------------------------------------------ output
 
@@ -806,39 +812,36 @@ ih_phase4_configure() {
         return 1
     fi
 
-    # The images come from the registry; the compose file, the migrations and
-    # the contracts come from this checkout. BELLASREEF_TAG is the only thing
-    # holding those two halves to the same commit, and `latest` does not hold
-    # them at all — it resolves to whatever CI pushed most recently, so a hub
-    # ends up running migrations from one commit against images built from
-    # another. The tag is this checkout's commit: the same thing CI publishes
-    # and the same thing deploy-pi.sh pins to.
-    if ! command -v git >/dev/null 2>&1; then
-        ih_fail "git is not installed; the image tag is this checkout's commit and cannot be derived without it"
+    # The images come from the registry; compose and the scripts come from
+    # this checkout. What holds them to the same build is the release
+    # manifest the release workflow wrote beside compose.yaml — this
+    # checkout's own git commit is a bellasreef-hub commit and says nothing
+    # about which images exist.
+    if [[ ! -r "$IH_RELEASE_ENV" ]]; then
+        ih_fail "no deploy/release.env; this checkout is not a released hub"
+        printf '      Clone the hub repo instead: https://github.com/viperdavethesnake/bellasreef-hub\n'
         return 1
     fi
-    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
-        ih_fail "this checkout has uncommitted changes; no image is published for what is on disk"
+    local version tag
+    version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" | head -1)"
+    tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" | head -1)"
+    if [[ -z "$version" || ! "$tag" =~ ^[0-9a-f]{40}$ ]]; then
+        ih_fail "deploy/release.env is malformed (version='${version}', tag='${tag}'); it is written by the release workflow, not by hand"
         return 1
     fi
-    # Unknown is not the same as wrong. A clone with no remote, or one that has
-    # never fetched, cannot answer whether this commit was ever published — so
-    # it is recorded as unverified rather than guessed either way.
-    if ! git -C "$REPO_DIR" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
-        ih_unverified "origin/main is unknown here; cannot confirm images were published for this commit"
-        return 1
+    # An edited hub checkout is not a release. Checked only when there is
+    # git metadata to check against: the release tarball has none, and that
+    # is a limit on what can be verified, not evidence of edits.
+    if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
+            ih_fail "this checkout has uncommitted changes; an edited hub checkout is not a release"
+            return 1
+        fi
+    else
+        ih_warn "not a git checkout; cannot confirm these files are unmodified"
     fi
-    if ! git -C "$REPO_DIR" merge-base --is-ancestor HEAD origin/main; then
-        ih_fail "HEAD is not on origin/main; CI publishes images only for commits that landed there"
-        return 1
-    fi
-    local commit
-    commit="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
-    if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
-        ih_fail "could not read this checkout's commit; the image tag would be a guess"
-        return 1
-    fi
-    ih_pass "image tag ${commit:0:12} (this checkout's commit)"
+    ih_pass "image tag ${version} (${tag:0:12})"
+    local commit="$tag"
 
     # Checked, not assumed. /dev/urandom missing, a busybox tr without -dc, a
     # locale that makes the class match nothing: each of those yields a short
@@ -854,7 +857,7 @@ ih_phase4_configure() {
     ih_pass "generated a Postgres password (32 chars, not shown)"
 
     if (( IH_DRY_RUN )); then
-        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${commit:0:12} BELLASREEF_BACKUP_DIR=${HOME}/backups"
+        ih_would "write deploy/.env with I2C_GID=${i2c_gid:-<missing>} GPIO_GID=${gpio_gid:-<missing>} BELLASREEF_TAG=${version} BELLASREEF_BACKUP_DIR=${HOME}/backups"
         return 0
     fi
 
