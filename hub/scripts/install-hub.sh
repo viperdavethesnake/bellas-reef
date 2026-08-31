@@ -992,6 +992,7 @@ ih_phase5_deploy() {
     if (( IH_DRY_RUN )); then
         ih_would "docker compose pull"
         ih_would "docker compose run --rm api alembic upgrade head"
+        ih_would "create the backup and /etc/bellasreef directories"
         ih_would "install and enable bellasreef.service"
         ih_would "docker compose up -d"
         return 0
@@ -1041,6 +1042,28 @@ ih_phase5_deploy() {
         return 1
     fi
     ih_pass "migrations applied"
+
+    # The two host paths compose.yaml bind-mounts into api. Docker would
+    # auto-create a missing one as root:root, and the container runs as
+    # 1000 — so `bellasreef backup` would fail on the day it was needed.
+    # Created here owned by the image uid; an existing directory is left
+    # exactly as found. `${IH_ROOT}` prefixes the host path; the value in
+    # .env stays the bare path the container sees on a real machine.
+    local backup_dir etc_dir d
+    backup_dir="$(sed -n 's/^BELLASREEF_BACKUP_DIR=//p' "$IH_ENVFILE" | head -1)"
+    etc_dir="$(sed -n 's/^BELLASREEF_ETC_DIR=//p' "$IH_ENVFILE" | head -1)"
+    if [[ -z "$backup_dir" || -z "$etc_dir" ]]; then
+        ih_fail "deploy/.env has no BELLASREEF_BACKUP_DIR / BELLASREEF_ETC_DIR; cannot create the bind-mount directories"
+        return 1
+    fi
+    for d in "$backup_dir" "$etc_dir"; do
+        if [[ -d "${IH_ROOT}${d}" ]]; then
+            ih_pass "directory ${d} exists; left as is"
+        else
+            ih_run "creating ${d} (owned by the container uid 1000)" \
+                sudo install -d -m 0755 -o 1000 -g 1000 "${IH_ROOT}${d}" || return 1
+        fi
+    done
 
     # Rendered for this host, not copied. The checked-in unit is written for
     # the reference Pi — User=david, WorkingDirectory=/home/david/bellasreef,

@@ -525,9 +525,12 @@ def install_stub(log: Path | None = None) -> str:
     check. The real `install` is hidden from PATH (it writes to /etc), so this
     is the only thing that ever runs.
     """
-    record = f'echo install-unit >> "{log}"\n' if log is not None else ""
+    record_unit = f'echo install-unit >> "{log}"\n' if log is not None else ""
+    record_dir = f'echo install-dir >> "{log}"; ' if log is not None else ""
     return (
-        record + 'src="${@: -2:1}"; dst="${@: -1}"\n'
+        f'if [[ "$1" == "-d" ]]; then {record_dir}mkdir -p "${{@: -1}}"; exit 0; fi\n'
+        + record_unit
+        + 'src="${@: -2:1}"; dst="${@: -1}"\n'
         # `install` takes either a file or a directory as its destination.
         'if [[ "$dst" == */ || -d "$dst" ]]; then dst="${dst%/}/$(basename "$src")"; fi\n'
         'mkdir -p "$(dirname "$dst")" || exit 1\n'
@@ -1521,7 +1524,17 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     root = full_root(tmp_path)
     envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
-    sentinel = "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
+    # Phase 5 now reads BELLASREEF_BACKUP_DIR/BELLASREEF_ETC_DIR out of this
+    # same file to create the bind-mount directories, and this test's whole
+    # point is that phase 4 leaves an existing file untouched rather than
+    # regenerating it — so the sentinel has to carry both keys itself, or a
+    # run through the stubbed-inert phases 5/6 fails on a guard this test
+    # isn't about.
+    sentinel = (
+        "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
+        "BELLASREEF_BACKUP_DIR=/home/tester/backups\n"
+        "BELLASREEF_ETC_DIR=/etc/bellasreef\n"
+    )
     envfile.write_text(sentinel)
 
     real_envfile = HUB_ROOT / "deploy" / ".env"
@@ -2066,6 +2079,43 @@ def phase5_root(tmp_path: Path) -> Path:
     return root
 
 
+def test_phase5_creates_the_bind_mount_directories_owned_by_the_image_uid(tmp_path: Path) -> None:
+    # compose.yaml bind-mounts both; a missing host path is auto-created by
+    # Docker as root:root, and the api container (uid 1000) then cannot write
+    # a backup. The installer creates them owned by the container uid, which
+    # makes the operating user's own uid irrelevant.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / "home/tester/backups").is_dir()
+    assert (root / "etc/bellasreef").is_dir()
+    assert "creating /home/tester/backups (owned by the container uid 1000)" in strip_ansi(
+        result.stdout
+    ), result.stdout
+
+
+def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+    (root / "home/tester/backups").mkdir(parents=True)
+    (root / "etc/bellasreef").mkdir(parents=True)
+
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "install-dir" not in log.read_text()
+    assert "directory /home/tester/backups exists; left as is" in strip_ansi(result.stdout), (
+        result.stdout
+    )
+
+
 def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
     # The images are private today, so a pull with no credentials is the most
     # likely way a first install stops. A bare "pull failed" leaves the
@@ -2240,6 +2290,8 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
     assert log.read_text().split() == [
         "pull",
         "migrate",
+        "install-dir",
+        "install-dir",
         "install-unit",
         "systemctl",
         "daemon-reload",
