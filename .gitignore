@@ -16,6 +16,7 @@ htmlcov/
 *.db
 *.sqlite3
 .env
+# hub/deploy/.env — the per-host secrets install-hub.sh writes
 config.local.*
 
 # OS / editor

@@ -48,7 +48,7 @@ run "ruff format --check" uv run ruff format --check .
 #
 # Not skipped when shellcheck is absent: a check that silently did not run is
 # the same failure conftest.py exists to prevent, one directory over.
-run "shellcheck" shellcheck scripts/*.sh
+run "shellcheck" shellcheck scripts/*.sh hub/scripts/*.sh
 run "mypy --strict"       uv run mypy contracts/python db services
 run "pytest"              uv run pytest
 
@@ -124,7 +124,7 @@ run "openapi spec drift" spec_drift
 # shellcheck disable=SC2329,SC2317
 avahi_contracts() {
     local record declared expected
-    record="deploy/avahi/bellasreef.service"
+    record="hub/deploy/avahi/bellasreef.service"
     declared="$(sed -n 's|.*<txt-record>contracts=\([^<]*\)</txt-record>.*|\1|p' "$record")"
     expected="$(uv run python -c 'from importlib.metadata import version
 print(version("bellasreef-contracts"))')" || return 1

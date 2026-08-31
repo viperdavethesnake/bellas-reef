@@ -1,0 +1,79 @@
+name: Release
+
+# A v* tag on main is a release. Nothing else produces a bellasreef-hub commit.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: retag images · assemble hub · publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A retag, not a rebuild: the release image is bit-for-bit the image
+      # CI published for this commit. A missing <sha> tag is the gate — the
+      # tag was pushed to a commit CI never published (not on main, or red).
+      - name: Retag the CI images for this release
+        run: |
+          set -euo pipefail
+          for svc in hardware-io control-engine api; do
+            img="ghcr.io/viperdavethesnake/bellasreef-${svc}"
+            if ! docker buildx imagetools inspect "${img}:${GITHUB_SHA}" >/dev/null 2>&1; then
+              echo "::error::no image ${img}:${GITHUB_SHA} — this tag is not on a commit CI published"
+              exit 1
+            fi
+            docker buildx imagetools create -t "${img}:${GITHUB_REF_NAME}" "${img}:${GITHUB_SHA}"
+          done
+
+      - name: Assemble the hub payload
+        run: scripts/build-hub-repo.sh "$RUNNER_TEMP/hub" "$GITHUB_REF_NAME" "$GITHUB_SHA"
+
+      # Before the publish step on purpose: the tarball needs only
+      # GITHUB_TOKEN, so a missing HUB_REPO_TOKEN loses one step, not two.
+      - name: Attach the payload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="$RUNNER_TEMP/bellasreef-hub-${GITHUB_REF_NAME}.tar.gz"
+          tar -C "$RUNNER_TEMP" --transform "s,^hub,bellasreef-hub-${GITHUB_REF_NAME}," -czf "$asset" hub
+          pre=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && pre="--prerelease"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" $pre --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes "Images: ghcr.io/viperdavethesnake/bellasreef-{api,control-engine,hardware-io}:${GITHUB_REF_NAME} (built from ${GITHUB_SHA}). Hub payload: bellasreef-hub@${GITHUB_REF_NAME}."
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+
+      - name: Publish to bellasreef-hub
+        env:
+          HUB_REPO_TOKEN: ${{ secrets.HUB_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HUB_REPO_TOKEN}" ]]; then
+            echo "::error::HUB_REPO_TOKEN is not set. Create a fine-grained PAT (repository: bellasreef-hub, Contents: read and write) and add it as an Actions secret on this repo."
+            exit 1
+          fi
+          git clone --quiet "https://x-access-token:${HUB_REPO_TOKEN}@github.com/viperdavethesnake/bellasreef-hub.git" "$RUNNER_TEMP/hub-repo"
+          cd "$RUNNER_TEMP/hub-repo"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R "$RUNNER_TEMP/hub/." .
+          git config user.name "bellas-reef release"
+          git config user.email "release@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "release ${GITHUB_REF_NAME} from bellas-reef@${GITHUB_SHA}"
+          git tag "${GITHUB_REF_NAME}"
+          git push --quiet --atomic origin HEAD:main "${GITHUB_REF_NAME}"

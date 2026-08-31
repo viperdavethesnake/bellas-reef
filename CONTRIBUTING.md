@@ -38,6 +38,12 @@ uv sync
 ./scripts/check.sh            # ruff, ruff format, mypy --strict, pytest, alembic render
 ```
 
+Images are built by CI from `deploy/Dockerfile.*` (multi-arch, pushed to
+ghcr.io on every merge to main). `hub/deploy/compose.yaml` carries no
+`build:` blocks on purpose — a hub pulls, it never builds. For a local image:
+
+    docker build -f deploy/Dockerfile.api -t bellasreef-api:dev .
+
 CI runs exactly `scripts/check.sh`, so a green local gate is a green CI.
 
 Tests that need real hardware are marked `@pytest.mark.hardware` and never run
