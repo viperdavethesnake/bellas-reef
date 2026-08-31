@@ -36,7 +36,9 @@ def docker_stub(
     *,
     info: str = INFO_FRESH,
     psql: str = "0\n0",
+    psql_rc: int = 0,
     alembic: str = "0020 (head)",
+    alembic_rc: int = 0,
     volumes: str = "bellasreef_nats-data\nbellasreef_postgres-data\nbellasreef_vm-data",
     hw_log: str = HW_LOG,
     backup_rc: int = 0,
@@ -50,8 +52,8 @@ case "$1" in
       exec)
         case "$*" in
           *"bellasreef backup"*) exit {backup_rc} ;;
-          *psql*) printf '{psql}\\n'; exit 0 ;;
-          *"alembic current"*) echo "{alembic}"; exit 0 ;;
+          *psql*) printf '{psql}\\n'; exit {psql_rc} ;;
+          *"alembic current"*) echo "{alembic}"; exit {alembic_rc} ;;
           *"setup-code"*) echo "7KF2-9QMD"; exit 0 ;;
         esac ;;
       down|run) exit 0 ;;
@@ -150,3 +152,7 @@ def test_post_reset_assertions_fail_the_run(tmp_path: Path) -> None:
     assert result.returncode == 1 and "not at head" in result.stderr
     result, _ = run(tmp_path, hw_log='{"msg":"stream created"}')
     assert result.returncode == 1 and "1 of 7" in result.stderr
+    result, _ = run(tmp_path, psql_rc=1)
+    assert result.returncode == 1 and "NOT confirmed factory-fresh" in result.stderr
+    result, _ = run(tmp_path, alembic_rc=1)
+    assert result.returncode == 1 and "not confirmed at head" in result.stderr

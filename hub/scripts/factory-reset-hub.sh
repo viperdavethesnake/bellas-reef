@@ -139,7 +139,7 @@ if psql_out="$(compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POS
     [[ "$audit_count" == "0" ]] || die "the reset left ${audit_count:-<unreadable>} audit_log row(s) behind"
     echo "  0 devices, 0 audit_log rows"
 else
-    warn "could not query devices/audit_log counts (${psql_out}); check manually with: docker compose exec -T postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB -c 'SELECT count(*) FROM devices;'"
+    die "could not query devices/audit_log after the redeploy (${psql_out}) — the wipe and redeploy ran, but this hub is NOT confirmed factory-fresh; check manually with: docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres psql -U \$POSTGRES_USER -d \$POSTGRES_DB -c 'SELECT count(*) FROM devices;'"
 fi
 
 step "confirming alembic is at head"
@@ -147,7 +147,7 @@ if alembic_out="$(compose exec -T api sh -c 'cd /app/db && alembic current' 2>&1
     [[ "$alembic_out" == *"(head)"* ]] || die "alembic current reports '${alembic_out}' — not at head after the redeploy"
     echo "  alembic at head"
 else
-    warn "could not check the alembic revision (${alembic_out})"
+    die "could not read the alembic revision after the redeploy (${alembic_out}) — not confirmed at head; check manually with: docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T api sh -c 'cd /app/db && alembic current'"
 fi
 
 # Seven JetStream streams (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY,
