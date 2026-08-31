@@ -35,6 +35,7 @@ called by every builder.
 | `bellasreef.audit.<category>` | audit envelope | **JetStream** `BR_AUDIT` | any |
 | `bellasreef.registry.<id>` | `ActuatorRegistration` | core pub/sub | hardware-io |
 | `bellasreef.chip.<source>.<instance>` | `ChipState` | **JetStream** `BR_CHIP` | hardware-io |
+| `bellasreef.host.status` | `HostStatus` | **JetStream** `BR_HOST` | hardware-io |
 
 `<class>` is the actuator class (`binary`, `pwm`). `<type>` is the sensor type
 token (`temp`, `ph`, …). `<source>` is the hardware source (`pi-pwm`,
@@ -282,6 +283,17 @@ consumer (`GET /api/v1/hardware`) and the iOS Hardware leaf are separate PRs,
 per `docs/superpowers/specs/2026-08-19-chip-state-on-the-wire-design.md`'s
 Order; this bump covers only what ships here — the message, the subject, the
 stream, and the three publishers.
+
+**contracts 4.3.0 adds `HostStatus`, the `bellasreef.host.status` subject,
+and `BR_HOST`** — the hub machine's own vitals (load, memory, SoC
+temperature, uptime), published by hardware-io every 30 s and retained
+last-value, consumed by the API for `GET /api/v1/hub-status` and the iOS
+System tab's Hub status leaf. A new message type and a new subject; nothing
+existing changes, so MINOR under the table above. The subject is a fixed
+singleton — phase 1 is one hub, and a phase-2 spoke identifies itself in the
+envelope's `source`, the subject being an address rather than the datum
+(same reasoning as `<instance>` on `bellasreef.chip.*`). Design:
+`docs/superpowers/specs/2026-08-31-hub-status-design.md`.
 
 ### Pre-release exception (expires at the first tagged release)
 

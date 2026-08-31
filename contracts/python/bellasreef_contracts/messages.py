@@ -48,6 +48,7 @@ __all__ = [
     "DeviceAssignment",
     "DeviceId",
     "Heartbeat",
+    "HostStatus",
     "PwmLevel",
     "SensorAlert",
     "SensorReading",
@@ -257,6 +258,37 @@ class ChipState(_Message):
     #: CapabilityChannel.detail is: they differ per source and no consumer
     #: should switch on them. Keys are stable strings; values scalars.
     facts: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class HostStatus(_Message):
+    """The hub machine's own vitals, right now.
+
+    Published on ``bellasreef.host.status`` every 30 s and retained
+    last-value, like a chip state — a consumer that starts late still gets
+    the most recent snapshot. Snapshot only, deliberately: this is a status
+    page's data, not history (contracts 4.3.0 spec,
+    docs/superpowers/specs/2026-08-31-hub-status-design.md).
+
+    ``/proc`` loadavg/meminfo/uptime are system-wide even inside a
+    container, and ``/sys`` is the host's — measured in
+    bellasreef-hardware-io-1 on coco 2026-08-31, which is what makes
+    hardware-io able to publish this with no new mounts or privileges.
+
+    No hostname field: in-container the hostname is the container's, and
+    clients already get the hub's name from ``/api/v1/info``. A phase-2
+    spoke identifies itself in the envelope's ``source``.
+    """
+
+    load_1m: float = Field(ge=0)
+    load_5m: float = Field(ge=0)
+    load_15m: float = Field(ge=0)
+    cpu_count: int = Field(ge=1)
+    mem_total_kb: int = Field(ge=0)
+    mem_available_kb: int = Field(ge=0)
+    #: SoC temperature in °C. None means unreadable on this host (no thermal
+    #: zone) — a real state, never to be papered over with a fabricated 0.
+    temp_c: float | None = None
+    uptime_s: float = Field(ge=0)
 
 
 class DeviceAssignment(_Message):

@@ -150,21 +150,21 @@ else
     die "could not read the alembic revision after the redeploy (${alembic_out}) — not confirmed at head; check manually with: docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T api sh -c 'cd /app/db && alembic current'"
 fi
 
-# Seven JetStream streams (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY,
-# BR_CHIP, BR_ASSIGNMENT, BR_AUDIT) are provisioned by hardware-io at start;
-# against a wiped nats-data volume every one logs "stream created".
-step "confirming all seven JetStream streams were recreated"
+# Eight JetStream streams (BR_CMD, BR_STATE, BR_REGISTRY, BR_CAPABILITY,
+# BR_CHIP, BR_HOST, BR_ASSIGNMENT, BR_AUDIT) are provisioned by hardware-io at
+# start; against a wiped nats-data volume every one logs "stream created".
+step "confirming all eight JetStream streams were recreated"
 deadline=$(( $(date +%s) + FR_STREAM_DEADLINE_SECS ))
 stream_count=0
 while :; do
     stream_count="$(docker logs bellasreef-hardware-io-1 2>&1 | grep -c '"msg":"stream created"' || true)"
     stream_count="${stream_count:-0}"
-    (( stream_count >= 7 )) && break
+    (( stream_count >= 8 )) && break
     (( $(date +%s) >= deadline )) && break
     sleep "$FR_POLL_SECS"
 done
-(( stream_count >= 7 )) || die "hardware-io logged ${stream_count} of 7 expected 'stream created' lines within ${FR_STREAM_DEADLINE_SECS}s — JetStream provisioning did not complete"
-echo "  all 7 JetStream streams recreated"
+(( stream_count >= 8 )) || die "hardware-io logged ${stream_count} of 8 expected 'stream created' lines within ${FR_STREAM_DEADLINE_SECS}s — JetStream provisioning did not complete"
+echo "  all 8 JetStream streams recreated"
 
 # Watch item (2026-08-30): a hub with no hardware attached may legitimately
 # announce nothing under the inventory-only ruling. Kept strict until coco

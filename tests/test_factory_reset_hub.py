@@ -16,7 +16,7 @@ FAST = {"FR_API_DEADLINE_SECS": "2", "FR_STREAM_DEADLINE_SECS": "2", "FR_POLL_SE
 
 INFO_FRESH = '{"paired_client_count":0,"setup_mode":true}'
 INFO_PAIRED = '{"paired_client_count":1,"setup_mode":false}'
-HW_LOG = "\n".join(['{"msg":"stream created"}'] * 7 + ['{"msg":"capability announced"}'])
+HW_LOG = "\n".join(['{"msg":"stream created"}'] * 8 + ['{"msg":"capability announced"}'])
 
 
 def installed_root(tmp_path: Path) -> Path:
@@ -151,7 +151,7 @@ def test_post_reset_assertions_fail_the_run(tmp_path: Path) -> None:
     result, _ = run(tmp_path, alembic="0019")
     assert result.returncode == 1 and "not at head" in result.stderr
     result, _ = run(tmp_path, hw_log='{"msg":"stream created"}')
-    assert result.returncode == 1 and "1 of 7" in result.stderr
+    assert result.returncode == 1 and "1 of 8" in result.stderr
     result, _ = run(tmp_path, psql_rc=1)
     assert result.returncode == 1 and "NOT confirmed factory-fresh" in result.stderr
     result, _ = run(tmp_path, alembic_rc=1)

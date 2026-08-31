@@ -117,6 +117,16 @@ def chip(source: str, instance: str) -> str:
     return f"{ROOT}.chip.{source}.{instance.replace('.', '-')}"
 
 
+def host_status() -> str:
+    """The hub machine's own vitals, retained last-value.
+
+    A fixed singleton subject: phase 1 is one hub, and a phase-2 spoke
+    carries its identity in the message envelope's ``source`` — the subject
+    is an address, not the datum (same reasoning as :func:`chip`).
+    """
+    return f"{ROOT}.host.status"
+
+
 def assignment(device_id: str) -> str:
     """One device's binding, as the operator declared it.
 
@@ -178,6 +188,7 @@ def parse_device_id(subject: str) -> str:
 ALL_ALERTS: Final = f"{ROOT}.alert.>"
 ALL_CAPABILITIES: Final = f"{ROOT}.capability.>"
 ALL_CHIPS: Final = f"{ROOT}.chip.>"
+ALL_HOSTS: Final = f"{ROOT}.host.>"
 ALL_ASSIGNMENTS: Final = f"{ROOT}.assignment.>"
 ALL_SILENCE: Final = f"{ROOT}.silence.>"
 ALL_SENSORS: Final = f"{ROOT}.sensor.>"
