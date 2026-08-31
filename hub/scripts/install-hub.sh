@@ -1304,7 +1304,38 @@ ih_phase6_verify() {
         esac
     fi
 
+    ih_phase6_handoff
+
     (( ${#IH_FAILURES[@]} == 0 && ${#IH_UNVERIFIED[@]} == 0 ))
+}
+
+# The two things the setup code does not say: what to do next, and which
+# machine this transcript is about.
+ih_phase6_handoff() {
+    local etc_dir version tag
+    etc_dir="$(sed -n 's/^BELLASREEF_ETC_DIR=//p' "$IH_ENVFILE" | head -1)"
+    etc_dir="${etc_dir:-/etc/bellasreef}"
+    printf '\n'
+    ih_step "Next: tell the hub what is attached"
+    printf '      A fresh hub has no devices, so nothing to read and nothing to show.\n'
+    printf '      Copy deploy/config/devices.yaml.example to %s/devices.import.yaml,\n' "$etc_dir"
+    printf '      edit it for your hardware, then with a token from pairing:\n'
+    printf '        docker compose -f %s --env-file %s \\\n' "$IH_COMPOSE" "${IH_ENVFILE#"$IH_ROOT"}"
+    printf '          exec api bellasreef devices import /etc/bellasreef/devices.import.yaml\n'
+
+    version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
+    tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
+    printf '\n'
+    ih_step "This hub"
+    local model="${IH_ROOT}/proc/device-tree/model" board="unknown"
+    [[ -r "$model" ]] && board="$(tr -d '\0' < "$model")"
+    printf '      hostname   %s\n' "$(command -v hostname >/dev/null 2>&1 && hostname 2>/dev/null || echo unknown)"
+    printf '      board      %s\n' "$board"
+    printf '      memory     %s MB\n' "$(awk '/^Mem/ {print int($2/1024); exit}' <(free -k 2>/dev/null) 2>/dev/null)"
+    printf '      free disk  %s GB\n' "$(df -k --output=avail "${IH_ROOT}/" 2>/dev/null | tail -1 | awk '{print int($1/1000/1000)}')"
+    printf '      addresses  %s\n' "$(hostname -I 2>/dev/null | sed 's/ *$//')"
+    printf '      release    %s (%s)\n' "${version:-unknown}" "${tag:0:12}"
+    printf '      checkout   %s\n' "$REPO_DIR"
 }
 
 # The three counts a gate reports, printed the same way wherever a gate fires.

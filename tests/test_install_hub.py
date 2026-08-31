@@ -94,6 +94,8 @@ HIDDEN_FROM_PATH = frozenset(
         # the real `id` says yes and on a laptop it says no, which would make
         # the offered remediation a property of the machine running the suite.
         "id",
+        # Phase 6's identity block. The runner's own hostname is not the hub's.
+        "hostname",
         # Phase 2's avahi remedy names this machine's own interfaces, read
         # from `ip -br link`. A runner's real `ip` would make the suggested
         # allow-interfaces line a property of the machine running the suite.
@@ -442,6 +444,9 @@ FULL_STUBS = {
     "ip": IP_BR_LINK,
     # Not in the docker group — the ordinary case before an install.
     "id": ID_NOT_IN_DOCKER_GROUP,
+    "hostname": (
+        'case "${1:-}" in -I) echo "192.168.33.105 172.17.0.1 " ;; *) echo coco-test ;; esac'
+    ),
 }
 
 
@@ -2116,6 +2121,32 @@ def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
     )
 
 
+def test_phase5_fails_before_creating_anything_when_a_directory_key_is_missing(
+    tmp_path: Path,
+) -> None:
+    # A deploy/.env from before the two directory keys existed. The guard
+    # has to stop the run before `install -d` runs at all — a half-created,
+    # root-owned pair of directories is the state the keys exist to prevent.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    root = phase5_root(tmp_path)
+    envfile = staged_env_path(root)
+    envfile.write_text(
+        "POSTGRES_USER=bellasreef\nPOSTGRES_DB=bellasreef\nPOSTGRES_PASSWORD=x\n"
+        "BELLASREEF_DATABASE_URL=postgresql+asyncpg://bellasreef:x@postgres:5432/bellasreef\n"
+        f"NATS_URL=nats://nats:4222\nBELLASREEF_TAG={FAKE_COMMIT}\nVM_RETENTION=24\n"
+        "I2C_GID=988\nGPIO_GID=986\n"
+    )
+
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BELLASREEF_BACKUP_DIR" in result.stdout, result.stdout
+    assert "install-dir" not in (log.read_text() if log.exists() else "")
+    assert not (root / "etc/bellasreef").exists()
+
+
 def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
     # The images are private today, so a pull with no credentials is the most
     # likely way a first install stops. A bare "pull failed" leaves the
@@ -2381,6 +2412,33 @@ def phase6_stubs(
     markers = write_phase6_stubs(stubs, tmp_path, setup_mode=setup_mode, avahi_ok=avahi_ok)
     markers["exec"] = exec_log
     return stubs, markers
+
+
+def test_phase6_hands_off_the_device_import_step(tmp_path: Path) -> None:
+    # A fresh registry has no devices, so no telemetry, so nothing for the
+    # app to show. The import is the next thing an owner does and the old
+    # hand-off never mentioned it (install-hub-3bplus-readiness, 2026-08-17).
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "/etc/bellasreef/devices.import.yaml" in result.stdout, result.stdout
+    assert "bellasreef devices import /etc/bellasreef/devices.import.yaml" in result.stdout
+    assert "deploy/config/devices.yaml.example" in result.stdout
+
+
+def test_phase6_prints_the_hub_identity(tmp_path: Path) -> None:
+    stubs, _ = phase6_stubs(tmp_path)
+    root = phase5_root(tmp_path)
+    (root / "proc/device-tree").mkdir(parents=True, exist_ok=True)
+    (root / "proc/device-tree/model").write_text("Raspberry Pi 5 Model B Rev 1.1\x00")
+    result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "hostname   coco-test" in out, out
+    assert "board      Raspberry Pi 5 Model B Rev 1.1" in out, out
+    assert "addresses  192.168.33.105 172.17.0.1" in out, out
+    assert f"release    {FAKE_VERSION} ({FAKE_COMMIT[:12]})" in out, out
 
 
 def test_phase6_verifies_a_healthy_hub_and_hands_off(tmp_path: Path) -> None:
