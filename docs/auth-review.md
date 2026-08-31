@@ -209,11 +209,13 @@ device is permanently taken and the only recovery is SQL on the hub.
 `override.released` all land on `bellasreef.audit.auth`. `GET /audit?category=auth`
 returns config and command events mixed with auth events.
 
-**B12 — The deploy gate never touches auth.** `deploy-pi.sh` polls
-VictoriaMetrics for a fresh sensor reading and dies loudly if none arrives,
-which is a genuinely good check. Nothing curls `/api/v1/info`, nothing confirms
-auth events reach `audit_log` on the real hub. Discovery or pairing could be
-broken on the hub right now and the script would report success.
+**B12 — The deploy gate never touches auth.** (`deploy-pi.sh` deleted
+2026-08-30; the on-Pi update path inherits the finding.) `deploy-pi.sh` polled
+VictoriaMetrics for a fresh sensor reading and died loudly if none arrived,
+which is a genuinely good check. Nothing curled `/api/v1/info`, nothing
+confirmed auth events reached `audit_log` on the real hub. Discovery or
+pairing could be broken on the hub right now and the script would report
+success.
 
 **B13 — `bellasreef pair` is untested and undocumented.** The string appears in
 three places repo-wide, all narrative. Not in README, host-setup, or CLAUDE.md.

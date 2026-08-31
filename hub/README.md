@@ -76,6 +76,7 @@ Then, with a token from pairing, run the import command the installer
 printed at the end of setup:
 
 ```bash
+cd ~/bellasreef
 docker compose -f deploy/compose.yaml --env-file deploy/.env \
   exec api bellasreef devices import /etc/bellasreef/devices.import.yaml
 ```

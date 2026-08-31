@@ -56,7 +56,7 @@ gpiodetect | grep rp1       # expect gpiochip0 [pinctrl-rp1] (54 lines)
 
 ## 1b. `deploy/.env` — the second host-state file
 
-Alongside the dtoverlays above, `/home/david/bellasreef/deploy/.env` is host
+Alongside the dtoverlays above, `~/bellasreef/deploy/.env` is host
 state, not repo state: it is gitignored (`deploy/.env.example` is the
 template committed instead) and holds the values `bellasreef.service`
 interpolates into `deploy/compose.yaml` — `POSTGRES_USER`,
@@ -69,8 +69,9 @@ hardware-io included, in one `docker compose up`, and compose interpolates
 the whole file up front — a missing variable anywhere in it fails that `up`
 before any service, hardware-accessing or not, gets a chance to start.
 
-Never committed, and never reset by `deploy-pi.sh` — a git reset touches the
-repo clone, not this file. Verify it exists and is current after any change
+Never committed, and never reset by the hub scripts: `install-hub.sh` leaves
+an existing `deploy/.env` untouched, and `update-hub.sh`'s `git checkout` to a
+new tag does not touch a gitignored file. Verify it exists and is current after any change
 to Postgres credentials, retention, or the host's `i2c`/`gpio` group GIDs
 (`getent group i2c gpio`).
 
@@ -79,8 +80,9 @@ to Postgres credentials, retention, or the host's `i2c`/`gpio` group GIDs
 Containers-only means the app images (`hardware-io`, `control-engine`, `api`)
 are pulled, not built, on the Pi — and ghcr.io packages under this repo are
 private, so pulling them needs a credential the Pi has to hold on its own.
-Without it, `docker compose pull` fails and `deploy-pi.sh` refuses before it
-touches anything running.
+Without it, `docker compose pull` fails, and `install-hub.sh` (or
+`update-hub.sh`) catches the auth failure and stops before it touches
+anything running.
 
 ```bash
 docker login ghcr.io -u <github-username>
@@ -91,16 +93,16 @@ docker login ghcr.io -u <github-username>
 
 The credential lands in `~/.docker/config.json` (mode `0600` by `docker
 login` itself) and is host state, not repo state — never committed, never
-reset by a `deploy-pi.sh` run, and not recreated by a factory wipe. Verify it
+reset by the hub scripts, and not recreated by a factory wipe. Verify it
 survived a wipe or a fresh clone with:
 
 ```bash
 grep -q '"ghcr.io"' ~/.docker/config.json && echo present
 ```
 
-`deploy-pi.sh` checks for this entry before pulling and fails loudly with the
-login command above if it is missing, rather than letting a bare `docker
-compose pull` fail with an opaque auth error partway through a deploy.
+`install-hub.sh` and `update-hub.sh` catch a pull refused for this reason and
+print the login command above, rather than letting a bare `docker compose
+pull` fail with an opaque auth error partway through a deploy.
 
 ## 2. Headless stripping
 
@@ -304,11 +306,13 @@ this unit and never `restart`s it — restarting it would `up -d --wait` the
 whole stack including the spine's data services, which is the durable-
 contention risk the environment-boundary rule in CLAUDE.md exists to prevent.
 
-Deploy with `scripts/deploy-pi.sh`, which refuses a dirty or unpushed tree,
-resets `/home/david/bellasreef` to the pushed commit, pulls the three app
-images by digest-verified SHA tag, migrates, recreates
-hardware-io/control-engine/api, and then waits for a fresh sample to reach
-VictoriaMetrics before reporting success.
+Deploy with `scripts/install-hub.sh`, run on the hub from the `bellasreef-hub`
+clone: it pulls the three app images at the commit-sha tag recorded in
+`deploy/release.env`, migrates, brings the stack up, and waits for a fresh
+sample to reach VictoriaMetrics before reporting success. `scripts/update-hub.sh`
+is meant to move an already-installed hub to a newer release the same way; it
+is not implemented yet (see `../README.md`), so an update today is a fresh
+`install-hub.sh` run from the new release, or the manual steps below.
 
 ### Service configuration: `deploy/.env` + compose, not a directory per service
 
@@ -329,8 +333,8 @@ the `api` service's `environment:` block in compose.yaml, not per-host.
 `BELLASREEF_NATS_URL` is the entry that bites. Leave it unset on hardware-io
 and it reads the probe, serves metrics, logs a clean startup, and publishes
 nothing at all. Nothing about the container looks wrong; the tank is simply
-not monitored. That is why `deploy-pi.sh` verifies a sample on the wire
-instead of a container being merely "up."
+not monitored. That is why `install-hub.sh`'s verify phase checks for a
+sample on the wire instead of a container being merely "up."
 
 ### Logs are `docker compose logs`, not journald-per-unit
 
@@ -347,7 +351,7 @@ anyone read it — the same reasoning, now pointed at compose's own log driver.
 
 ### Installing by hand
 
-`deploy-pi.sh` does this for you; the manual form is here for a first
+`install-hub.sh` does this for you; the manual form is here for a first
 bring-up.
 
 ```bash
@@ -695,7 +699,7 @@ no sourcing a service env file by hand, because there is no longer a
 per-service env file to source (see §7):
 
 ```bash
-cd /home/david/bellasreef
+cd ~/bellasreef
 docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke --list
 ```
 
@@ -750,7 +754,7 @@ new one and the open-pairing window has been shut since the first device paired.
 Three steps, on the hub:
 
 ```bash
-cd /home/david/bellasreef
+cd ~/bellasreef
 
 # 1. Open a recovery window. Default 300 seconds; --ttl takes seconds.
 docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef pair --ttl 600
@@ -794,8 +798,9 @@ add them after the fact: `audit_log` is append-only by trigger.
 containers-only changed where those binaries live. The command now runs
 *inside* the `api` container (`docker compose exec api bellasreef backup
 --out /backups/...`), and `/backups` is itself a host bind mount
-(`/home/david/backups:/backups`, declared on the `api` service in
-`deploy/compose.yaml`), so `pg_dump --file` writing inside the container's filesystem lands the
+(`${BELLASREEF_BACKUP_DIR}:/backups`, declared on the `api` service in
+`deploy/compose.yaml`; the installer sets `BELLASREEF_BACKUP_DIR` to
+`~/backups`), so `pg_dump --file` writing inside the container's filesystem lands the
 archive on the host through that mount — no `docker exec` detour needed, and
 none of the "host copy of the tools" reasoning below is load-bearing anymore.
 
