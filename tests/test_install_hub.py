@@ -25,7 +25,8 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "scripts" / "install-hub.sh"
+HUB_ROOT = REPO_ROOT / "hub"
+SCRIPT = HUB_ROOT / "scripts" / "install-hub.sh"
 
 
 # Names this harness owns. Nothing on the machine's real PATH may answer for
@@ -287,7 +288,7 @@ def test_phase1_warns_but_continues_when_deploy_env_exists(tmp_path: Path) -> No
     # REPO_DIR (as the script computes it) is this repo's absolute path, so
     # under a fixture root the script reads ${root}${REPO_DIR}/deploy/.env.
     # Derive that nested path instead of hardcoding it.
-    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
     envfile.write_text("SOME_SETTING=value\n")
     result = run_script("--check-only", root=root, stubs=stubs)
@@ -1273,12 +1274,12 @@ def test_phase4_failed_run_leaves_no_env_behind_and_can_be_rerun(tmp_path: Path)
         tmp_path, {"getent": 'case "$2" in i2c) echo "i2c:x:108:" ;; *) exit 2 ;; esac'}
     )
     root = full_root(tmp_path)
-    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     # The directory exists on a real machine (it is the repo's deploy/), and
     # without it here `cp` simply fails and the poison never lands — which is
     # how the first version of this test passed against the unfixed script.
     envfile.parent.mkdir(parents=True, exist_ok=True)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     first = run_script("--yes", root=root, stubs=stubs)
@@ -1313,12 +1314,12 @@ def test_phase4_never_overwrites_an_existing_env(tmp_path: Path) -> None:
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
-    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
     sentinel = "POSTGRES_PASSWORD=already-configured-do-not-touch\n"
     envfile.write_text(sentinel)
 
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
@@ -1334,7 +1335,7 @@ def staged_env_path(root: Path) -> Path:
     so a fixture without it makes the write fail for a reason no operator
     would ever hit, and a test built on that passes against a broken script.
     """
-    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
+    envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
     envfile.parent.mkdir(parents=True, exist_ok=True)
     return envfile
 
@@ -1350,7 +1351,7 @@ def test_phase4_writes_a_complete_locked_down_env(tmp_path: Path) -> None:
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs)
@@ -1395,7 +1396,7 @@ def test_phase4_pins_the_image_tag_to_the_checkouts_commit(tmp_path: Path) -> No
     write_phase5_stubs(stubs)
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
@@ -1534,7 +1535,7 @@ def test_phase4_writes_over_an_empty_env(tmp_path: Path) -> None:
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
     envfile.write_text("")
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
@@ -1562,7 +1563,7 @@ def test_phase4_a_failed_write_leaves_no_partial_env(tmp_path: Path) -> None:
     )
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs)
@@ -1603,7 +1604,7 @@ def test_phase4_rejects_a_password_that_is_not_32_chars(tmp_path: Path) -> None:
     )
     root = full_root(tmp_path)
     envfile = staged_env_path(root)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs)
@@ -1812,7 +1813,7 @@ def test_phase5_names_the_fix_on_a_registry_401(tmp_path: Path) -> None:
     # regression that runs on past the failure cannot invoke the real sudo.
     write_stub(stubs, "sudo", "exit 1")
     root = phase5_root(tmp_path)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs)
@@ -1831,8 +1832,8 @@ def test_a_failed_deploy_does_not_wedge_the_next_run(tmp_path: Path) -> None:
     # been changed" and exit 0 — a re-run that reports success having installed
     # nothing, forever, on a machine one `docker login` away from working.
     root = phase5_root(tmp_path)
-    envfile = root.joinpath(*REPO_ROOT.parts[1:]) / "deploy" / ".env"
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    envfile = root.joinpath(*HUB_ROOT.parts[1:]) / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     stubs = make_stubs(
@@ -1959,7 +1960,7 @@ def test_phase5_deploys_in_the_required_order(tmp_path: Path) -> None:
     write_stub(stubs, "install", install_stub(log))
     write_phase6_stubs(stubs, tmp_path)
     root = phase5_root(tmp_path)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs)
@@ -2066,7 +2067,7 @@ def test_phase6_verifies_a_healthy_hub_and_hands_off(tmp_path: Path) -> None:
     # nothing the owner can use.
     stubs, markers = phase6_stubs(tmp_path)
     root = phase5_root(tmp_path)
-    real_envfile = REPO_ROOT / "deploy" / ".env"
+    real_envfile = HUB_ROOT / "deploy" / ".env"
     assert not real_envfile.exists(), "this test refuses to run against a real deploy/.env"
 
     result = run_script("--yes", root=root, stubs=stubs, env=FAST_POLL)
@@ -2108,14 +2109,14 @@ def test_phase5_renders_the_boot_unit_for_this_host(tmp_path: Path) -> None:
     unit = installed_unit_path(root).read_text()
     assert "User=reef-tester" in unit, unit
     assert "/home/david/bellasreef" not in unit, unit
-    assert f"WorkingDirectory={REPO_ROOT}" in unit, unit
+    assert f"WorkingDirectory={HUB_ROOT}" in unit, unit
     for line in ("ExecStart=", "ExecStop="):
         rendered = next(ln for ln in unit.splitlines() if ln.startswith(line))
-        assert str(REPO_ROOT / "deploy") in rendered, rendered
+        assert str(HUB_ROOT / "deploy") in rendered, rendered
 
     # The repo's own copy is what deploy-pi.sh installs on the reference host.
     # Rendering must not have edited it.
-    checked_in = (REPO_ROOT / "deploy/systemd/bellasreef.service").read_text()
+    checked_in = (HUB_ROOT / "deploy/systemd/bellasreef.service").read_text()
     assert "User=david" in checked_in
     assert "/home/david/bellasreef" in checked_in
 
@@ -2143,7 +2144,7 @@ def test_phase6_fails_when_the_installed_unit_names_a_foreign_host(tmp_path: Pat
     assert "6. verify" in result.stdout, combined
     assert result.returncode != 0, combined
     assert "boot unit" in result.stdout.lower(), combined
-    assert str(REPO_ROOT) in result.stdout, combined
+    assert str(HUB_ROOT) in result.stdout, combined
 
 
 def test_phase6_runs_systemd_analyze_when_it_is_available(tmp_path: Path) -> None:

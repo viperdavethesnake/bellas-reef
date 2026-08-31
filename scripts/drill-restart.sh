@@ -28,8 +28,8 @@ SERVICE=hardware-io
 REMOTE="${1:-}"
 REPO=/home/david/bellasreef
 
-COMPOSE_BASE="docker compose -f deploy/compose.yaml --env-file deploy/.env"
-COMPOSE_ARMED="docker compose -f deploy/compose.yaml -f deploy/compose.drill.yaml --env-file deploy/.env"
+COMPOSE_BASE="docker compose -f hub/deploy/compose.yaml --env-file hub/deploy/.env"
+COMPOSE_ARMED="docker compose -f hub/deploy/compose.yaml -f deploy/compose.drill.yaml --env-file hub/deploy/.env"
 
 if [[ -n "$REMOTE" ]]; then
     run() { ssh -o ControlPath=none "$REMOTE" "cd $REPO && $1"; }

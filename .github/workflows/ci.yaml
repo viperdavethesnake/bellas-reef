@@ -252,7 +252,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate compose file
-        working-directory: deploy
+        working-directory: hub/deploy
         run: |
           cp .env.example .env
           # Four values are deliberately blank in .env.example and are filled

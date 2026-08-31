@@ -64,7 +64,7 @@ done
 # bellasreef.local) — one hostname convention for both operator scripts.
 PI_HOST="${BELLASREEF_PI_HOST:-bellasreef.local}"
 PI_DIR="/home/david/bellasreef"
-DEPLOY_DIR="${PI_DIR}/deploy"
+DEPLOY_DIR="${PI_DIR}/hub/deploy"
 COMPOSE_FILE="${DEPLOY_DIR}/compose.yaml"
 COMPOSE_ENV="${DEPLOY_DIR}/.env"
 API_PORT=8000
