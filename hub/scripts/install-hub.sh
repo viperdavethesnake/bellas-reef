@@ -354,6 +354,40 @@ ih_check_disk() {
     return 1
 }
 
+# The host paths the compose manifest hard-requires: every `devices:` node
+# and every /sys bind-mount source. Docker cannot create a missing /dev node
+# or a missing source under /sys, so any absence is a guaranteed phase-5 wall
+# — hardware-io simply cannot start. Ruled 2026-08-31 (coco, weighing
+# dtparam=i2c_arm=off): that has to be a phase-2 FAIL that names the path and
+# the remedy, not a docker error after images are already pulled.
+ih_manifest_host_paths() {
+    [[ -r "$IH_COMPOSE" ]] || return 1
+    grep -E '^[[:space:]]*- /(dev|sys)/' "$IH_COMPOSE" \
+        | sed -E 's/^[[:space:]]*- //; s/:.*$//' \
+        | sort -u
+}
+
+ih_check_host_paths() {
+    local paths missing=() p count
+    if ! paths="$(ih_manifest_host_paths)" || [[ -z "$paths" ]]; then
+        ih_unverified "could not read the compose manifest's host paths"
+        return 2
+    fi
+    while IFS= read -r p; do
+        [[ -e "${IH_ROOT}${p}" ]] || missing+=("$p")
+    done <<<"$paths"
+    if (( ${#missing[@]} == 0 )); then
+        count="$(wc -l <<<"$paths" | tr -d ' ')"
+        ih_pass "host paths required by the compose manifest present (${count})"
+        return 0
+    fi
+    local m
+    for m in "${missing[@]}"; do
+        ih_fail "${m} is required by deploy/compose.yaml but missing — the stack cannot start without it; enable the interface in /boot/firmware/config.txt (see docs/host-setup.md) and reboot"
+    done
+    return 1
+}
+
 # An override is a deadline and the API refuses to compute one from a clock
 # chrony is about to step. A hub with a wrong clock is a hub that doses at the
 # wrong hour, so this is a hard requirement rather than a nicety.
@@ -612,6 +646,7 @@ ih_phase2_requirements() {
     ih_check_quietly ih_check_kernel
     ih_check_quietly ih_check_memory
     ih_check_quietly ih_check_disk
+    ih_check_quietly ih_check_host_paths
 
     # ih_check_clock can return 2 (UNVERIFIED — timedatectl unreadable) or
     # 3 (FAIL — a time daemon is running but has not converged yet) as well
@@ -692,6 +727,7 @@ ih_phase2_requirements() {
     ih_check_kernel
     ih_check_memory
     ih_check_disk
+    ih_check_host_paths
     ih_check_clock
     ih_check_avahi
 
@@ -1436,9 +1472,13 @@ ih_phase6_verify() {
                 if [[ -n "$code" ]]; then
                     printf '\n'
                     ih_step "Pair your phone"
-                    printf '\n      Setup code:  \033[1m%s\033[0m\n\n' "$code"
-                    printf '      Open the Bella'"'"'s Reef app, pick this hub, and enter it.\n'
-                    printf '      Multicast is not something this script can test from here;\n'
+                    # Verbatim, indented. The CLI's output is already labeled
+                    # and already carries its own instruction — wrapping it
+                    # in a second label printed "Setup code:  Setup code:"
+                    # on coco's maiden install (2026-08-31).
+                    printf '\n'
+                    printf '%s\n' "$code" | sed 's/^/      /'
+                    printf '\n      Multicast is not something this script can test from here;\n'
                     printf '      the app finding the hub is the proof.\n\n'
                 else
                     ih_fail "could not read the setup code"
@@ -1461,17 +1501,19 @@ ih_phase6_verify() {
 # The two things the setup code does not say: what to do next, and which
 # machine this transcript is about.
 ih_phase6_handoff() {
-    local etc_dir version tag
-    etc_dir="$(sed -n 's/^BELLASREEF_ETC_DIR=//p' "$IH_ENVFILE" | head -1)"
-    etc_dir="${etc_dir:-/etc/bellasreef}"
+    local version tag
     printf '\n'
-    ih_step "Next: tell the hub what is attached"
-    printf '      A fresh hub has no devices, so nothing to read and nothing to show.\n'
-    printf '      Copy deploy/config/devices.yaml.example to %s/devices.import.yaml,\n' "$etc_dir"
-    printf '      edit it for your hardware, then run the import with an access token\n'
-    printf '      from a paired client (docs/host-setup.md section 10):\n'
-    printf '        docker compose -f %s --env-file %s \\\n' "$IH_COMPOSE" "${IH_ENVFILE#"$IH_ROOT"}"
-    printf '          exec api bellasreef devices import /etc/bellasreef/devices.import.yaml --token <access token>\n'
+    ih_step "Next: adopt your hardware"
+    # The app is the product mechanism — proven on coco's maiden install:
+    # probe adopted from the app in three taps, no YAML, no token. `devices
+    # import` is the bulk/restore path (its own docstring says "explicitly
+    # not the product mechanism") and lives in the docs, not here.
+    printf '      A fresh hub knows what it can control, but nothing is adopted yet.\n'
+    printf '      In the app: System > Hardware lists every channel and probe this hub\n'
+    printf '      discovered. Adopt what the hub should use; controls live on the tab\n'
+    printf '      that uses the device.\n'
+    printf '      Restoring many devices at once instead? bellasreef devices import -\n'
+    printf '      docs/host-setup.md section 10.\n'
 
     version="$(sed -n 's/^BELLASREEF_VERSION=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
     tag="$(sed -n 's/^BELLASREEF_TAG=//p' "$IH_RELEASE_ENV" 2>/dev/null | head -1)"
@@ -1483,7 +1525,28 @@ ih_phase6_handoff() {
     printf '      board      %s\n' "$board"
     printf '      memory     %s MB\n' "$(awk '/^Mem/ {print int($2/1024); exit}' <(free -k 2>/dev/null) 2>/dev/null)"
     printf '      free disk  %s GB\n' "$(df -k --output=avail "${IH_ROOT}/" 2>/dev/null | tail -1 | awk '{print int($1/1000/1000)}')"
-    printf '      addresses  %s\n' "$(hostname -I 2>/dev/null | sed 's/ *$//')"
+    # LAN addresses are what the app can reach; the docker bridges are real
+    # but internal, and printing them unlabeled read as three equally-good
+    # addresses on coco's maiden install. Ruled 2026-08-31: label, don't
+    # hide. The interface split is the same one ih_lan_interfaces and the
+    # avahi allowlist already use.
+    local addr_out lan_addrs internal_addrs
+    if command -v ip >/dev/null 2>&1 && addr_out="$(ip -br addr 2>/dev/null)" && [[ -n "$addr_out" ]]; then
+        lan_addrs="$(awk '{ name=$1; sub(/@.*/, "", name);
+            if (name == "lo" || name ~ /^(docker|br-|veth|virbr)/) next;
+            for (i = 3; i <= NF; i++) if ($i ~ /^[0-9]+\./) { sub(/\/.*/, "", $i); printf "%s ", $i } }' \
+            <<<"$addr_out" | sed 's/ $//')"
+        internal_addrs="$(awk '{ name=$1; sub(/@.*/, "", name);
+            if (name !~ /^(docker|br-|virbr)/) next;
+            for (i = 3; i <= NF; i++) if ($i ~ /^[0-9]+\./) { sub(/\/.*/, "", $i); printf "%s ", $i } }' \
+            <<<"$addr_out" | sed 's/ $//')"
+        printf '      addresses  %s (LAN)\n' "${lan_addrs:-none found}"
+        if [[ -n "$internal_addrs" ]]; then
+            printf '                 %s (internal - docker bridges)\n' "$internal_addrs"
+        fi
+    else
+        printf '      addresses  %s\n' "$(hostname -I 2>/dev/null | sed 's/ *$//')"
+    fi
     printf '      release    %s (%s)\n' "${version:-unknown}" "${tag:0:12}"
     printf '      checkout   %s\n' "$REPO_DIR"
 }
