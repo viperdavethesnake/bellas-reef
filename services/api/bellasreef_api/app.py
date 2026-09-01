@@ -1232,7 +1232,21 @@ def build_app(
             # `client.paired` — one audit event per grant, not a second event
             # name layered on top of it.
             client_id, token = await store.create_client(body.client_name)
-            await store.complete_setup()
+            # The same check-then-act the window path below closed:
+            # two callers that both verified the code before either minted
+            # would both be granted. `complete_setup` latches once; the
+            # loser's row is rolled back and it gets a 409.
+            if not await store.complete_setup():
+                await store.discard_client(client_id)
+                log.warning(
+                    "lost the race for the setup code",
+                    extra={"event": "pair_setup_code_race"},
+                )
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "another client paired with this setup code first. Pair from "
+                    "that device, or run `bellasreef pair` on the hub.",
+                )
             await sink(
                 "pair.code_granted",
                 {
@@ -1301,7 +1315,20 @@ def build_app(
             # Blind TOFU: reachable only when no setup code was ever minted
             # (the check above), so a hub deployed without the new deploy
             # step still bootstraps exactly as before.
-            client_id, token = await store.create_client(body.client_name)
+            # `total == 0` above is a read on its own transaction; two callers
+            # can both see zero. `create_first_client` recounts and inserts
+            # under one lock, so exactly one of them is handed a row.
+            first = await store.create_first_client(body.client_name)
+            if first is None:
+                log.warning(
+                    "lost the race for the TOFU window",
+                    extra={"event": "pair_tofu_race"},
+                )
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "another client paired first. Pair from that device.",
+                )
+            client_id, token = first
             await store.complete_setup()
             await sink(
                 "pair.tofu_granted",

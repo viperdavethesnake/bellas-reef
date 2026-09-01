@@ -15,9 +15,10 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -1211,6 +1212,103 @@ def test_two_clients_racing_for_one_recovery_window_get_one_credential() -> None
     assert out["events"].count("pair.window_used") == 1, (
         "the trail must record one use of the window, by the client that used it"
     )
+
+
+@contextlib.asynccontextmanager
+async def _both_read_before_either_writes(cls: type, method: str) -> AsyncIterator[None]:
+    """Pin the interleaving a race test depends on.
+
+    Two requests through `asyncio.gather` do not reliably interleave at the
+    read: on a fast loopback database the first request can run its whole
+    handler before the second one's first await resolves, and a test that
+    passed for that reason has proven nothing about the handler. This wraps
+    one Store read in a two-party barrier, so both callers complete the read
+    — and both see the pre-write state — before either is allowed to proceed
+    to the write. It changes *when* the real method returns, never *what*.
+    """
+    original = getattr(cls, method)
+    gate = asyncio.Barrier(2)
+
+    async def held(self: Any, *a: Any, **kw: Any) -> Any:
+        result = await original(self, *a, **kw)
+        await gate.wait()
+        return result
+
+    with patch.object(cls, method, held):
+        yield
+
+
+def test_two_clients_racing_for_blind_tofu_get_one_credential() -> None:
+    """TOFU is one credential, under concurrency as well as in sequence.
+
+    The blind-TOFU grant was `count clients ever` -> `if 0` -> `create_client`
+    across two transactions with nothing atomic between them: two `POST /pair`
+    calls arriving together on a never-paired hub both read zero, both minted,
+    and both walked away with a permanent refresh token. The recovery-window
+    path forty lines up was fixed for exactly this shape in 2026-08 and this
+    path was not.
+
+    `complete_setup()` is the latch — `UPDATE ... WHERE setup_completed_at IS
+    NULL` already flips exactly once — so the grant is decided by whether that
+    UPDATE touched a row, and the loser's client row is rolled back.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        out: dict[str, Any] = {}
+        async with h.client() as c, _both_read_before_either_writes(Store, "total_clients_ever"):
+            a, b = await asyncio.gather(
+                c.post("/api/v1/pair", json={"client_name": "phone-a"}),
+                c.post("/api/v1/pair", json={"client_name": "phone-b"}),
+            )
+            out["codes"] = sorted([a.status_code, b.status_code])
+            out["tokens"] = [r.json()["refresh_token"] for r in (a, b) if r.status_code == 200]
+        out["clients_ever"] = await Store(h.engine).total_clients_ever()
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+
+    # Both callers counted zero before either minted (the barrier guarantees
+    # it), so the loser's only honest exit is losing the latch: 409.
+    assert out["codes"] == [200, 409], f"one paired, one refused; got {out['codes']}"
+    assert len(out["tokens"]) == 1
+    assert out["clients_ever"] == 1, "the loser's client row must be rolled back, not left orphaned"
+    assert out["events"].count("pair.tofu_granted") == 1
+
+
+def test_two_clients_racing_with_the_same_setup_code_get_one_credential() -> None:
+    """A setup code is one credential too — the same check-then-act, one
+    branch up: both callers verify the hash, both mint, both are granted.
+    Same latch, same rollback, same one-row audit trail.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        code = new_setup_code()
+        await Store(h.engine).set_setup_code_hash(hash_setup_code(code))
+        out: dict[str, Any] = {}
+        async with h.client() as c, _both_read_before_either_writes(Store, "setup_state"):
+            a, b = await asyncio.gather(
+                c.post("/api/v1/pair", json={"client_name": "phone-a", "setup_code": code}),
+                c.post("/api/v1/pair", json={"client_name": "phone-b", "setup_code": code}),
+            )
+            out["codes"] = sorted([a.status_code, b.status_code])
+            out["tokens"] = [r.json()["refresh_token"] for r in (a, b) if r.status_code == 200]
+        out["clients_ever"] = await Store(h.engine).total_clients_ever()
+        await h.engine.dispose()
+        out["events"] = h.audit.names()
+        return out
+
+    out = run(scenario)
+
+    # Both callers read "in setup" and verified the code before either minted,
+    # so the loser's only honest exit is losing the latch: 409.
+    assert out["codes"] == [200, 409], f"one paired, one refused; got {out['codes']}"
+    assert len(out["tokens"]) == 1
+    assert out["clients_ever"] == 1, "the loser's client row must be rolled back, not left orphaned"
+    assert out["events"].count("pair.code_granted") == 1
 
 
 def test_an_expired_window_does_not_let_anyone_in() -> None:

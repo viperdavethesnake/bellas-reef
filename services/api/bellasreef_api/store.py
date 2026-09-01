@@ -195,7 +195,7 @@ class Store:
                 text("UPDATE hub_identity SET setup_code_hash = :h"), {"h": code_hash}
             )
 
-    async def complete_setup(self) -> None:
+    async def complete_setup(self) -> bool:
         """First successful pair, by any method. Never unset afterwards.
 
         ``WHERE setup_completed_at IS NULL`` is what makes "never unset" true
@@ -204,14 +204,25 @@ class Store:
         therefore cannot re-open setup mode. Also clears any live setup-code
         hash — once a hub is set up, that code has no further use and must
         not still verify.
+
+        Returns whether *this* call latched. The UPDATE flips exactly once,
+        which makes it the atomic decider for the setup-code grant: two
+        callers that both verified the code and both minted a client cannot
+        both see ``True`` here, and the one that sees ``False`` rolls its
+        client back. The other two grants have their own deciders and ignore
+        this value — ``consume_window`` for a recovery window (which opens
+        after setup is complete, so the UPDATE is expected to touch nothing)
+        and ``create_first_client`` for blind TOFU (keyed on client rows
+        ever, not on this column).
         """
         async with self._engine.begin() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 text(
                     "UPDATE hub_identity SET setup_completed_at = now(), setup_code_hash = NULL "
                     "WHERE setup_completed_at IS NULL"
                 )
             )
+            return bool(result.rowcount)
 
     # ------------------------------------------------------------ capabilities
 
@@ -791,6 +802,40 @@ class Store:
         token = new_refresh_token()
         client_id = uuid4()
         async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO paired_clients (id, name, refresh_token_hash) "
+                    "VALUES (:id, :name, :hash)"
+                ),
+                {"id": client_id, "name": name, "hash": hash_refresh_token(token)},
+            )
+        return client_id, token
+
+    async def create_first_client(self, name: str) -> tuple[UUID, str] | None:
+        """Create a client only if no client row has ever existed.
+
+        The blind-TOFU decider. ``total_clients_ever`` followed by
+        ``create_client`` is two transactions with nothing between them, so
+        two first-boot callers could both count zero and both be granted.
+        Here the count and the insert share one transaction serialised on a
+        transaction-scoped advisory lock: the second caller blocks on the
+        lock, then counts one, and gets ``None`` — nothing was minted, so
+        there is nothing to roll back. Deliberately *not* keyed on
+        ``hub_identity.setup_completed_at``: the TOFU window is "no client
+        row ever" by design (see ``total_clients_ever``), and the setup latch
+        is a separate fact.
+        """
+        token = new_refresh_token()
+        client_id = uuid4()
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext('paired_clients:first'))")
+            )
+            existing = (
+                await conn.execute(text("SELECT count(*) FROM paired_clients"))
+            ).scalar_one()
+            if int(existing) != 0:
+                return None
             await conn.execute(
                 text(
                     "INSERT INTO paired_clients (id, name, refresh_token_hash) "
