@@ -27,6 +27,7 @@ from bellasreef_hardware_io.capabilities import (
     discover_pca9685,
     discover_pwm,
     find_pwm_chip,
+    muxed_pwm_channel_count,
 )
 from bellasreef_hardware_io.capabilities import (
     parse_pinctrl as _parse,
@@ -116,6 +117,43 @@ class TestDiscoverPwm:
         empty = tmp_path / "class-pwm"
         empty.mkdir()
         assert discover_pwm(empty, mux_reader=lambda: _parse(TWO_MUXED)) is None
+
+
+class TestMuxedPwmChannelCount:
+    """The pi-pwm ChipState's ``channels`` fact, counted from the live mux.
+
+    Hardcoding the silicon's four was the 2026-08-31 finding: coco's overlay
+    muxes two pins, so the Hardware surface said "4 channels" over a two-row
+    adoptable list. The count must be the same reads discovery makes, so the
+    fact and the announcement agree by construction."""
+
+    def test_two_muxed_channels_count_two(self, tmp_path: Path) -> None:
+        count = muxed_pwm_channel_count(_rp1_class(tmp_path), mux_reader=lambda: _parse(TWO_MUXED))
+        assert count == 2
+
+    def test_four_muxed_channels_count_four(self, tmp_path: Path) -> None:
+        count = muxed_pwm_channel_count(_rp1_class(tmp_path), mux_reader=lambda: _parse(FOUR_MUXED))
+        assert count == 4
+
+    def test_an_unreadable_mux_is_unknown_not_zero(self, tmp_path: Path) -> None:
+        assert muxed_pwm_channel_count(_rp1_class(tmp_path), mux_reader=lambda: None) is None
+
+    def test_a_missing_chip_is_unknown(self, tmp_path: Path) -> None:
+        empty = tmp_path / "class-pwm"
+        empty.mkdir()
+        assert muxed_pwm_channel_count(empty, mux_reader=lambda: _parse(TWO_MUXED)) is None
+
+    def test_agrees_with_discover_pwm_when_npwm_bounds_the_mux(self, tmp_path: Path) -> None:
+        """The invariant the fact exists to keep: count == what is announced,
+        including the npwm bound (a pin claiming a channel the chip does not
+        report is not counted, exactly as it is not announced)."""
+        pwm_class = _rp1_class(tmp_path)
+        chip = (pwm_class / "pwmchip0").resolve()
+        (chip / "npwm").write_text("1\n")
+        announcement = discover_pwm(pwm_class, mux_reader=lambda: _parse(FOUR_MUXED))
+        count = muxed_pwm_channel_count(pwm_class, mux_reader=lambda: _parse(FOUR_MUXED))
+        assert announcement is not None
+        assert count == len(announcement.channels) == 1
 
 
 class TestReadPwmMux:

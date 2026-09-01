@@ -162,6 +162,11 @@ def _service_building(
     monkeypatch.setattr(
         app_module, "build_from_assignments", lambda assignments, *, open_i2c: (list(built), [])
     )
+    # The pi-pwm chip-state publish counts muxed channels from the live
+    # pinctrl mux; stubbed here so no unit test shells out. Two is coco's
+    # overlay, deliberately not the dev Pi's four — the count following the
+    # overlay is the point (2026-08-31).
+    monkeypatch.setattr(app_module, "muxed_pwm_channel_count", lambda: 2)
     service = HardwareIO(metrics_port=0)
     service.spine = cast(Any, spine)
     return service
@@ -295,8 +300,46 @@ class TestPiPwmAppWiring:
             "period_ns": 2_000_000,
             "frequency_hz": 500.0,
             "polarity": "normal",
-            "channels": 4,
+            "channels": 2,
         }
+
+    def test_the_channels_fact_is_the_muxed_count_not_the_silicon(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Found on coco 2026-08-31: the Hardware surface said "4 channels"
+        over a two-row adoptable list, because the fact was the RP1's silicon
+        count rather than what the operator's overlay muxes. The fact follows
+        the mux, same as the capability announcement."""
+        chip_root = _pwm_chip_root(tmp_path)
+        channel = PiPwmChannel(0, "light-0", chip_root=chip_root, sysfs=FakeSysfs())
+        spine = _RecordingSpine()
+        service = _service_building(
+            monkeypatch, spine, BuiltActuator(channel, _pwm_registration(channel))
+        )
+        monkeypatch.setattr(app_module, "muxed_pwm_channel_count", lambda: 4)
+
+        asyncio.run(service._build_from_registry())
+
+        assert spine.chip_states[0].facts["channels"] == 4
+
+    def test_an_unknown_mux_omits_the_channels_fact(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Unreadable mux means the count is unknown — the fact is left out,
+        never fabricated. Clients render facts by key and drop what is absent
+        (ChannelGroups.swift does), so honesty costs one missing segment."""
+        chip_root = _pwm_chip_root(tmp_path)
+        channel = PiPwmChannel(0, "light-0", chip_root=chip_root, sysfs=FakeSysfs())
+        spine = _RecordingSpine()
+        service = _service_building(
+            monkeypatch, spine, BuiltActuator(channel, _pwm_registration(channel))
+        )
+        monkeypatch.setattr(app_module, "muxed_pwm_channel_count", lambda: None)
+
+        asyncio.run(service._build_from_registry())
+
+        assert len(spine.chip_states) == 1
+        assert "channels" not in spine.chip_states[0].facts
 
     def test_two_channels_on_the_same_chip_publish_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
