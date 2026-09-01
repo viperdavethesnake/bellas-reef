@@ -23,10 +23,13 @@ must surface as a phase-2 FAIL with the config.txt remedy printed.
 - Phase 2 check: every host path named in a `devices:` entry of
   `deploy/compose.yaml` must exist, else FAIL with the dtparam/dtoverlay
   remedy.
-- Design question (separate, larger): whether the manifest should hard-require
-  nodes at all on hubs that don't use them — e.g. an installer-generated
-  compose override that maps only present nodes. Not assumed; needs its own
-  ruling.
+- Design question — RESOLVED 2026-08-31 (David, option 1): the committed
+  manifest stays canonical and hard-requires the full Pi 5 device set. The
+  host contract is config.txt with I2C on, a PWM overlay (2chan or 4chan —
+  soft: the stack starts without it, channels are just absent), and 1-Wire
+  on; phase 2's host-path FAIL is the enforcement. An installer-generated
+  override is the fallback IF a real non-Pi5 board ever lands on the bench
+  (the 3B+), decided then, with the board in hand.
 
 ## Context
 

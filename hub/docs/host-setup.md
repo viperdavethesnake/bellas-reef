@@ -30,18 +30,35 @@ install them.
 
 ## 1. Device tree overlays
 
+**The host contract (ruled 2026-08-31, option 1): the compose manifest is
+one committed file that hard-requires the full Pi 5 device set, and the host
+brings it via config.txt — I²C on, 1-Wire on, and a PWM overlay.** The
+installer's phase 2 fails with the missing path when any of it is absent.
+I²C and 1-Wire are hard (the stack cannot start without their device nodes);
+the PWM overlay is soft — the stack starts without it, you just have no PWM
+channels, which is not a hub that dims anything.
+
 In `/boot/firmware/config.txt`:
 
 ```ini
 dtparam=i2c_arm=on
 
 [pi5]
-dtoverlay=w1-gpio-pi5,gpiopin=4
+dtoverlay=pwm-2chan
+dtoverlay=w1-gpio,gpiopin=4
 ```
 
-**The `-pi5` suffix is required.** Plain `dtoverlay=w1-gpio` is the pre-Pi-5
-variant; it loads without error and silently fails to bring up the bus. This
-costs a reboot cycle to discover.
+`pwm-2chan` (stock) muxes GPIO18/19 — two channels, no custom overlay. All
+four channels need the custom `pwm-4chan` from §9. For 1-Wire, both
+`w1-gpio` and `w1-gpio-pi5` are known to work on a Pi 5 at kernel 6.18
+(coco runs the plain one, probe reads verified 3/3 crc=YES 2026-08-31; the
+dev Pi's earlier silent-failure with the plain variant is why `-pi5` was
+once documented as required). If the bus comes up empty, trying the other
+variant costs one reboot.
+
+Booting from USB storage on a supply weaker than 5 A? Add
+`usb_max_current_enable=1` under `[pi5]` or the boot drive may not power up
+on reboot (measured on the dev Pi, 2026-08-31).
 
 Never put a trailing `#` comment on a `dtparam=` or `dtoverlay=` line — the
 firmware device-tree parser can fold the comment into the value.

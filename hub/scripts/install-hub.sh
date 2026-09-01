@@ -181,7 +181,13 @@ ih_phase1_already_deployed() {
 # ------------------------------------------------------------------ phase 2
 
 IH_MIN_KERNEL_MAJOR=6
-IH_MIN_MEM_KB=2000000        # 2 GB. Six containers including Postgres and VM.
+# Measured, not guessed (coco, 1 GB Pi 5, 2026-08-31): all six services plus
+# live telemetry use ~580 MB with ~400 MB headroom on a board reporting
+# 1014464 kB. So the recommendation is 1 GB — the threshold sits at 900 MB
+# because a "1 GB" board reports ~990 MB after the kernel's cut, and the
+# check must not warn on supported hardware. A 512 MB board genuinely does
+# not fit. WARN, never FAIL: it may run, and refusing to try is not our call.
+IH_MIN_MEM_KB=921600
 
 # Disk is two-tier, from measurements on the reference Pi (2026-08-17).
 #

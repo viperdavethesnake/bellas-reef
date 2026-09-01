@@ -98,13 +98,16 @@ carrying that decision").
   hand; `scripts/build-hub-repo.sh` is the one assembler.
 - **A backend pass is not done at CI green.** The stop condition is
   **CI green → `v*` tag → release workflow green → `update-hub.sh` on the hub
-  → telemetry verified on the wire.** All of it, every time. Until
-  `update-hub.sh` is implemented, the last two are a fresh
-  `install-hub.sh` from the new release on a machine that is not yet a hub,
-  or the documented manual steps, never a hand-applied fix around a script
-  failure ("if the script fails, we fail", 2026-08-30). Until `update-hub.sh`
-  exists, "telemetry verified on the wire" is done by hand on the hub with
-  `curl -s 'http://127.0.0.1:8428/api/v1/query?query=count({__name__=~"bellasreef.*"})'`.
+  → telemetry verified on the wire.** All of it, every time.
+  `update-hub.sh` is implemented as of v0.2.0-rc.5 (#93; maiden run passed
+  on coco 2026-08-31): its verify phase reads a fresh telemetry sample off
+  VictoriaMetrics itself, so a PASS **is** the last two legs. Its three
+  outcomes are PASS, NO DEVICES (empty registry — complete, adopt from the
+  app), and FAIL. It never moves to main, never downgrades on a plain run,
+  and "already on the tag" also requires deploy/.env to name the manifest's
+  image sha (the first run on any hub arrives via a manual checkout of the
+  new tag). Never a hand-applied fix around a script failure ("if the
+  script fails, we fail", 2026-08-30).
 
   Green-and-undeployed is a state that reads as finished and is not. The Pi
   drifted four commits behind main that way in one session, which meant the hub

@@ -104,9 +104,11 @@ and `test_hub_status_api.py` (404-before-first-message, 200-after);
 implementation. iOS: `HardwareSectionsTests`-style tests for the new leaf's
 formatting.
 
-## Open question for David
+## Open question — RESOLVED 2026-08-31 (David: "for a hobbyist app do we
+really care?")
 
-Disk usage on the status page needs a rootfs-backed read-only bind mount
-into hardware-io (any path on the root filesystem works — a dedicated
-`/:/host:ro` is the node-exporter idiom, a narrower path is possible).
-Which grant, if any, is yours to rule; v1 ships without disk.
+Disk usage is SKIPPED by scope ruling, not deferred. The failure mode it
+would guard (slow storage exhaustion) is years out at this telemetry volume
+and is an alert's job when it ever matters, not a status row's. The
+installer prints free disk at install time. Do not re-open without a
+ruling.
