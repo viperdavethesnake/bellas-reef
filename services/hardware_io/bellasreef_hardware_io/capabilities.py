@@ -43,6 +43,7 @@ __all__ = [
     "discover_pwm",
     "discover_w1",
     "find_pwm_chip",
+    "muxed_pwm_channel_count",
     "parse_pinctrl",
     "read_pwm_mux",
 ]
@@ -191,6 +192,35 @@ def discover_pwm(
         hardware_source="pi-pwm",
         channels=channels,
     )
+
+
+def muxed_pwm_channel_count(
+    pwm_class: Path = Path("/sys/class/pwm"),
+    mux_reader: Callable[[], dict[int, int] | None] = read_pwm_mux,
+) -> int | None:
+    """How many RP1 PWM channels the live mux proves, or None for unknown.
+
+    The same three reads ``discover_pwm`` makes — chip by identity, ``npwm``
+    as the bound, ``pinctrl`` as the truth — reduced to a count. This is what
+    the pi-pwm ChipState reports as its ``channels`` fact, so the Hardware
+    surface agrees with the adoptable channel list by construction. The fact
+    was the hardcoded silicon count until 2026-08-31, when coco's two-pin
+    overlay met a "4 channels" header over a two-row adoptable list.
+
+    None means unknowable, never zero: a hub that cannot read its mux has an
+    unknown count, and the caller omits the fact rather than fabricating one.
+    """
+    chip = find_pwm_chip(pwm_class)
+    if chip is None:
+        return None
+    try:
+        npwm = int((chip / "npwm").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    mux = mux_reader()
+    if mux is None:
+        return None
+    return sum(1 for index in mux if index < npwm)
 
 
 def discover_w1(root: Path = W1_DEVICES) -> CapabilityAnnouncement | None:

@@ -52,7 +52,6 @@ log = get_logger(__name__)
 __all__ = [
     "DEFAULT_PERIOD_NS",
     "PWM_CHIP_ROOT",
-    "RP1_PWM_CHANNELS",
     "PiPwmChannel",
     "RealSysfs",
     "SysfsWriter",
@@ -117,14 +116,6 @@ class RealSysfs:
         return os.access(path, os.W_OK)
 
 
-#: The RP1 PWM0 block's channel count, fixed by the silicon (CLAUDE.md,
-#: verified host facts: all four channels reach a header pin on this board).
-#: Distinct from ``npwm`` as read live from sysfs by capabilities.py's
-#: discovery — this is the fact reported in the chip's ChipState table, not
-#: a discovery bound, and the two are expected to agree on this hub.
-RP1_PWM_CHANNELS: Final = 4
-
-
 def chip_device_identity(chip_root: Path) -> str:
     """The pwmchip's device-tree identity, e.g. ``"1f00098000.pwm"``.
 
@@ -137,7 +128,7 @@ def chip_device_identity(chip_root: Path) -> str:
 
 
 def chip_identity_and_facts(
-    chip_root: Path, period_ns: int, polarity: str
+    chip_root: Path, period_ns: int, polarity: str, *, channels: int | None
 ) -> tuple[str, dict[str, str | int | float | bool]]:
     """This chip's instance identity and its ChipState facts, together.
 
@@ -147,6 +138,13 @@ def chip_identity_and_facts(
     period and one polarity convention, so the channel that opens first
     describes the chip for the rest of the process's life (see app.py's
     publish-once keying).
+
+    ``channels`` is the mux-proven count from
+    ``capabilities.muxed_pwm_channel_count``, passed in rather than read
+    here so this module stays sysfs-only. It was a hardcoded 4 until
+    2026-08-31 — coco's two-pin overlay showed "4 channels" over a two-row
+    adoptable list. None (unreadable mux) omits the fact; clients render
+    facts by key and drop what is absent.
     """
     device = chip_device_identity(chip_root)
     facts: dict[str, str | int | float | bool] = {
@@ -155,8 +153,9 @@ def chip_identity_and_facts(
         "period_ns": period_ns,
         "frequency_hz": round(1e9 / period_ns, 1),
         "polarity": polarity,
-        "channels": RP1_PWM_CHANNELS,
     }
+    if channels is not None:
+        facts["channels"] = channels
     return device, facts
 
 

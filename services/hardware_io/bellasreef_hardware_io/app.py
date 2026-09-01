@@ -48,6 +48,7 @@ from bellasreef_hardware_io.capabilities import (
     discover_pca9685,
     discover_pwm,
     discover_w1,
+    muxed_pwm_channel_count,
 )
 from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.drivers.pca9685 import Pca9685Channel
@@ -280,8 +281,15 @@ class HardwareIO:
             await self._publish_chip_state_once(driver.device.chip_state())
         elif isinstance(driver, PiPwmChannel):
             now = datetime.now(UTC)
+            # The channels fact is counted from the live mux, the same reads
+            # discovery makes. Built per opened channel and deduped by
+            # _publish_chip_state_once, like the pca9685 branch — a few
+            # ~10 ms pinctrl reads at startup, not a hot path.
             instance, facts = chip_identity_and_facts(
-                driver.chip_root, driver.period_ns, driver.polarity
+                driver.chip_root,
+                driver.period_ns,
+                driver.polarity,
+                channels=muxed_pwm_channel_count(),
             )
             await self._publish_chip_state_once(
                 ChipState(
