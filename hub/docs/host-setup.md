@@ -311,13 +311,13 @@ clone: it pulls the three app images at the commit-sha tag recorded in
 `deploy/release.env`, migrates, brings the stack up, and then phase 6 checks
 that every compose service is running, `bellasreef.service` is enabled and
 rendered for this host, the API answers on port 8000, avahi's service record
-is published, and prints the setup code. `scripts/update-hub.sh` is meant to
-move an already-installed hub to a newer release the same way; it is not
-implemented yet (see `../README.md`), so an update today is a fresh
-`install-hub.sh` run from the new release, or the manual steps below.
+is published, and prints the setup code. `scripts/update-hub.sh` moves an
+already-installed hub to a newer release the same way (see `../README.md`
+for what it does and refuses to do); its verify phase reads a telemetry
+sample off the wire itself, so a PASS is the full stop condition.
 
-None of that reads a telemetry sample. Until `update-hub.sh` lands, confirm
-telemetry is actually on the wire by hand by asking VictoriaMetrics directly:
+The manual check, for when a hand is wanted anyway — ask VictoriaMetrics
+directly:
 
 ```bash
 curl -s 'http://127.0.0.1:8428/api/v1/query?query=count({__name__=~"bellasreef.*"})'
