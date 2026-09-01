@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 #
 # Overlay that ARMS THE FREEZE DRILL on hardware-io. Never part of a deploy:
-# `scripts/drill-restart.sh` names `hub/deploy/compose.yaml` alone for a
-# normal recreate, and this file is only ever layered in by that same script
-# to arm the drill. That same script disarms via a trap on the way out,
-# including when the drill fails.
+# `scripts/drill-restart.sh` names `deploy/compose.yaml` alone for a normal
+# recreate, and this file is only ever layered in by that same script to arm
+# the drill. That same script disarms via a trap on the way out, including
+# when the drill fails.
 #
 # The trigger is opt-in and the container is recreated to arm it, because
 # BELLASREEF_ENABLE_FREEZE_DRILL is read once at process start (app.py). A

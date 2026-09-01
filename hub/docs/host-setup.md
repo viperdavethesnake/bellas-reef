@@ -478,9 +478,11 @@ socket on the host.
 
 ### Running the drill
 
+On the hub, from `~/bellasreef` — the script ships in this repo and reads
+the layout it sits in:
+
 ```bash
-./scripts/drill-restart.sh bellasreef.local   # from the dev machine
-./scripts/drill-restart.sh                    # on the Pi
+./scripts/drill-restart.sh
 ```
 
 Arming is handled by the script. The freeze trigger is read once at process
@@ -580,14 +582,36 @@ The RP1 PWM block is present without any overlay: `pwmchip0` at
 overlay does is **mux header pins to it**. Without one, exporting a channel
 succeeds and drives nothing.
 
+Two overlays cover the two configurations this project has run in
+production. Either is fine: hardware-io's discovery reads the live mux with
+`pinctrl get` at startup, so whatever the overlay muxes is exactly what the
+hub announces — fewer channels muxed means fewer announced, no code change
+in either direction.
+
+**Stock `pwm-2chan` — two channels, no custom build.** What coco, the first
+production hub, runs (observed 2026-08-31: channels 2 and 3 announced and
+adopted through the app):
+
+```bash
+# In /boot/firmware/config.txt, [pi5] section.
+dtoverlay=pwm-2chan
+```
+
+With no parameters this muxes PWM0_CHAN2/3 (GPIO18/19). The parametered form
+picks other pins — `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4` muxes
+CH0/CH1 instead (GPIO12/13, verified 2026-08-13).
+
+**`pwm-4chan` — all four channels, our own overlay.** Source ships in this
+repo at `deploy/overlays/pwm-4chan.dts`, build/install commands in its
+header — it exists because no stock overlay muxes all four RP1 PWM0
+channels:
+
 ```bash
 # In /boot/firmware/config.txt, [pi5] section. Applied and verified 2026-08-13.
 dtoverlay=pwm-4chan
 ```
 
-`pwm-4chan` is **our own overlay** — source in `deploy/overlays/pwm-4chan.dts`,
-build/install commands in its header — because no stock overlay muxes all four
-RP1 PWM0 channels. The verified pin map:
+The verified pin map:
 
 | Channel | GPIO | Header pin | legacy `func` | RP1 alt |
 |---|---|---|---|---|
@@ -599,12 +623,7 @@ RP1 PWM0 channels. The verified pin map:
 The legacy `brcm,function` values are translated per-pin and are not the RP1
 alt numbers — `func=7` on 18/19 is rejected and **poisons the whole map**,
 unmuxing 12/13 too (measured; the two `pinctrl-rp1 ... invalid function` lines
-in dmesg are the tell). hardware-io's discovery reads the live mux with
-`pinctrl get` at startup, so whatever this overlay muxes is exactly what the
-hub announces — fewer channels muxed means fewer announced, no code change in
-either direction. The earlier two-channel form
-(`dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`) remains valid if only
-two channels are wanted.
+in dmesg are the tell).
 
 **Not two single-channel overlays.** The archived HAL (v3.1.0) prescribes
 
@@ -712,9 +731,8 @@ never. Read this before you need it, because the day you need it is the day the
 app will not open.
 
 A related use of pairing: `bellasreef devices import` needs an access token
-(`--token`, or `BELLASREEF_TOKEN` in the environment) from a paired client, and
-this repo's CLAUDE.md, "Deployment discipline," documents the seed-a-client-
-then-revoke-it sequence for getting one.
+from a paired client — the full sequence is the "A token for `bellasreef
+devices import`" section below.
 
 ### Running the CLI
 
@@ -808,6 +826,68 @@ Pair the replacement, then revoke the old one. Two commands, on purpose.
 
 If the window expires before you get to the app, run `pair` again. There is no
 cancel; a window is spent or it ages out.
+
+### A token for `bellasreef devices import`: seed a client, use it, revoke it
+
+`bellasreef devices import` writes through the API like any other client, so
+it needs an access token like one (`--token`, or `BELLASREEF_TOKEN` in the
+environment). Nothing on the hub holds a credential — deliberately — so the
+way to get one is to pair a short-lived client, use it, and revoke it.
+
+Everything below runs on the hub, from `~/bellasreef`, with the same compose
+flags as "Running the CLI" above; `curl` and `jq` talk to the API on its own
+loopback port.
+
+**1. Open the door.** On a hub that has never paired anything (fresh
+install, or right after a factory reset), print the setup code:
+
+```bash
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef setup-code
+# Setup code: 7KF2-9QMD
+```
+
+Each call **rotates** the code, so the printout you just got is the truth,
+not the one in an old deploy log. On a hub that already has paired devices,
+open a recovery window instead (`bellasreef pair`, previous section) — the
+pair call in step 2 then goes through the window, no `setup_code` field.
+
+**2. Pair a seed client:**
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/pair \
+  -H 'Content-Type: application/json' \
+  -d '{"client_name": "seed-cli", "setup_code": "7KF2-9QMD"}'
+# {"refresh_token": "...", "client_id": "..."}
+```
+
+**3. Exchange the refresh token for an access token:**
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8000/api/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"refresh_token": "<from step 2>"}'
+# {"access_token": "...", "expires_in": ...}
+```
+
+**4. Import:**
+
+```bash
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec \
+  -e BELLASREEF_TOKEN='<access token from step 3>' \
+  api bellasreef devices import /etc/bellasreef/devices.import.yaml
+```
+
+**5. Revoke the seed.** It was a credential for one job:
+
+```bash
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec api bellasreef revoke seed-cli
+```
+
+One ordering consequence on a fresh hub: pairing the seed with the setup
+code **completes setup**, so the app cannot use that code afterwards. Pair
+the app through a recovery window (previous section) — or pair the app
+first and skip the importer entirely: adopting devices from the app is the
+product path, and the importer exists for seeding a rebuilt hub from notes.
 
 ### Confirming the audit row landed
 
