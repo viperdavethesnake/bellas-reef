@@ -29,6 +29,7 @@ from bellasreef_contracts import (
     ChipState,
     DeviceAssignment,
     Heartbeat,
+    HostStatus,
     SensorReading,
     SensorRegistration,
     subjects,
@@ -77,6 +78,7 @@ REGISTRY_STREAM: Final = "BR_REGISTRY"
 CAPABILITY_STREAM: Final = "BR_CAPABILITY"
 ASSIGNMENT_STREAM: Final = "BR_ASSIGNMENT"
 CHIP_STREAM: Final = "BR_CHIP"
+HOST_STREAM: Final = "BR_HOST"
 
 STREAMS: Final = (
     StreamConfig(
@@ -130,6 +132,17 @@ STREAMS: Final = (
     StreamConfig(
         name=CHIP_STREAM,
         subjects=[subjects.ALL_CHIPS],
+        retention=RetentionPolicy.LIMITS,
+        storage=StorageType.FILE,
+        max_msgs_per_subject=1,
+    ),
+    # Host status: the hub machine's own vitals, one retained snapshot. The
+    # subject is a singleton so this stream holds exactly one message, which
+    # is the whole design — a status page's "now", not history (contracts
+    # 4.3.0, docs/superpowers/specs/2026-08-31-hub-status-design.md).
+    StreamConfig(
+        name=HOST_STREAM,
+        subjects=[subjects.ALL_HOSTS],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
         max_msgs_per_subject=1,
@@ -409,6 +422,16 @@ class Spine:
             subjects.chip(state.hardware_source, state.instance),
             state.model_dump_json().encode(),
         )
+
+    async def publish_host_status(self, status: HostStatus) -> None:
+        """Publish the hub machine's vitals, retained last-value.
+
+        Singleton subject: the stream keeps exactly one message, and a
+        consumer that starts late reads the newest snapshot.
+        """
+        if self._nc is None:
+            raise RuntimeError("spine not connected")
+        await self._nc.publish(subjects.host_status(), status.model_dump_json().encode())
 
     async def publish_audit(self, category: str, event: dict[str, object]) -> None:
         """Publish an audit event, stamped with an id the store dedups on.

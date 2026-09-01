@@ -53,6 +53,7 @@ from bellasreef_hardware_io.drivers.onewire import DS18B20
 from bellasreef_hardware_io.drivers.pca9685 import Pca9685Channel
 from bellasreef_hardware_io.drivers.pipwm import PiPwmChannel, chip_identity_and_facts
 from bellasreef_hardware_io.factory import build_from_assignments
+from bellasreef_hardware_io.host import HostStatusPublisher, HostStatusReader
 from bellasreef_hardware_io.safety import InterlockSupervisor, SafetyEvent
 from bellasreef_hardware_io.spine import CommandConsumer, Spine
 
@@ -196,6 +197,12 @@ class HardwareIO:
         #: life of the process; re-publish-on-refault is a future
         #: bus-fault story (spec 2026-08-19).
         self._published_chip_instances: set[tuple[str, str]] = set()
+        #: The hub machine's own vitals, published from the loop's tick on
+        #: its own cadence (host.py). Built here, before the spine connects,
+        #: which is why the publisher takes a getter.
+        self._host_status: HostStatusPublisher | None = HostStatusPublisher(
+            lambda: self.spine, HostStatusReader()
+        )
 
     # ------------------------------------------------------------- lifecycle
 
@@ -686,6 +693,8 @@ class HardwareIO:
             await self._beat_and_serve()
             await self._poll_due_sensors(now)
             self._refresh_latch_metrics()
+            if self._host_status is not None:
+                await self._host_status.maybe_publish(now)
 
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=self._loop_interval_s)

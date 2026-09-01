@@ -1068,6 +1068,64 @@
         "title": "HistoryView",
         "type": "object"
       },
+      "HubStatusView": {
+        "additionalProperties": false,
+        "description": "The hub machine's own vitals, as last published by hardware-io.\n\nThe Hub status leaf's data source (System tab, design\ndocs/superpowers/specs/2026-08-31-hub-status-design.md): a snapshot, not\nhistory. `updated_at` is the message's own emitted_at \u2014 receipt time\nwould claim freshness the publisher never asserted.",
+        "properties": {
+          "cpu_count": {
+            "title": "Cpu Count",
+            "type": "integer"
+          },
+          "load_15m": {
+            "title": "Load 15M",
+            "type": "number"
+          },
+          "load_1m": {
+            "title": "Load 1M",
+            "type": "number"
+          },
+          "load_5m": {
+            "title": "Load 5M",
+            "type": "number"
+          },
+          "mem_available_kb": {
+            "title": "Mem Available Kb",
+            "type": "integer"
+          },
+          "mem_total_kb": {
+            "title": "Mem Total Kb",
+            "type": "integer"
+          },
+          "temp_c": {
+            "title": "Temp C",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "uptime_s": {
+            "title": "Uptime S",
+            "type": "number"
+          }
+        },
+        "required": [
+          "load_1m",
+          "load_5m",
+          "load_15m",
+          "cpu_count",
+          "mem_total_kb",
+          "mem_available_kb",
+          "uptime_s",
+          "updated_at"
+        ],
+        "title": "HubStatusView",
+        "type": "object"
+      },
       "Info": {
         "additionalProperties": false,
         "properties": {
@@ -1879,7 +1937,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "4.2.0"
+    "version": "4.3.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2855,6 +2913,58 @@
         "summary": "History",
         "tags": [
           "history"
+        ]
+      }
+    },
+    "/api/v1/hub-status": {
+      "get": {
+        "description": "The hub machine's own vitals: load, memory, SoC temperature, uptime.\n\nThe Hub status leaf's data source. 404 until hardware-io's first\npublish reaches this process \u2014 a fresh boot, or a pre-4.3.0\nhardware-io \u2014 which a client renders as \"not available\", not an\nerror. Read through app.state.background so what is served is what\nis actually running, never a copy that could go stale.",
+        "operationId": "getHubStatus",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HubStatusView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No host status published yet"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Hub Status",
+        "tags": [
+          "system"
         ]
       }
     },

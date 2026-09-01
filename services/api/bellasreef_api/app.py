@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
 from time import monotonic
-from typing import Annotated, Any, Final, Literal, Protocol
+from typing import Annotated, Any, Final, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from bellasreef_contracts import (
@@ -79,6 +79,7 @@ from bellasreef_api.registry import (
     AssignmentPublisher,
     CapabilityConsumer,
     ChipConsumer,
+    HostStatusConsumer,
     RegistryConsumer,
 )
 from bellasreef_api.security import (
@@ -313,6 +314,30 @@ class ChipStateView(BaseModel):
     #: INVRT, and the like. Shape varies by source; the view does not pin it.
     facts: dict[str, str | int | float | bool]
     announced_at: datetime
+
+
+class HubStatusView(BaseModel):
+    """The hub machine's own vitals, as last published by hardware-io.
+
+    The Hub status leaf's data source (System tab, design
+    docs/superpowers/specs/2026-08-31-hub-status-design.md): a snapshot, not
+    history. `updated_at` is the message's own emitted_at — receipt time
+    would claim freshness the publisher never asserted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    load_1m: float
+    load_5m: float
+    load_15m: float
+    cpu_count: int
+    mem_total_kb: int
+    mem_available_kb: int
+    #: SoC temperature in °C; null when the host has no readable thermal
+    #: zone — a real state, never rendered as a fabricated 0.
+    temp_c: float | None = None
+    uptime_s: float
+    updated_at: datetime
 
 
 #: Which announced source a driver type binds against. A DS18B20 is a probe on
@@ -817,6 +842,7 @@ def build_app(
     registry = RegistryConsumer(nats_url, store) if nats_url else None
     capabilities = CapabilityConsumer(nats_url, store) if nats_url else None
     chips = ChipConsumer(nats_url, store) if nats_url else None
+    host_status = HostStatusConsumer(nats_url) if nats_url else None
     assignments = AssignmentPublisher(nats_url) if nats_url else None
     telemetry = (
         TelemetryWriter(nats_url, vm_url, store, durable_suffix=durable_suffix)
@@ -916,6 +942,7 @@ def build_app(
             ("registry consumer", registry),
             ("capability consumer", capabilities),
             ("chip consumer", chips),
+            ("host status consumer", host_status),
             ("telemetry writer", telemetry),
             ("audit writer", audit_writer),
         ):
@@ -928,7 +955,14 @@ def build_app(
         try:
             yield
         finally:
-            for component in (registry, capabilities, chips, telemetry, audit_writer):
+            for component in (
+                registry,
+                capabilities,
+                chips,
+                host_status,
+                telemetry,
+                audit_writer,
+            ):
                 if component is not None:
                     await component.close()
             # Last out, first in symmetry with the start above: the port must
@@ -966,6 +1000,7 @@ def build_app(
         "registry consumer": registry,
         "capability consumer": capabilities,
         "chip consumer": chips,
+        "host status consumer": host_status,
         "telemetry writer": telemetry,
         "audit writer": audit_writer,
     }
@@ -1046,6 +1081,43 @@ def build_app(
         same reasoning as `/api/v1/capabilities`.
         """
         return [ChipStateView(**row) for row in await store.list_chip_state()]
+
+    @app.get(
+        "/api/v1/hub-status",
+        response_model=HubStatusView,
+        tags=["system"],
+        operation_id="getHubStatus",
+        responses={401: AUTH_401, 404: {"description": "No host status published yet"}},
+    )
+    async def get_hub_status(
+        request: Request,
+        _: Annotated[UUID, Depends(current_client)],
+    ) -> HubStatusView:
+        """The hub machine's own vitals: load, memory, SoC temperature, uptime.
+
+        The Hub status leaf's data source. 404 until hardware-io's first
+        publish reaches this process — a fresh boot, or a pre-4.3.0
+        hardware-io — which a client renders as "not available", not an
+        error. Read through app.state.background so what is served is what
+        is actually running, never a copy that could go stale.
+        """
+        consumer = cast(
+            "HostStatusConsumer | None", request.app.state.background.get("host status consumer")
+        )
+        latest = consumer.latest if consumer is not None else None
+        if latest is None:
+            raise HTTPException(status_code=404, detail="no host status published yet")
+        return HubStatusView(
+            load_1m=latest.load_1m,
+            load_5m=latest.load_5m,
+            load_15m=latest.load_15m,
+            cpu_count=latest.cpu_count,
+            mem_total_kb=latest.mem_total_kb,
+            mem_available_kb=latest.mem_available_kb,
+            temp_c=latest.temp_c,
+            uptime_s=latest.uptime_s,
+            updated_at=latest.emitted_at,
+        )
 
     @app.get("/api/v1/info", response_model=Info, tags=["discovery"], operation_id="info")
     async def info() -> Info:

@@ -23,6 +23,7 @@ from bellasreef_contracts import (
     CapabilityAnnouncement,
     ChipState,
     DeviceAssignment,
+    HostStatus,
     SensorRegistration,
     subjects,
 )
@@ -295,6 +296,87 @@ class ChipConsumer:
             log.exception(
                 "could not store chip state",
                 extra={"hardware_source": state.hardware_source, "instance": state.instance},
+            )
+        with contextlib.suppress(Exception):
+            await msg.ack()
+
+
+class HostStatusConsumer:
+    """Subscribes to the hub machine's vitals and keeps the latest in memory.
+
+    Same ephemeral push-subscription shape as :class:`ChipConsumer` (and for
+    the same durable-contention reasons), but no store at all: a 30 s
+    snapshot is process state, not a table — the retained `BR_HOST` stream
+    replays the last value on API restart, which is all the durability it
+    deserves (design: docs/superpowers/specs/2026-08-31-hub-status-design.md).
+    """
+
+    RETRY_S = 5.0
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+        self._nc: Client | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._subscribed = False
+        #: The newest snapshot seen, or None before the first message — the
+        #: state `GET /api/v1/hub-status` serves as 404.
+        self.latest: HostStatus | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._subscribed and self._nc is not None and self._nc.is_connected
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._subscribe_forever())
+
+    async def _subscribe_forever(self) -> None:
+        while True:
+            try:
+                await self._subscribe()
+                return
+            except asyncio.CancelledError:
+                raise
+            except NotFoundError:
+                log.info(
+                    "host stream not provisioned yet; waiting",
+                    extra={"retry_in_s": self.RETRY_S},
+                )
+            except Exception:
+                log.exception("host status consumer could not subscribe; retrying")
+            await asyncio.sleep(self.RETRY_S)
+
+    async def _subscribe(self) -> None:
+        if self._nc is None or not self._nc.is_connected:
+            self._nc = await nats.connect(self._url)
+        js = self._nc.jetstream()
+        await js.subscribe(
+            subjects.ALL_HOSTS,
+            cb=self._on_message,
+            config=ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT),
+        )
+        self._subscribed = True
+        log.info("host status consumer subscribed", extra={"subject": subjects.ALL_HOSTS})
+
+    async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._nc is not None:
+            with contextlib.suppress(Exception):
+                await self._nc.close()
+            self._nc = None
+
+    async def _on_message(self, msg: Msg) -> None:
+        try:
+            self.latest = HostStatus.model_validate_json(msg.data)
+        except ValidationError:
+            # Ack, don't nak: redelivering a message that failed validation
+            # once fails it forever — same reasoning as the chip consumer.
+            log.warning(
+                "host status message did not validate; ignored",
+                extra={"subject": msg.subject},
             )
         with contextlib.suppress(Exception):
             await msg.ack()
