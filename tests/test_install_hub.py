@@ -2841,3 +2841,30 @@ def test_check_only_uninstall_is_an_error(tmp_path: Path) -> None:
         result.stderr
     )
     assert "install-hub.sh" in result.stderr, result.stderr
+
+
+def test_phase2_accepts_a_1gb_board_without_warning(tmp_path: Path) -> None:
+    # The floor is measured now, not guessed (David 2026-08-31: "we should
+    # know now what the running stack looks like"): coco, a 1 GB Pi 5
+    # reporting 1014464 kB, runs all six services plus telemetry in ~580 MB
+    # with ~400 MB headroom. A 1 GB board is a supported hub and must not be
+    # greeted with a warning; a 512 MB board genuinely does not fit.
+    stubs = make_stubs(tmp_path, {"free": 'echo "Mem: 1014464"'})
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "memory 990 MB" in out, out
+    assert "below the recommended" not in out, out
+    assert result.returncode == 0
+
+
+def test_phase2_still_warns_below_the_measured_floor(tmp_path: Path) -> None:
+    stubs = make_stubs(tmp_path, {"free": 'echo "Mem: 524288"'})  # a 512 MB board
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    write_manifest_host_paths(root)
+    result = run_script("--check-only", root=root, stubs=stubs)
+    out = strip_ansi(result.stdout)
+    assert "below the recommended" in out, out

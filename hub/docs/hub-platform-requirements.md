@@ -60,7 +60,7 @@ api.
 
 | | Floor | Reference (Pi 5) |
 |---|---|---|
-| RAM | 2 GB is the practical minimum and leaves no headroom | 8 GB |
+| RAM | 1 GB — measured, not guessed: coco (1 GB Pi 5, 2026-08-31) runs all six services plus live telemetry in ~580 MB with ~400 MB headroom. 512 MB does not fit | 8 GB (dev); 1 GB (coco, production) |
 | Storage | 16 GB is the practical minimum. Images alone are several GB before any data | 115 GB |
 | Cores | 2 | 4 |
 
