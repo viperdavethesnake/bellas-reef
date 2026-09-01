@@ -856,7 +856,7 @@ This is an artefact of the kill API, **not** of the recovery path — a genuine
 stall exits the process with nobody calling `docker kill`. It matters because
 testing recovery the obvious way reports a failure that production would not
 have, and could be misread as "the restart policy is broken." Signal PID 1 from
-inside. `scripts/drill-restart.sh` does, and `hub/docs/host-setup.md` §7 records
+inside. `hub/scripts/drill-restart.sh` does, and `hub/docs/host-setup.md` §7 records
 both rows.
 
 Related: `.State.ExitCode` reads `0` on a *running* container even when its

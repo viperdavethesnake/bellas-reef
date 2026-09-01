@@ -9,10 +9,12 @@
 # supervisor itself stops running — which the in-process tests cannot, because a
 # frozen process cannot assert anything about itself.
 #
-# Needs the real runtime and the real image, so it runs on the Pi, not in CI.
+# Needs the real runtime and the real image, so it runs on the hub, not in
+# CI — and only on the hub, from the hub checkout, like every other script
+# here (the ssh-from-the-workstation mode this once had was the deploy-pi.sh
+# shape, removed with it):
 #
-#   ./scripts/drill-restart.sh            # local (on the Pi)
-#   ./scripts/drill-restart.sh reef       # over ssh
+#   ./scripts/drill-restart.sh
 #
 # What replaced what, when the host systemd units were deleted on 2026-08-13:
 # systemd used to tell you why it killed the unit ("Watchdog timeout" in the
@@ -25,18 +27,12 @@
 set -uo pipefail
 
 SERVICE=hardware-io
-REMOTE="${1:-}"
-REPO=/home/david/bellasreef
 
-COMPOSE_BASE="docker compose -f hub/deploy/compose.yaml --env-file hub/deploy/.env"
-COMPOSE_ARMED="docker compose -f hub/deploy/compose.yaml -f deploy/compose.drill.yaml --env-file hub/deploy/.env"
+COMPOSE_BASE="docker compose -f deploy/compose.yaml --env-file deploy/.env"
+COMPOSE_ARMED="docker compose -f deploy/compose.yaml -f deploy/compose.drill.yaml --env-file deploy/.env"
 
-if [[ -n "$REMOTE" ]]; then
-    run() { ssh -o ControlPath=none "$REMOTE" "cd $REPO && $1"; }
-else
-    cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-    run() { bash -c "$1"; }
-fi
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+run() { bash -c "$1"; }
 
 # Dump the evidence BEFORE the trap disarms, because disarming recreates the
 # container and takes its logs with it. Learned the hard way on 2026-08-14: the

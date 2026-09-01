@@ -1998,11 +1998,26 @@ def test_phase5_creates_the_bind_mount_directories_owned_by_the_image_uid(tmp_pa
     ), result.stdout
 
 
+#: GNU-stat answers for `stat -c '%u %g %a' <dir>`. The real stat is hidden
+#: from PATH: its answer would be the runner's own uid and the BSD flag
+#: dialect on macOS, making writability a property of the machine running
+#: the suite.
+STAT_ALL_CONTAINER_OWNED = 'echo "1000 1000 755"'
+
+#: The coco 2026-08-31 debris: a backups directory left root-owned 0755 by a
+#: failed earlier install. The other directory answers as the standard the
+#: installer itself creates.
+STAT_BACKUPS_ROOT_OWNED = (
+    'case "${!#}" in */backups) echo "0 0 755" ;; *) echo "1000 1000 755" ;; esac'
+)
+
+
 def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
     log = tmp_path / "actions.log"
     stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
     write_phase5_stubs(stubs)
     write_stub(stubs, "install", install_stub(log))
+    write_stub(stubs, "stat", STAT_ALL_CONTAINER_OWNED)
     root = phase5_root(tmp_path)
     (root / "home/tester/backups").mkdir(parents=True)
     (root / "etc/bellasreef").mkdir(parents=True)
@@ -2013,6 +2028,58 @@ def test_phase5_leaves_existing_directories_alone(tmp_path: Path) -> None:
     assert "directory /home/tester/backups exists; left as is" in strip_ansi(result.stdout), (
         result.stdout
     )
+
+
+def test_phase5_offers_to_chown_an_existing_dir_the_container_cannot_write(
+    tmp_path: Path,
+) -> None:
+    # coco's maiden update, 2026-08-31: "directory exists; left as is" passed
+    # a root-owned 0755 backups directory — debris from a failed morning
+    # install — and the first backup died on it. An existing directory now
+    # meets the same standard as a created one, and the fix is offered under
+    # consent rather than hand-applied after the failure.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    write_stub(stubs, "stat", STAT_BACKUPS_ROOT_OWNED)
+    write_stub(stubs, "chown", f'echo "chown $*" >> "{log}"')
+    root = phase5_root(tmp_path)
+    (root / "home/tester/backups").mkdir(parents=True)
+
+    result = run_script("--yes", root=root, stubs=stubs, env={**FAST_POLL, "HOME": "/home/tester"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"chown 1000:1000 {root}/home/tester/backups" in log.read_text()
+    assert "chowning /home/tester/backups to the container uid" in strip_ansi(result.stdout), (
+        result.stdout
+    )
+
+
+def test_phase5_fails_when_chown_of_an_unwritable_dir_is_declined(tmp_path: Path) -> None:
+    # Declined consent is a decision, and the script fails rather than
+    # starting a stack whose first backup cannot be written — with the exact
+    # remedy printed, per the deploy-only-via-script rule.
+    log = tmp_path / "actions.log"
+    stubs = make_stubs(tmp_path, {"getent": GOOD_GETENT, "docker": inert_compose_docker()})
+    write_phase5_stubs(stubs)
+    write_stub(stubs, "install", install_stub(log))
+    write_stub(stubs, "stat", STAT_BACKUPS_ROOT_OWNED)
+    write_stub(stubs, "chown", f'echo "chown $*" >> "{log}"')
+    root = phase5_root(tmp_path)
+    (root / "home/tester/backups").mkdir(parents=True)
+
+    result = run_script(
+        root=root,
+        stubs=stubs,
+        env={**FAST_POLL, "HOME": "/home/tester", "IH_ASSUME_NO_TTY": "1"},
+    )
+    stripped = strip_ansi(result.stdout)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "uid 1000 cannot write it" in stripped, result.stdout
+    assert "sudo chown 1000:1000 /home/tester/backups" in stripped, result.stdout
+    # The run stopped before anything wrote the action log — which is itself
+    # the assertion: no chown ran, and neither did the unit install after it.
+    assert not log.exists() or "chown 1000" not in log.read_text()
 
 
 def test_phase5_fails_before_creating_anything_when_a_directory_key_is_missing(
@@ -2841,6 +2908,133 @@ def test_check_only_uninstall_is_an_error(tmp_path: Path) -> None:
         result.stderr
     )
     assert "install-hub.sh" in result.stderr, result.stderr
+
+
+# ------------------------------------------------------------------ --purge
+#
+# Ruled 2026-08-31: scorched earth on top of --uninstall — also the images,
+# the avahi record, daemon.json (only if untouched since install) and
+# /etc/bellasreef. Backups alone survive, plus the checkout this script runs
+# from and the docker login.
+
+#: Byte-for-byte what ih_write_docker_daemon_json writes. Purge removes the
+#: file only when it still reads exactly like this — an edited one is a
+#: stranger's config, warned about and left.
+INSTALLER_DAEMON_JSON = (
+    '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+)
+
+
+def purge_fixture(tmp_path: Path, daemon_json: str = INSTALLER_DAEMON_JSON) -> tuple[Path, Path]:
+    """A full install plus everything --purge is ruled to remove, and a
+    backups directory that must survive. Returns (root, stub log)."""
+    root = tmp_path / "root"
+    unit = installed_unit_path(root)
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    staged_env_path(root).write_text("POSTGRES_PASSWORD=x\n")
+    record = root / "etc/avahi/services/bellasreef.service"
+    record.parent.mkdir(parents=True)
+    record.write_text("<service-group/>\n")
+    dj = root / "etc/docker/daemon.json"
+    dj.parent.mkdir(parents=True)
+    dj.write_text(daemon_json)
+    (root / "etc/bellasreef").mkdir(parents=True)
+    (root / "etc/bellasreef/devices.import.yaml").write_text("devices: []\n")
+    (root / "home/tester/backups").mkdir(parents=True)
+    (root / "home/tester/backups/keepme.dump").write_text("precious\n")
+
+    log = uninstall_stub_log(tmp_path)
+    stubs = tmp_path / "bin"
+    write_uninstall_systemctl_stub(stubs, log)
+    write_uninstall_sudo_stub(stubs, log)
+    write_stub(
+        stubs,
+        "docker",
+        f'echo "docker $*" >> "{log}"\n'
+        'if [[ "$1" == "compose" ]]; then\n'
+        '    for a in "$@"; do\n'
+        '        if [[ "$a" == "--images" ]]; then\n'
+        '            printf "ghcr.io/tester/bellasreef-api:v1\\nnats:2.10\\n"; exit 0\n'
+        "        fi\n"
+        "    done\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit 0",
+    )
+    return root, log
+
+
+def test_purge_without_uninstall_is_an_error(tmp_path: Path) -> None:
+    result = run_script("--purge", root=tmp_path / "root")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--uninstall" in result.stderr, result.stderr
+
+
+def test_purge_removes_what_uninstall_keeps_except_backups(tmp_path: Path) -> None:
+    root, log = purge_fixture(tmp_path)
+
+    result = run_script(
+        "--uninstall", "--purge", root=root, stubs=tmp_path / "bin", input="purge\n"
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "Type 'purge' to proceed" in combined, combined
+
+    log_text = log.read_text()
+    assert "rmi -f ghcr.io/tester/bellasreef-api:v1 nats:2.10" in log_text, log_text
+    # The image list is read from compose config before the stack comes down;
+    # afterwards there is no .env left to ask.
+    assert log_text.index("--images") < log_text.index("down -v"), log_text
+
+    assert not (root / "etc/avahi/services/bellasreef.service").exists()
+    assert not (root / "etc/docker/daemon.json").exists()
+    assert not (root / "etc/bellasreef").exists()
+    assert (root / "home/tester/backups/keepme.dump").exists(), "backups must survive a purge"
+
+
+def test_purge_leaves_an_edited_daemon_json_alone(tmp_path: Path) -> None:
+    edited = (
+        '{\n  "log-driver": "json-file",\n'
+        '  "log-opts": { "max-size": "50m" },\n  "dns": ["1.1.1.1"]\n}\n'
+    )
+    root, _log = purge_fixture(tmp_path, daemon_json=edited)
+
+    result = run_script(
+        "--uninstall", "--purge", root=root, stubs=tmp_path / "bin", input="purge\n"
+    )
+    combined = strip_ansi(result.stdout + result.stderr)
+    assert result.returncode == 0, combined
+    assert (root / "etc/docker/daemon.json").read_text() == edited
+    assert "left in place" in combined, combined
+
+
+def test_purge_confirmation_refuses_the_uninstall_word(tmp_path: Path) -> None:
+    # A purge confirmed with the smaller word is not confirmed. Same standard
+    # as factory-reset's typed confirmation: the word names what happens.
+    root, log = purge_fixture(tmp_path)
+
+    result = run_script(
+        "--uninstall", "--purge", root=root, stubs=tmp_path / "bin", input="uninstall\n"
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "not confirmed" in combined.lower(), combined
+    assert not log.exists() or log.read_text() == "", "a mutating command ran"
+    assert (root / "etc/bellasreef").exists()
+
+
+def test_purge_dry_run_changes_nothing(tmp_path: Path) -> None:
+    root, log = purge_fixture(tmp_path)
+
+    result = run_script("--dry-run", "--uninstall", "--purge", root=root, stubs=tmp_path / "bin")
+    combined = strip_ansi(result.stdout + result.stderr)
+    assert result.returncode == 0, combined
+    assert "would" in combined.lower(), combined
+    assert not log.exists() or log.read_text() == "", "a mutating command ran"
+    assert (root / "etc/avahi/services/bellasreef.service").exists()
+    assert (root / "etc/docker/daemon.json").exists()
+    assert (root / "etc/bellasreef").exists()
 
 
 def test_phase2_accepts_a_1gb_board_without_warning(tmp_path: Path) -> None:
