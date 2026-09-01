@@ -849,9 +849,16 @@ def build_app(
         if nats_url and vm_url
         else None
     )
-    audit_writer = (
-        AuditWriter(nats_url, engine, durable=f"audit-writer{durable_suffix}") if nats_url else None
-    )
+    # No durable_suffix here, deliberately — unlike the telemetry writer one
+    # line up. BR_AUDIT is a workqueue: the server permits one consumer per
+    # filter subject regardless of names, so a per-process name buys no
+    # isolation and converts every cleanup race into a permanent lockout — a
+    # leftover consumer under an old name hard-collides ("filtered consumer
+    # not unique"), where a same-name leftover is simply re-bound. That
+    # lockout is the recurring CI flake (2026-08-31, PR #86 attempt 1): the
+    # writer failed its first subscribe at startup and every retry after it,
+    # for the whole test window.
+    audit_writer = AuditWriter(nats_url, engine, durable="audit-writer") if nats_url else None
 
     # CLAUDE.md, "Code standards": "Every service: healthcheck endpoint,
     # structured JSON logs, metrics endpoint. Day 1, not later." The API

@@ -402,3 +402,31 @@ def test_naive_timestamp_falls_back_to_drain_time() -> None:
     assert isinstance(occurred_at, datetime)
     assert occurred_at.tzinfo is not None
     assert abs((datetime.now(UTC) - occurred_at).total_seconds()) < 60
+
+
+def test_the_composed_apps_audit_durable_ignores_the_suffix() -> None:
+    """BR_AUDIT is a workqueue: one consumer per filter subject, enforced by
+    the server regardless of names. A per-process durable name buys nothing
+    there — and it converts every cleanup race into a permanent lockout,
+    because a leftover consumer under an old name hard-collides ("filtered
+    consumer not unique", err 10100) where a same-name leftover would simply
+    be re-bound. That lockout is the CI flake of 2026-08-31 (PR #86 attempt
+    1): the writer's first subscribe failed at startup and every 5 s retry
+    failed identically for the whole 60 s window.
+
+    The suffix exists for the telemetry durables, whose streams are not
+    workqueues and where per-test isolation is right. The asymmetry here is
+    deliberate; this test pins it. Pure — build_app constructs components
+    without connecting to anything.
+    """
+    from bellasreef_api.app import build_app
+
+    app = build_app(
+        create_async_engine("postgresql+asyncpg://unused/unused"),
+        nats_url="nats://unused",
+        vm_url="http://unused",
+        durable_suffix="-test-deadbeef",
+        metrics_port=0,
+    )
+    assert app.state.background["audit writer"]._durable == "audit-writer"
+    assert app.state.background["telemetry writer"]._suffix == "-test-deadbeef"

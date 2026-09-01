@@ -82,7 +82,8 @@ async def clear_audit_consumers() -> None:
     try:
         js = nc.jetstream()
         remaining: list[str] = []
-        for _ in range(5):
+        empty_listings = 0
+        for _ in range(6):
             try:
                 consumers = await js.consumers_info("BR_AUDIT")
             except NotFoundError:
@@ -97,7 +98,20 @@ async def clear_audit_consumers() -> None:
                 await asyncio.sleep(0.5)
                 continue
             if not consumers:
-                return
+                # Empty once is not proof: a consumer whose creation was in
+                # flight during that listing (the previous test's writer,
+                # cancelled mid-add_consumer, can materialize server-side
+                # moments later) is invisible to it, and returning on the
+                # first empty answer was the hole through which the
+                # 2026-08-31 flake escaped both this clear and the previous
+                # test's. Two consecutive empty listings, a beat apart, is
+                # the standard.
+                empty_listings += 1
+                if empty_listings >= 2:
+                    return
+                await asyncio.sleep(0.2)
+                continue
+            empty_listings = 0
             remaining = [c.name for c in consumers]
             for name in remaining:
                 with contextlib.suppress(Exception):
