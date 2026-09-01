@@ -68,6 +68,12 @@ HIDDEN_FROM_PATH = frozenset(
         "usermod",
         "cp",
         "install",
+        "chown",
+        # Phase 5's writability check on an existing bind-mount directory.
+        # The real stat would answer with the runner's own uid — and the BSD
+        # flag dialect on macOS — making writability a property of the
+        # machine running the suite.
+        "stat",
         # Phase 3's pin-mux evidence. A sysfs pwmchip directory exists whether
         # or not any header pin is muxed to PWM (the standing trap in
         # CLAUDE.md's verified host facts), so pinctrl is what turns "chips

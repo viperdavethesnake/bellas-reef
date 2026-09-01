@@ -27,6 +27,7 @@ IH_DRY_RUN=0
 IH_CHECK_ONLY=0
 IH_YES=0
 IH_UNINSTALL=0
+IH_PURGE=0
 IH_FAILURES=()
 IH_UNVERIFIED=()
 
@@ -96,6 +97,7 @@ Run this on the hub itself, from a clone of this repo.
   --dry-run      report every action, mutate nothing
   --yes          accept every offered action without prompting
   --uninstall    remove the stack, the boot unit and deploy/.env from this machine; keeps backups, /etc/bellasreef, host config, images, and this checkout
+  --purge        with --uninstall: also remove the images, the avahi record, /etc/docker/daemon.json (only if untouched since install) and /etc/bellasreef; backups alone survive
   --help         this text
 
 Phases:
@@ -115,6 +117,7 @@ ih_parse_args() {
             --dry-run)    IH_DRY_RUN=1; shift ;;
             --yes)        IH_YES=1; shift ;;
             --uninstall)  IH_UNINSTALL=1; shift ;;
+            --purge)      IH_PURGE=1; shift ;;
             --help|-h)    ih_usage; exit 0 ;;
             *)            printf 'install-hub: unknown option %s\n' "$1" >&2
                           ih_usage >&2
@@ -125,6 +128,13 @@ ih_parse_args() {
     # and only mutates. Together they say opposite things about the same run.
     if (( IH_CHECK_ONLY && IH_UNINSTALL )); then
         printf 'install-hub: --check-only and --uninstall are contradictory\n' >&2
+        ih_usage >&2
+        exit 2
+    fi
+    # --purge on its own would read as "purge what?" — it only sharpens an
+    # uninstall, so demanding the pair keeps the destructive flag explicit.
+    if (( IH_PURGE && ! IH_UNINSTALL )); then
+        printf 'install-hub: --purge requires --uninstall\n' >&2
         ih_usage >&2
         exit 2
     fi
@@ -285,11 +295,18 @@ ih_check_docker_logging() {
     return 0
 }
 
+# One source for the file's content: the writer below and --purge's
+# untouched-since-install comparison must mean the same bytes, or purge
+# would refuse to remove the very file the installer wrote.
+ih_docker_daemon_json_content() {
+    printf '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n'
+}
+
 ih_write_docker_daemon_json() {
     local tmp rc f
     f="$(ih_docker_daemon_json)"
     tmp="$(mktemp)" || return 1
-    printf '{\n  "log-driver": "json-file",\n  "log-opts": { "max-size": "10m", "max-file": "3" }\n}\n' > "$tmp"
+    ih_docker_daemon_json_content > "$tmp"
     sudo mkdir -p "$(dirname "$f")" && sudo install -m 0644 "$tmp" "$f"; rc=$?
     rm -f "$tmp"
     return $rc
@@ -565,6 +582,29 @@ ih_run() {
     fi
     ih_pass "$description"
     return 0
+}
+
+# Whether the container uid (1000, the api's user) can write <dir>, judged
+# from owner, group and mode — the same standard the created directories meet
+# (install -d -o 1000 -g 1000 -m 0755). Supplementary groups and ACLs are not
+# consulted. Exists because "directory exists; left as is" once passed a
+# root-owned 0755 backups directory on coco — debris from a failed earlier
+# install — and the first backup died on it (2026-08-31).
+ih_dir_writable_by_container() {
+    local dir="$1" uid gid mode bit
+    read -r uid gid mode < <(stat -c '%u %g %a' "$dir" 2>/dev/null)
+    [[ -n "${mode:-}" ]] || return 1
+    # %a prints no leading zeros, and setuid/sticky bits add a fourth digit;
+    # pad so the last three characters are always owner/group/other.
+    mode="000${mode}"
+    if [[ "$uid" == "1000" ]]; then
+        bit="${mode: -3:1}"
+    elif [[ "$gid" == "1000" ]]; then
+        bit="${mode: -2:1}"
+    else
+        bit="${mode: -1}"
+    fi
+    (( bit & 2 ))
 }
 
 ih_offer_install() {
@@ -1110,7 +1150,18 @@ ih_phase5_deploy() {
     fi
     for d in "$backup_dir" "$etc_dir"; do
         if [[ -d "${IH_ROOT}${d}" ]]; then
-            ih_pass "directory ${d} exists; left as is"
+            # An existing directory meets the same standard as a created one.
+            # "left as is" once passed root-owned debris from a failed earlier
+            # install, and the first backup died on it (coco, 2026-08-31).
+            if ih_dir_writable_by_container "${IH_ROOT}${d}"; then
+                ih_pass "directory ${d} exists; left as is"
+            elif ih_confirm "chown ${d} to the container uid 1000?"; then
+                ih_run "chowning ${d} to the container uid" \
+                    sudo chown 1000:1000 "${IH_ROOT}${d}" || return 1
+            else
+                ih_fail "directory ${d} exists but the container uid 1000 cannot write it; the first backup would fail. Fix: sudo chown 1000:1000 ${d}"
+                return 1
+            fi
         else
             ih_run "creating ${d} (owned by the container uid 1000)" \
                 sudo install -d -m 0755 -o 1000 -g 1000 "${IH_ROOT}${d}" || return 1
@@ -1183,8 +1234,12 @@ ih_phase5_deploy() {
 IH_UNINSTALL_VOLUMES=(bellasreef_postgres-data bellasreef_vm-data bellasreef_nats-data)
 
 # Destructive enough to ask every time — --yes is for the install's offered
-# remediations, not for this. There is no bypass flag for this prompt.
+# remediations, not for this. There is no bypass flag for this prompt. The
+# typed word names what happens: 'purge' will not confirm a plain uninstall
+# and 'uninstall' will not confirm a purge.
 ih_uninstall_confirm() {
+    local word="uninstall"
+    (( IH_PURGE )) && word="purge"
     printf '\n'
     printf '  This removes the Bella'"'"'s Reef stack from this machine.\n'
     printf '\n'
@@ -1193,23 +1248,31 @@ ih_uninstall_confirm() {
     printf '      (every pairing, every device, all history)\n'
     printf '    - the bellasreef.service boot unit\n'
     printf '    - deploy/.env\n'
+    if (( IH_PURGE )); then
+        printf '    - the pulled images\n'
+        printf '    - the _bellasreef._tcp avahi record\n'
+        printf '    - /etc/docker/daemon.json (only if untouched since install)\n'
+        printf '    - /etc/bellasreef\n'
+    fi
     printf '\n'
     printf '  This keeps:\n'
     printf '    - the backups directory\n'
-    printf '    - /etc/bellasreef\n'
-    printf '    - /etc/docker/daemon.json\n'
-    printf '    - the avahi configuration\n'
+    if (( ! IH_PURGE )); then
+        printf '    - /etc/bellasreef\n'
+        printf '    - /etc/docker/daemon.json\n'
+        printf '    - the avahi configuration\n'
+        printf '    - the pulled images\n'
+    fi
     printf '    - the docker login on this machine\n'
-    printf '    - the pulled images\n'
     printf '    - this checkout\n'
     printf '\n'
     # A plain `read -p` prints nothing at all when stdin is not a terminal —
     # which is exactly how the test suite drives this — so the prompt is
     # printed here rather than left to -p, and read separately.
-    printf "  Type 'uninstall' to proceed: "
+    printf "  Type '%s' to proceed: " "$word"
     local answer
     read -r answer
-    [[ "$answer" == "uninstall" ]]
+    [[ "$answer" == "$word" ]]
 }
 
 # Step 2: stack + volumes down. A working deploy/.env means docker compose
@@ -1258,23 +1321,100 @@ ih_uninstall_stack() {
     done
 }
 
+# The scorched-earth half of --uninstall --purge (ruled 2026-08-31): the
+# images, the avahi record, daemon.json when it is still exactly what the
+# installer wrote, and /etc/bellasreef. Backups survive, along with this
+# checkout and the docker login — none of the three is this script's to
+# remove even at its most destructive.
+ih_purge_extras() {
+    local images="$1"
+
+    if (( IH_DRY_RUN )); then
+        ih_would "remove the stack's images (read from compose config)"
+        ih_would "remove /etc/avahi/services/bellasreef.service"
+        ih_would "remove /etc/docker/daemon.json if untouched since install"
+        ih_would "remove /etc/bellasreef"
+        return 0
+    fi
+
+    # The list was read from compose config before the stack came down —
+    # afterwards there is no deploy/.env left to ask. Without one there is no
+    # authoritative list, so only images that name bellasreef go, and the
+    # spine images are left rather than guessed at.
+    local -a imgs=()
+    local line
+    if [[ -n "$images" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && imgs+=("$line")
+        done <<<"$images"
+    else
+        ih_warn "no deploy/.env; removing only images that name bellasreef (spine images left)"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && imgs+=("$line")
+        done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep bellasreef)
+    fi
+    if (( ${#imgs[@]} > 0 )); then
+        ih_run "removing ${#imgs[@]} image(s)" docker rmi -f "${imgs[@]}"
+    else
+        ih_warn "no images to remove"
+    fi
+
+    # avahi watches its services directory; removing the record unpublishes
+    # it without a daemon restart. The allow-interfaces line stays — it is
+    # an exclusion of Docker bridges, not part of the stack.
+    local record="${IH_ROOT}/etc/avahi/services/bellasreef.service"
+    if [[ -f "$record" ]]; then
+        ih_run "removing the _bellasreef._tcp service record" sudo rm -f "$record"
+    else
+        ih_warn "no _bellasreef._tcp service record installed"
+    fi
+
+    local dj
+    dj="$(ih_docker_daemon_json)"
+    if [[ ! -f "$dj" ]]; then
+        ih_warn "no /etc/docker/daemon.json to remove"
+    elif [[ "$(cat "$dj")" == "$(ih_docker_daemon_json_content)" ]]; then
+        ih_run "removing /etc/docker/daemon.json (untouched since install)" sudo rm -f "$dj"
+    else
+        ih_warn "/etc/docker/daemon.json differs from what this installer writes; left in place"
+    fi
+
+    if [[ -d "${IH_ROOT}/etc/bellasreef" ]]; then
+        ih_run "removing /etc/bellasreef" sudo rm -rf "${IH_ROOT}/etc/bellasreef"
+    else
+        ih_warn "no /etc/bellasreef to remove"
+    fi
+}
+
 ih_uninstall_summary() {
     printf '\n'
     ih_step "uninstall complete"
-    printf '      Removed: the stack, its data volumes, the boot unit, deploy/.env.\n'
-    printf '      Kept: backups, /etc/bellasreef, /etc/docker/daemon.json, avahi\n'
-    printf '      configuration, docker login, pulled images, this checkout.\n'
+    if (( IH_PURGE )); then
+        printf '      Removed: the stack, its data volumes, the boot unit, deploy/.env,\n'
+        printf '      the images, the avahi record, /etc/bellasreef.\n'
+        printf '      Kept: backups, docker login, this checkout.\n'
+    else
+        printf '      Removed: the stack, its data volumes, the boot unit, deploy/.env.\n'
+        printf '      Kept: backups, /etc/bellasreef, /etc/docker/daemon.json, avahi\n'
+        printf '      configuration, docker login, pulled images, this checkout.\n'
+    fi
     printf '\n'
     printf '      This checkout remains; rm -rf %s removes it.\n' "$REPO_DIR"
-    printf '      Host configuration the installer offered (docker log rotation,\n'
-    printf '      avahi) was left in place.\n'
+    if (( ! IH_PURGE )); then
+        printf '      Host configuration the installer offered (docker log rotation,\n'
+        printf '      avahi) was left in place.\n'
+    fi
 }
 
 ih_uninstall() {
     ih_step "Bella's Reef uninstall"
 
     if (( IH_DRY_RUN )); then
-        ih_would "prompt for typed confirmation ('uninstall')"
+        if (( IH_PURGE )); then
+            ih_would "prompt for typed confirmation ('purge')"
+        else
+            ih_would "prompt for typed confirmation ('uninstall')"
+        fi
     elif ! ih_uninstall_confirm; then
         ih_warn "uninstall not confirmed; nothing was changed"
         return 1
@@ -1284,6 +1424,14 @@ ih_uninstall() {
     local envfile="${IH_ROOT}${REPO_DIR}/deploy/.env"
     local had_unit=0
     [[ -f "$unit_file" ]] && had_unit=1
+
+    # Read while deploy/.env still exists: compose config is the one
+    # authoritative list of what --purge should remove, and it is gone two
+    # steps from now.
+    local purge_images=""
+    if (( IH_PURGE && ! IH_DRY_RUN )) && [[ -s "$envfile" ]]; then
+        purge_images="$(ih_compose config --images 2>/dev/null)" || purge_images=""
+    fi
 
     if (( had_unit )); then
         ih_run "boot unit disabled and stopped" sudo systemctl disable --now bellasreef.service
@@ -1303,6 +1451,8 @@ ih_uninstall() {
     else
         ih_warn "no deploy/.env to remove"
     fi
+
+    (( IH_PURGE )) && ih_purge_extras "$purge_images"
 
     ih_uninstall_summary
     return 0
