@@ -253,7 +253,10 @@ class AuditEvent(BaseModel):
     occurred_at: datetime
     category: str
     actor: str
-    subject: str
+    #: The NATS subject the event arrived on. Nullable in schema v1, and the
+    #: db constraint suite seeds subjectless rows into an append-only table —
+    #: a `str` here made one such row poison the whole listing.
+    subject: str | None
     device_id: str | None
     event: dict[str, Any]
     #: The event name from the payload ("device.unbound", "pair.window_used"),

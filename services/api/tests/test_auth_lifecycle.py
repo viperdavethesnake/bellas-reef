@@ -1039,6 +1039,42 @@ def test_audit_event_exposes_action() -> None:
     assert run(scenario) == "device.unbound"
 
 
+def test_a_subjectless_audit_row_lists_rather_than_500s() -> None:
+    """`audit_log.subject` is nullable in schema v1 and the db constraint
+    tests seed rows without one (append-only, so they cannot be cleaned up).
+    The listing endpoint used to refuse the whole page over a single NULL
+    subject — every row after the seed became unreadable through the API.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        h = await harness()
+        message_id = str(uuid4())
+        async with h.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO audit_log "
+                    "(message_id, occurred_at, category, actor, event) "
+                    "VALUES (:message_id, now(), 'safety', 'test', CAST(:event AS JSONB))"
+                ),
+                {"message_id": message_id, "event": json.dumps({"k": 1})},
+            )
+        async with h.client() as c:
+            granted = (await c.post("/api/v1/pair", json={"client_name": "phone"})).json()
+            headers = await bearer(c, granted["refresh_token"])
+            r = await c.get("/api/v1/audit", params={"limit": 200}, headers=headers)
+        await h.engine.dispose()
+        rows = r.json() if r.status_code == 200 else []
+        return {
+            "status": r.status_code,
+            "row": next((row for row in rows if row["message_id"] == message_id), None),
+        }
+
+    out = run(scenario)
+    assert out["status"] == 200
+    assert out["row"] is not None, "the seeded row must be listed"
+    assert out["row"]["subject"] is None
+
+
 class TestAuditLimitValidation:
     """`limit` is unbounded today (defect B): `?limit=-1` reaches Postgres as
     `LIMIT -1` (a 500) and `?limit=100000000` is a full scan+sort of
