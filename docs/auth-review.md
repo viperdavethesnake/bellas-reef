@@ -175,6 +175,16 @@ and `create_client()` run in separate transactions with no lock or constraint
 between them (`app.py:758-770`). Two concurrent first-boot requests can both be
 granted, with no record it was unintended.
 
+RESOLVED 2026-09-01. Blind TOFU now mints through `Store.create_first_client`
+— count and insert in one transaction under a transaction-scoped advisory
+lock, `None` to the loser, nothing to roll back. The setup-code grant had the
+same shape one branch up and is decided by `complete_setup()` returning
+whether it latched (`WHERE setup_completed_at IS NULL` flips once); its loser
+is rolled back via `discard_client`. Both losers get a 409 and a
+`pair_*_race` log line. Pinned by two barrier tests in `test_auth_lifecycle.py`
+that force both callers to read before either writes — the plain
+`asyncio.gather` shape passed against the bug.
+
 **B6 — iOS refresh stampede.** `accessTokenNow()` is actor-isolated but suspends
 at `await client.mintToken(...)` (`HubClient.swift:251-275`). Actors are
 reentrant, so every caller arriving during that suspension passes the cache

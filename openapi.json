@@ -399,7 +399,10 @@
           },
           "subject": {
             "title": "Subject",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
