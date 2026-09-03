@@ -273,3 +273,133 @@ class TestHistoryEndpointValidation:
         """No devices registered, so this is the normal empty result — the
         guard must not reject a window it used to accept."""
         assert self._get("2026-08-10T12:00:00Z", "2026-08-10T13:00:00Z") == 200
+
+
+# --------------------------------------------------------- export round trip
+#
+# `/api/v1/history/export` against real samples: written through VictoriaMetrics'
+# own import endpoint, read back through the route, compared byte for byte. The
+# guards that refuse a request before any of this live in
+# `test_history_export_api.py`, which needs no VictoriaMetrics.
+
+
+async def _register_sensor(engine: AsyncEngine, device_id: str) -> None:
+    """A registered device row, which is what the export route resolves against.
+
+    Inserted directly rather than through the registry consumer: that path is a
+    NATS subscription, and this test has no broker.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO devices (id, device_id, kind, driver_id, sensor_type, "
+                "poll_interval_s, transport) VALUES (:id, :device_id, 'sensor', "
+                "'ds18b20', 'temp', 5.0, 'local')"
+            ),
+            {"id": uuid.uuid4(), "device_id": device_id},
+        )
+
+
+def _iso(at: datetime) -> str:
+    """The Z-suffixed form the API parses, from an aware datetime."""
+    return at.isoformat().replace("+00:00", "Z")
+
+
+@_needs_vm
+@_needs_pg
+class TestExportRoundTrip:
+    @pytest.mark.timeout(120)
+    def test_two_written_samples_come_back_as_two_csv_rows(self) -> None:
+        """The whole point of the endpoint, end to end.
+
+        The two values are exactly representable in binary floating point, so
+        the rendered column is the number that was written rather than the
+        nearest thing to it, and the assertion can be on bytes.
+        """
+
+        async def scenario() -> tuple[str, str, dict[str, Any]]:
+            vm = os.environ[_VM].rstrip("/")
+            engine = await _fresh_engine()
+            device = f"probe-{uuid.uuid4().hex[:8]}"
+            await _register_sensor(engine, device)
+
+            base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+            await write(vm, device, [(base, 24.5), (base + timedelta(seconds=5), 24.5625)])
+            await wait_until_stored(vm, device, 2)
+
+            app = build_app(engine, vm_url=vm)
+            headers = await _paired(app)
+            window = {
+                "device_id": device,
+                "start": _iso(base - timedelta(minutes=1)),
+                "end": _iso(base + timedelta(minutes=1)),
+            }
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                as_csv = await c.get("/api/v1/history/export", params=window, headers=headers)
+                as_json = await c.get(
+                    "/api/v1/history/export",
+                    params={**window, "format": "json"},
+                    headers=headers,
+                )
+            await engine.dispose()
+
+            assert as_csv.status_code == 200, as_csv.text
+            assert as_json.status_code == 200, as_json.text
+            assert as_csv.headers["content-type"].startswith("text/csv")
+            assert as_json.headers["content-type"].startswith("application/json")
+
+            expected = (
+                "timestamp,device_id,metric,value,quality\n"
+                f"{base.strftime('%Y-%m-%dT%H:%M:%S')}.000Z,{device},"
+                "bellasreef_sensor_reading,24.5,\n"
+                f"{(base + timedelta(seconds=5)).strftime('%Y-%m-%dT%H:%M:%S')}.000Z,{device},"
+                "bellasreef_sensor_reading,24.5625,\n"
+            )
+            body: dict[str, Any] = as_json.json()
+            return as_csv.text, expected, body
+
+        rendered, expected, body = run(scenario)
+        assert rendered == expected
+        assert body["metric"] == "bellasreef_sensor_reading"
+        assert [s["value"] for s in body["samples"]] == [24.5, 24.5625]
+        assert [s["quality"] for s in body["samples"]] == [None, None]
+
+    @pytest.mark.timeout(120)
+    def test_an_empty_window_is_a_named_file_with_only_a_header(self) -> None:
+        """Two things at once, because they are the same download.
+
+        A window with nothing in it is a real answer, and a zero-byte file
+        reads as a failed transfer instead. The name is all the share sheet
+        shows about the file, so it carries the device and the window.
+        """
+
+        async def scenario() -> tuple[str, str, str]:
+            vm = os.environ[_VM].rstrip("/")
+            engine = await _fresh_engine()
+            device = f"probe-{uuid.uuid4().hex[:8]}"
+            await _register_sensor(engine, device)
+            app = build_app(engine, vm_url=vm)
+            headers = await _paired(app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                response = await c.get(
+                    "/api/v1/history/export",
+                    params={
+                        "device_id": device,
+                        "start": "2026-08-10T12:00:00Z",
+                        "end": "2026-08-10T13:30:00Z",
+                    },
+                    headers=headers,
+                )
+            await engine.dispose()
+            assert response.status_code == 200, response.text
+            return device, response.text, response.headers["content-disposition"]
+
+        device, rendered, disposition = run(scenario)
+        assert rendered == "timestamp,device_id,metric,value,quality\n"
+        assert disposition == (
+            f'attachment; filename="bellasreef-{device}-20260810T1200Z-20260810T1330Z.csv"'
+        )

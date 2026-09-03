@@ -863,6 +863,34 @@
         "title": "DeviceView",
         "type": "object"
       },
+      "ExportSample": {
+        "additionalProperties": false,
+        "description": "One stored reading, as written. Nothing here is aggregated.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "quality": {
+            "title": "Quality",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "title": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "at",
+          "value"
+        ],
+        "title": "ExportSample",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -995,6 +1023,46 @@
           "raised_at"
         ],
         "title": "HistoryEpisode",
+        "type": "object"
+      },
+      "HistoryExport": {
+        "additionalProperties": false,
+        "description": "A window of raw samples for one device \u2014 the JSON export.\n\nIt repeats the window and the metric because the file outlives the request\nthat produced it: six weeks later a bare list of readings does not say\nwhich probe or which days it came from. The CSV form carries the same facts\nin its own columns.",
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "end": {
+            "format": "date-time",
+            "title": "End",
+            "type": "string"
+          },
+          "metric": {
+            "title": "Metric",
+            "type": "string"
+          },
+          "samples": {
+            "items": {
+              "$ref": "#/components/schemas/ExportSample"
+            },
+            "title": "Samples",
+            "type": "array"
+          },
+          "start": {
+            "format": "date-time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "metric",
+          "start",
+          "end",
+          "samples"
+        ],
+        "title": "HistoryExport",
         "type": "object"
       },
       "HistorySeries": {
@@ -1940,7 +2008,7 @@
   "info": {
     "summary": "Reef controller: pairing, auth, and device control.",
     "title": "Bella's Reef API",
-    "version": "4.3.0"
+    "version": "4.4.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2914,6 +2982,102 @@
           }
         },
         "summary": "History",
+        "tags": [
+          "history"
+        ]
+      }
+    },
+    "/api/v1/history/export": {
+      "get": {
+        "description": "Every stored sample for one device in one window, as a file.\n\nThe counterpart to `/api/v1/history`, and the opposite trade: that one\ndownsamples so a phone can draw a month, this one hides nothing so a\nperson can work out afterwards what a heater actually did. Which is why\nit is a download rather than a view \u2014 the useful next step is opening\nit in something else, weeks later, with no hub in the loop.\n\nBounded by the window rather than by a bucket count, so the window is\ncapped (`MAX_EXPORT_WINDOW`) instead: the samples are materialised here\nbefore they are sent.",
+        "operationId": "historyExport",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "title": "Start",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "csv",
+              "enum": [
+                "csv",
+                "json"
+              ],
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "title": "Authorization",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryExport"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Raw samples for the window."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked credential."
+          },
+          "404": {
+            "description": "No such device."
+          },
+          "422": {
+            "description": "Unusable window."
+          },
+          "503": {
+            "description": "No telemetry store configured."
+          }
+        },
+        "summary": "History Export",
         "tags": [
           "history"
         ]
