@@ -28,21 +28,42 @@ holds each value until the next change and takes the time-weighted min/avg/max
 inside every bucket (H1/H2, 2026-08-18). The rule above still stands where it
 applies: a bucket *before the first sample ever recorded* is absent, because
 "off" would be an invention there.
+
+**The export is the same data with none of that applied.** :meth:`HistoryReader.
+raw_samples` and :func:`csv_rows` back `GET /api/v1/history/export`, which
+hands over the stored samples themselves rather than a summary of them: the
+downsampling above exists so a phone can draw a month, and the export exists
+for the afternoon someone needs to work out what a heater actually did. It is
+bounded by :data:`MAX_EXPORT_WINDOW` rather than by a bucket count, because
+nothing is aggregating the rows away.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import httpx
 from bellasreef_service import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["Bucket", "HistoryReader", "Series", "step_buckets"]
+__all__ = [
+    "CSV_CHUNK_ROWS",
+    "CSV_HEADER",
+    "MAX_EXPORT_WINDOW",
+    "Bucket",
+    "HistoryReader",
+    "RawSample",
+    "Series",
+    "csv_rows",
+    "step_buckets",
+]
 
 #: How far before a window a step series looks for the value it enters the
 #: window holding. A light's last change can be days old; thirty days is well
@@ -54,6 +75,44 @@ STEP_LOOKBACK_S = 30 * 86_400
 #: that 20k raw samples never cross the network.
 MAX_BUCKETS = 1000
 DEFAULT_BUCKETS = 240
+
+#: Longest window `/api/v1/history/export` will render. Raw samples, not
+#: buckets: a probe on the default 5 s cadence writes ~535k of them in 31 days,
+#: and the whole window is materialised in this process before it is sent. A
+#: month is also the span the feature exists for — "what did the heater do
+#: while I was away" — so the cap is where the use case ends rather than an
+#: arbitrary safety valve.
+MAX_EXPORT_WINDOW = timedelta(days=31)
+
+#: The export's columns, in order. Fixed on purpose: the file outlives the
+#: release that produced it, and a column that moves between versions makes
+#: every older file the odd one out with nothing in it to say so.
+CSV_HEADER = ("timestamp", "device_id", "metric", "value", "quality")
+
+#: Rows per yielded chunk of the CSV export. Starlette sends each yielded
+#: string through a threadpool hop and uvicorn frames it as its own chunk, so
+#: a row at a time is ~535k of both at the 31-day ceiling — enough to matter on
+#: a Pi 5. A thousand rows is a few hundred hops for the same bytes.
+CSV_CHUNK_ROWS = 1000
+
+#: Labels that say which series a sample came from rather than anything about
+#: the sample. Both are columns of their own in the export, so repeating them
+#: per row inside the label map would be noise.
+_IDENTITY_LABELS = frozenset({"__name__", "device_id"})
+
+
+@dataclass(frozen=True, slots=True)
+class RawSample:
+    """One stored sample, undownsampled, with the labels it was written under.
+
+    This is the export's unit and deliberately not :class:`Bucket`: the point
+    of the export is that nothing has been aggregated, so a person can see the
+    individual readings a chart could only ever summarise.
+    """
+
+    at: datetime
+    value: float
+    labels: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +136,16 @@ class Series:
 class HistoryReader:
     """Reads VictoriaMetrics. Owns no state beyond its HTTP client."""
 
-    def __init__(self, vm_url: str) -> None:
+    def __init__(self, vm_url: str, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._vm_url = vm_url.rstrip("/")
+        #: Test seam. `None` is httpx's own default transport, so production
+        #: builds exactly the client it always did; a unit test hands in a
+        #: `MockTransport` and gets the parsing under test without a container.
+        self._transport = transport
+
+    def _client(self) -> httpx.AsyncClient:
+        """The one place a client is built, so the seam cannot be bypassed."""
+        return httpx.AsyncClient(timeout=20.0, transport=self._transport)
 
     @staticmethod
     def bucket_seconds(start: datetime, end: datetime, buckets: int) -> int:
@@ -111,7 +178,7 @@ class HistoryReader:
         step = self.bucket_seconds(start, end, buckets)
         selector = f'{metric}{{device_id="{device_id}"}}'
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with self._client() as client:
             results = {}
             for name, fn in (
                 ("minimum", "min_over_time"),
@@ -171,37 +238,148 @@ class HistoryReader:
         step = self.bucket_seconds(start, end, buckets)
         selector = f'{metric}{{device_id="{device_id}"}}'
         lookback_start = start - timedelta(seconds=STEP_LOOKBACK_S)
-        samples: list[tuple[datetime, float]] = []
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"{self._vm_url}/api/v1/export",
-                params={
-                    "match[]": selector,
-                    "start": lookback_start.timestamp(),
-                    "end": end.timestamp(),
-                },
-            )
-            response.raise_for_status()
-            for line in response.text.splitlines():
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                for ts_ms, raw in zip(
-                    entry.get("timestamps", []), entry.get("values", []), strict=True
-                ):
-                    try:
-                        value = float(raw)
-                    except (TypeError, ValueError):
-                        continue
-                    if not math.isfinite(value):
-                        continue
-                    samples.append((datetime.fromtimestamp(ts_ms / 1000, tz=start.tzinfo), value))
+        raw = await self._export(selector=selector, start=lookback_start, end=end, tz=start.tzinfo)
         return Series(
             device_id=device_id,
             metric=metric,
             unit=unit,
-            buckets=step_buckets(samples, start=start, end=end, step_s=step),
+            buckets=step_buckets(
+                [(sample.at, sample.value) for sample in raw],
+                start=start,
+                end=end,
+                step_s=step,
+            ),
         )
+
+    async def raw_samples(
+        self, *, metric: str, device_id: str, start: datetime, end: datetime
+    ) -> list[RawSample]:
+        """Every stored sample in the window, in time order, nothing aggregated.
+
+        The export endpoint's source. Unlike :meth:`series` this is bounded by
+        the caller's window rather than by a bucket count, which is why the
+        route caps the window at :data:`MAX_EXPORT_WINDOW` before calling it.
+        """
+        return await self._export(
+            selector=f'{metric}{{device_id="{device_id}"}}',
+            start=start,
+            end=end,
+            tz=start.tzinfo,
+        )
+
+    async def _export(
+        self, *, selector: str, start: datetime, end: datetime, tz: tzinfo | None
+    ) -> list[RawSample]:
+        """Raw samples from ``/api/v1/export``, parsed once for both callers."""
+        async with self._client() as client:
+            response = await client.get(
+                f"{self._vm_url}/api/v1/export",
+                params={
+                    "match[]": selector,
+                    "start": start.timestamp(),
+                    "end": end.timestamp(),
+                },
+            )
+            response.raise_for_status()
+        return _jsonl_samples(response.text, tz=tz)
+
+
+def _jsonl_samples(body: str, *, tz: tzinfo | None) -> list[RawSample]:
+    """Parse VictoriaMetrics' JSONL export into samples, sorted by time.
+
+    One entry per label set, so a metric published with two different
+    ``quality`` labels arrives as two entries covering the same window. They
+    are one signal split by why each value was written, so they merge here and
+    the sort is what makes the merged result a timeline.
+
+    Values that are not finite numbers are dropped rather than passed through.
+    NaN is how VictoriaMetrics spells staleness, and a row asserting that a
+    probe read NaN is an invention — the sample simply is not there.
+    """
+    samples: list[RawSample] = []
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        labels = {
+            str(name): str(value)
+            for name, value in entry.get("metric", {}).items()
+            if name not in _IDENTITY_LABELS
+        }
+        for ts_ms, raw in zip(entry.get("timestamps", []), entry.get("values", []), strict=True):
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            samples.append(
+                RawSample(
+                    at=datetime.fromtimestamp(ts_ms / 1000, tz=tz),
+                    value=value,
+                    # A copy per sample. `RawSample` is frozen, but one shared
+                    # dict is not: a caller mutating the labels of one sample
+                    # would silently rewrite every other sample from the same
+                    # JSONL entry.
+                    labels=dict(labels),
+                )
+            )
+    samples.sort(key=lambda sample: sample.at)
+    return samples
+
+
+def csv_rows(samples: Iterable[RawSample], *, device_id: str, metric: str) -> Iterator[str]:
+    """The export as CSV text, a row at a time, header first.
+
+    A generator so the response body is assembled as it is written rather than
+    concatenated first; the window cap is what bounds the sample list itself.
+    Yielded in chunks of :data:`CSV_CHUNK_ROWS` rather than a row at a time,
+    because every yield from a streaming response costs a threadpool hop and a
+    chunk on the wire. The bytes are identical either way.
+
+    Timestamps are RFC 3339 in UTC with milliseconds, one timezone for the
+    whole file. A spreadsheet sorts this column as text, so a file mixing
+    offsets would sort wrong and look right.
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+
+    def drain() -> str:
+        text = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return text
+
+    writer.writerow(CSV_HEADER)
+    pending = 0
+    for sample in samples:
+        writer.writerow(
+            (
+                _rfc3339_ms(sample.at),
+                device_id,
+                metric,
+                # `repr` rather than `str(round(...))`: the export exists so a
+                # person can see what was actually stored, and rounding here
+                # would hide the last digit of a reading in the one artefact
+                # that is supposed to have nothing hidden.
+                repr(sample.value),
+                sample.labels.get("quality", ""),
+            )
+        )
+        pending += 1
+        if pending >= CSV_CHUNK_ROWS:
+            yield drain()
+            pending = 0
+    remainder = drain()
+    if remainder:
+        yield remainder
+
+
+def _rfc3339_ms(at: datetime) -> str:
+    """``2026-09-03T20:15:04.123Z`` — UTC, milliseconds, no offset arithmetic
+    left for the reader to do."""
+    moment = at.astimezone(UTC)
+    return f"{moment.strftime('%Y-%m-%dT%H:%M:%S')}.{moment.microsecond // 1000:03d}Z"
 
 
 def _points(payload: dict[str, object]) -> dict[float, float]:

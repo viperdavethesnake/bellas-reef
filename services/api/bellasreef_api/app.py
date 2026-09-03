@@ -67,6 +67,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import StreamingResponse
 from prometheus_client import CollectorRegistry, Counter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -74,7 +75,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from bellasreef_api.audit import NatsAuditSink
 from bellasreef_api.audit_writer import AuditWriter
 from bellasreef_api.frames import ReadyFrame
-from bellasreef_api.history import DEFAULT_BUCKETS, MAX_BUCKETS, HistoryReader
+from bellasreef_api.history import (
+    DEFAULT_BUCKETS,
+    MAX_BUCKETS,
+    MAX_EXPORT_WINDOW,
+    HistoryReader,
+    csv_rows,
+)
 from bellasreef_api.registry import (
     AssignmentPublisher,
     CapabilityConsumer,
@@ -242,6 +249,41 @@ class HistoryView(BaseModel):
     bucket_s: int
     series: list[HistorySeries]
     episodes: list[HistoryEpisode]
+
+
+class ExportSample(BaseModel):
+    """One stored reading, as written. Nothing here is aggregated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Full precision, unlike the CSV rendering's milliseconds: JSON is read
+    #: by programs and a spreadsheet column is read by a person.
+    at: datetime
+    value: float
+
+    #: The ``quality`` label the sample was published with, when it carried
+    #: one. Null rather than an empty string: "not labelled" and "labelled with
+    #: nothing" are different facts. The CSV rendering flattens both to a blank
+    #: cell, because a spreadsheet has no way to show the difference.
+    quality: str | None = None
+
+
+class HistoryExport(BaseModel):
+    """A window of raw samples for one device — the JSON export.
+
+    It repeats the window and the metric because the file outlives the request
+    that produced it: six weeks later a bare list of readings does not say
+    which probe or which days it came from. The CSV form carries the same facts
+    in its own columns.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str
+    metric: str
+    start: datetime
+    end: datetime
+    samples: list[ExportSample]
 
 
 class AuditEvent(BaseModel):
@@ -2156,6 +2198,115 @@ def build_app(
 
         return HistoryView(
             start=start, end=end, bucket_s=bucket_s, series=series, episodes=episodes
+        )
+
+    @app.get(
+        "/api/v1/history/export",
+        response_model=None,
+        tags=["history"],
+        operation_id="historyExport",
+        responses={
+            # Declared by hand because the route returns a Response, not a
+            # model: FastAPI infers no content from that, and a client
+            # generated against a 200 with no media types cannot tell that
+            # this endpoint answers in two.
+            200: {
+                "model": HistoryExport,
+                "description": "Raw samples for the window.",
+                "content": {"text/csv": {"schema": {"type": "string"}}},
+            },
+            401: AUTH_401,
+            404: {"description": "No such device."},
+            422: {"description": "Unusable window."},
+            503: {"description": "No telemetry store configured."},
+        },
+    )
+    async def history_export(
+        _: Annotated[UUID, Depends(current_client)],
+        device_id: str,
+        start: datetime,
+        end: datetime,
+        # Aliased rather than named `format`, which would shadow the
+        # builtin. The wire name is what a client sees.
+        export_format: Annotated[Literal["csv", "json"], Query(alias="format")] = "csv",
+    ) -> Response:
+        """Every stored sample for one device in one window, as a file.
+
+        The counterpart to `/api/v1/history`, and the opposite trade: that one
+        downsamples so a phone can draw a month, this one hides nothing so a
+        person can work out afterwards what a heater actually did. Which is why
+        it is a download rather than a view — the useful next step is opening
+        it in something else, weeks later, with no hub in the loop.
+
+        Bounded by the window rather than by a bucket count, so the window is
+        capped (`MAX_EXPORT_WINDOW`) instead: the samples are materialised here
+        before they are sent.
+        """
+        if reader is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "no telemetry store configured"
+            )
+        # Same guard, same wording as `history` above, and for the same reason:
+        # FastAPI parses an offset-free ISO-8601 string into a naive datetime,
+        # which then compares against an aware one by raising.
+        if start.tzinfo is None or end.tzinfo is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "start and end must be timezone-aware"
+            )
+        if end <= start:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "end must be after start")
+        if end - start > MAX_EXPORT_WINDOW:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "window exceeds 31 days")
+
+        # A registered device, not just any label. An unknown id would
+        # otherwise download as a valid export of nothing, which reads as "the
+        # probe recorded nothing" rather than "that is not a device".
+        device = next(
+            (row for row in await store.list_devices() if row["device_id"] == device_id), None
+        )
+        if device is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
+        metric = (
+            "bellasreef_sensor_reading"
+            if device["kind"] == "sensor"
+            else "bellasreef_actuator_level"
+        )
+
+        samples = await reader.raw_samples(metric=metric, device_id=device_id, start=start, end=end)
+        stem = (
+            f"bellasreef-{device_id}"
+            f"-{start.astimezone(UTC).strftime('%Y%m%dT%H%MZ')}"
+            f"-{end.astimezone(UTC).strftime('%Y%m%dT%H%MZ')}"
+        )
+
+        def attachment(extension: str) -> dict[str, str]:
+            # Safe to interpolate unquoted: the id matched a registry row, and
+            # registration only accepts `[a-z0-9_-]{1,64}` (contracts
+            # `validate_token`), which is neither a header nor a path hazard.
+            return {"Content-Disposition": f'attachment; filename="{stem}.{extension}"'}
+
+        if export_format == "json":
+            export = HistoryExport(
+                device_id=device_id,
+                metric=metric,
+                start=start,
+                end=end,
+                samples=[
+                    ExportSample(at=s.at, value=s.value, quality=s.labels.get("quality"))
+                    for s in samples
+                ],
+            )
+            # Serialised by the model rather than by json.dumps of a dict, so
+            # the datetimes match every other timestamp this API emits.
+            return Response(
+                content=export.model_dump_json(),
+                media_type="application/json",
+                headers=attachment("json"),
+            )
+        return StreamingResponse(
+            csv_rows(samples, device_id=device_id, metric=metric),
+            media_type="text/csv; charset=utf-8",
+            headers=attachment("csv"),
         )
 
     # ------------------------------------------------------------- alerts
