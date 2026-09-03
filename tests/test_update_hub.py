@@ -187,6 +187,40 @@ def test_ref_pins_a_specific_tag(tmp_path: Path) -> None:
     assert "checkout" not in logs["git"].read_text()
 
 
+def test_ref_pins_a_specific_tag_when_the_tag_list_overflows_the_pipe_buffer(
+    tmp_path: Path,
+) -> None:
+    # SIGPIPE/pipefail trap in the --ref validation: `git tag -l 'v*' |
+    # grep -qx "$target"`. grep -q exits at the first match; if the producer
+    # (git, here the stub) still has unread output queued in the pipe when it
+    # does, past the kernel pipe buffer (~64 KiB), the producer takes SIGPIPE
+    # and pipefail reports the *pipeline's* exit status as that SIGPIPE (141)
+    # even though grep matched — a valid tag gets refused. The short tag
+    # lists elsewhere in this file all fit inside the buffer and never
+    # exercise this, so this fixture pads the stubbed `git tag -l` output
+    # well past 64 KiB with the target listed first, forcing a large amount
+    # of unread output at the moment grep matches. Reproduced 60/60 outside
+    # pytest against the unpatched script (see the task report); this pins
+    # it inside the suite.
+    target = "v0.1.0"
+    padding = "x" * 60
+    filler = "\n".join(f"v0.{i:05d}.0-{padding}" for i in range(1, 3000))
+    root = hub_fixture(tmp_path, deployed_tag=NEW_SHA)
+    stubs = tmp_path / "bin"
+    write_update_stubs(stubs, tmp_path, tags=f"{target}\n{filler}")
+    write_release_env(tmp_path / "release.env", version=target, tag=NEW_SHA)
+    result = run_update(
+        "--ref",
+        target,
+        root=root,
+        stubs=stubs,
+        env={"IH_RELEASE_ENV": str(tmp_path / "release.env")},
+    )
+    out = strip_ansi(result.stdout)
+    assert result.returncode == 0, out + result.stderr
+    assert "not a v* release tag" not in (out + result.stderr)
+
+
 def test_already_current_deploys_nothing(tmp_path: Path) -> None:
     root = hub_fixture(tmp_path, deployed_tag=FAKE_COMMIT)
     stubs = tmp_path / "bin"
