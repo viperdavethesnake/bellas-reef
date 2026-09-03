@@ -3062,7 +3062,15 @@
                 }
               }
             },
-            "description": "Raw samples for the window."
+            "description": "Raw samples for the window.",
+            "headers": {
+              "Content-Disposition": {
+                "description": "attachment; filename=\"bellasreef-<device_id>-<start>-<end>.csv|json\"",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing, invalid, expired, or revoked credential."

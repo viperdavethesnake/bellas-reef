@@ -2214,6 +2214,14 @@ def build_app(
                 "model": HistoryExport,
                 "description": "Raw samples for the window.",
                 "content": {"text/csv": {"schema": {"type": "string"}}},
+                "headers": {
+                    "Content-Disposition": {
+                        "description": (
+                            'attachment; filename="bellasreef-<device_id>-<start>-<end>.csv|json"'
+                        ),
+                        "schema": {"type": "string"},
+                    },
+                },
             },
             401: AUTH_401,
             404: {"description": "No such device."},
