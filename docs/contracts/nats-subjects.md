@@ -295,6 +295,13 @@ envelope's `source`, the subject being an address rather than the datum
 (same reasoning as `<instance>` on `bellasreef.chip.*`). Design:
 `docs/superpowers/specs/2026-08-31-hub-status-design.md`.
 
+**contracts 4.4.0 adds `GET /api/v1/history/export`** (UX review D7): raw
+samples for one device over one window, as CSV or JSON, capped at 31 days.
+No subject, no payload and no driver-interface change; the wire is
+byte-for-byte 4.3.0. It is an additive OpenAPI path, so MINOR under the table
+above, and the number is what the iOS client re-pins its vendored spec to.
+The share-sheet half ships in the iOS repo.
+
 ### Pre-release exception (expires at the first tagged release)
 
 **contracts 2.0.0 added the required `role` on `ActuatorRegistration` without
