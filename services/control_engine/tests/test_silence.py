@@ -310,47 +310,104 @@ def test_a_restart_resumes_an_open_silence_rather_than_re_raising() -> None:
     run(scenario)
 
 
-def test_a_restart_with_a_dead_probe_and_no_open_episode_never_raises() -> None:
-    """PINS A KNOWN GAP — this documents current (wrong-for-production)
-    behavior. David's ruling 2026-08-29: pin it with a test now, fix later,
-    before livestock goes in. Do not flip this assertion without a ruling;
-    if a fix makes this test fail, that is the fix working, and the
-    assertion must be rewritten to match the corrected behavior deliberately
-    — not silenced, not marked xfail.
+def test_a_restart_with_a_dead_probe_and_no_open_episode_raises_after_one_deadline() -> None:
+    """Formerly named for the old assertion this test PINNED AS A KNOWN GAP:
+    this test used to document current (wrong-for-production) behavior.
+    David's ruling 2026-08-29 was to pin it with a test now, fix later,
+    before livestock goes in.
 
     ``sweep`` (bellasreef_control_engine/alerts.py, ~lines 442-449) exempts a
     device from the dead-probe CRITICAL as long as ``self._last_seen`` has no
     entry for it, on the theory that "never seen" means "we have not been
     listening long enough yet" (e.g. this process started before
-    hardware-io). But ``prime()`` only seeds ``self._silent`` from
-    already-open episodes in Postgres — it never seeds ``_last_seen`` — so a
+    hardware-io). But ``prime()`` used to only seed ``self._silent`` from
+    already-open episodes in Postgres — it never seeded ``_last_seen`` — so a
     probe that was already dead *before* this process started, with no open
     episode recorded (say, the episode table was never written, or this is
-    the very first boot after the probe failed), looks identical to "brand
-    new, give it a grace period" and is exempted forever. Restart the engine
-    while a probe is dead with no open episode, and the alarm never arms —
-    the exact silent-monitoring failure this module's own docstring exists
-    to prevent, just reached by a different door (a restart, not the
+    the very first boot after the probe failed), looked identical to "brand
+    new, give it a grace period" and was exempted forever. Restarting the
+    engine while a probe was dead with no open episode meant the alarm never
+    armed — the exact silent-monitoring failure this module's own docstring
+    exists to prevent, just reached by a different door (a restart, not the
     2026-08-10 outage's leaked durable).
 
-    Simulated restart: a fresh ``SilenceWatcher``, ``prime()`` against a
-    store with the cadence configured but no open silence recorded, and
-    ``_last_seen`` never populated (no ``on_reading`` call — the dead probe
-    publishes nothing). Advance well past the deadline and sweep.
+    David's ruling 2026-09-02: fix it by seeding ``_last_seen`` for every
+    configured cadence with ``now`` in ``prime()``, so the never-seen
+    exemption in ``sweep`` becomes a finite grace of one deadline from boot
+    instead of forever — a restart with a dead probe and no open episode
+    must alarm after one deadline, not never. This test now asserts that
+    corrected behavior instead of pinning the gap.
+
+    Simulated restart: a fresh ``SilenceWatcher``, ``prime(now=boot)`` against
+    a store with the cadence configured but no open silence recorded, and
+    ``on_reading`` never called (the dead probe publishes nothing). Just
+    short of one deadline from boot, nothing is raised yet; at exactly one
+    deadline, the silence raises, reported against the seeded ``boot`` time.
     """
 
     async def scenario() -> None:
         store = FakeSilenceStore({"probe": 60.0})  # deadline 360s
         # No store.open entry: no episode was ever recorded for this probe.
         watcher = _watcher(store, Published())
-        await watcher.prime()  # the "restart" — _last_seen stays empty
+        boot = datetime.now(UTC)
+        await watcher.prime(now=boot)  # the "restart" — seeds _last_seen at boot
 
-        await watcher.sweep(now=datetime.now(UTC) + timedelta(hours=6))
+        deadline = silence_deadline_s(60.0)
 
-        # Wrong for production: the probe has been silent the whole time
-        # this process has existed, yet nothing is raised. Fix is gated on
-        # livestock, not on this test (David, 2026-08-29).
+        await watcher.sweep(now=boot + timedelta(seconds=deadline - 1))
         assert store.raised == []
         assert not watcher.is_silent("probe")
+
+        await watcher.sweep(now=boot + timedelta(seconds=deadline))
+        assert store.raised == [("probe", boot)]
+        assert watcher.is_silent("probe")
+
+    run(scenario)
+
+
+def test_boot_grace_is_one_deadline_not_forever_for_every_cadence() -> None:
+    """The grace ``prime()`` arms is per cadence, not one clock for the whole
+    watcher: a fast probe's deadline lands before a slow probe's, and each is
+    judged only against its own.
+    """
+
+    async def scenario() -> None:
+        store = FakeSilenceStore({"fast": 5.0, "slow": 60.0})
+        watcher = _watcher(store, Published())
+        boot = datetime.now(UTC)
+        await watcher.prime(now=boot)
+
+        await watcher.sweep(now=boot + timedelta(seconds=silence_deadline_s(5.0)))
+        assert [d for d, _ in store.raised] == ["fast"]
+
+        await watcher.sweep(now=boot + timedelta(seconds=silence_deadline_s(60.0)))
+        assert sorted(d for d, _ in store.raised) == ["fast", "slow"]
+
+    run(scenario)
+
+
+def test_a_reading_during_boot_grace_resets_the_clock() -> None:
+    """The seeded boot time is a placeholder last-seen, not a real reading —
+    an actual reading that arrives during the grace replaces it exactly as
+    it would after boot, so the deadline is judged from the reading, not
+    from boot.
+    """
+
+    async def scenario() -> None:
+        store = FakeSilenceStore({"probe": 60.0})
+        watcher = _watcher(store, Published())
+        boot = datetime.now(UTC)
+        await watcher.prime(now=boot)
+
+        reading_at = boot + timedelta(seconds=10)
+        await watcher.on_reading(_reading(), now=reading_at)
+
+        deadline = silence_deadline_s(60.0)
+        await watcher.sweep(now=boot + timedelta(seconds=deadline + 5))
+        assert store.raised == []
+        assert not watcher.is_silent("probe")
+
+        await watcher.sweep(now=reading_at + timedelta(seconds=deadline))
+        assert [d for d, _ in store.raised] == ["probe"]
 
     run(scenario)
