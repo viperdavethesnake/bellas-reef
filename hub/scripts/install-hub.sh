@@ -236,7 +236,17 @@ ih_docker_reachable()  { docker info >/dev/null 2>&1; }
 # not — and that disagreement is precisely the state that must not be read as
 # "never added", because the answer to it is a re-login, not another usermod.
 ih_in_docker_group() {
-    id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx docker
+    # No pipe into grep -q here (see update-hub.sh's --ref validation for the
+    # SIGPIPE/pipefail trap this used to match: grep -q exits the instant it
+    # matches, and if id/tr still had output queued when it did, they took
+    # SIGPIPE and pipefail reported that as the pipeline's exit status).
+    # Command substitution reads id's output to completion first.
+    local groups
+    groups="$(id -nG "$1" 2>/dev/null)"
+    case " $groups " in
+        *' docker '*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 ih_check_docker() {
@@ -1595,8 +1605,14 @@ ih_phase6_verify() {
     # Not by browsing: avahi-browse is not installed by avahi-daemon, and
     # host-setup.md §5 records that a local browse does not reliably reflect
     # the daemon's own services. The journal is authoritative instead.
+    #
+    # grep here (no -q) rather than grep -q: without -q, grep keeps reading
+    # until the input is exhausted instead of exiting the instant it finds a
+    # match, so journalctl can never take SIGPIPE for output still queued
+    # behind a match and poison the pipeline's exit status under pipefail
+    # (the same trap update-hub.sh's --ref validation hit).
     if journalctl -u avahi-daemon --no-pager -n 200 2>/dev/null \
-        | grep -q 'successfully established'; then
+        | grep 'successfully established' >/dev/null; then
         ih_pass "avahi published the _bellasreef._tcp record"
     else
         ih_unverified "could not confirm avahi published the service record"

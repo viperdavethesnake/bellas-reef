@@ -90,8 +90,21 @@ if [[ -z "$STAGE2" ]]; then
 
     if [[ -n "$PIN_REF" ]]; then
         target="$PIN_REF"
-        git -C "$REPO_DIR" tag -l 'v*' | grep -qx "$target" \
-            || die "--ref ${target} is not a v* release tag this clone can see"
+        # No pipe here on purpose. This used to be
+        # `git tag -l 'v*' | grep -qx "$target"`, which is a SIGPIPE trap
+        # under `set -o pipefail`: grep -q exits the instant it matches, and
+        # if git still had unread tag names queued in the pipe at that
+        # moment (past the kernel pipe buffer, tens of KB on a clone with
+        # many tags), git took SIGPIPE and pipefail reported THAT as the
+        # pipeline's exit status, refusing a perfectly valid tag. Command
+        # substitution below reads git's output to completion before
+        # anything is matched, so there is no reader-exits-early race for
+        # pipefail to catch.
+        candidate_tags="$(git -C "$REPO_DIR" tag -l 'v*')" || die "git tag -l failed; cannot see releases"
+        case $'\n'"$candidate_tags"$'\n' in
+            *$'\n'"$target"$'\n'*) ;;
+            *) die "--ref ${target} is not a v* release tag this clone can see" ;;
+        esac
     else
         # Only v* tags are candidates, ever — a plain run never moves to
         # main (the header's open question, answered: no).
