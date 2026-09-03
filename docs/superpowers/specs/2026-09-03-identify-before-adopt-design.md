@@ -50,9 +50,13 @@ sweep through sixteen channels.
 **Decision: no flag, no column, no contracts bump.** A provisionally adopted
 device is an adopted device whose `display_name` is NULL. The registry already
 models that: `display_name` is `str | None`
-(`services/api/bellasreef_api/app.py:DeviceView`), `DeviceView.name` falls back
-to `device_id`, and `DeviceName._blank_is_not_a_name` normalises whitespace to
-NULL so "no name" is one state rather than two.
+(`services/api/bellasreef_api/app.py:DeviceView`), `DeviceName._blank_is_not_a_name`
+normalises whitespace to NULL so "no name" is one state rather than two, and the
+app already renders a nameless row as its id, `displayName ?? deviceId`
+(BellasReefKit `EquipmentRows.swift:76`, and the same expression in
+`LightingCards.swift`, `DeviceCatalog.swift` and `SystemView.swift`).
+`DeviceView.name` in the API is a plain `@property` and is not serialised, so
+the client fallback is what satisfies the placeholder requirement.
 
 Nothing stops an unnamed device living forever, and nothing should: it is a
 missing name, not a hole. The device is adopted, authoritative, carries the full
@@ -72,18 +76,13 @@ provisional adoption promises exactly what every other one does.
 `contracts/python/bellasreef_contracts/messages.py`). There is no lesser
 adoption to declare.
 
-A stored placeholder would also bake the 1-based display convention (David's
-ruling 2026-08-17 12:11) into a value the wire and the binding read 0-based.
-
 ## The pulse
 
-| Parameter | Value | Why |
-|---|---|---|
-| `target` | the new `device_id` | |
-| `duty` | `0.30` | Clear of the undefined band, modest in a lit room, not a full-power flash. |
-| `transition` | `"snap"` | Identify is an operator standing at the tank. A ramp at 0.05/s would take six seconds to arrive (spec 2026-08-17). |
-| `duration_s` | `3.0` | |
-| `reason` | `"identify"` | |
+`target` the new `device_id`, `duty` 0.30, `transition` `"snap"`, `duration_s`
+3.0, `reason` `"identify"`. Duty 0.30 is clear of the undefined band, modest in
+a lit room, and not a full-power flash. Snap because identify is an operator
+standing at the tank: a ramp at 0.05/s would take six seconds to arrive (spec
+2026-08-17).
 
 **3 s is legal, and there is no minimum to work around.**
 `OverrideRequest.duration_s` is `Field(gt=0.0, le=86400.0)`
@@ -151,9 +150,9 @@ The `emitted_at` comparison is needed because BR_STATE is retained
 last-value-per-subject and the API replays it on socket open
 (`stream.py:_retained_state`), so a re-adopted channel can produce a frame from
 its previous life. Both timestamps come from the hub, so this is one clock. The
-startup publish lands a few milliseconds before hardware-io subscribes its
-`CommandConsumer`, which is harmless: BR_CMD is a durable workqueue, so a
-command published in that sliver is delivered when the consumer binds.
+startup publish precedes hardware-io's `CommandConsumer` subscription, which is
+harmless: BR_CMD is a durable workqueue, so a command published in that gap is
+delivered when the consumer binds.
 
 Rejected: polling `GET /api/v1/capabilities` for a moved `announced_at`. It is
 ordered after the build too, but it is per process rather than per channel, and
@@ -195,9 +194,11 @@ that exist: `bindDevice`, `createOverride`, `renameDevice`, `unbindDevice`,
 | Channel already carries a schedule assignment | Legal (schedule-before-adoption is allowed by the engine's gate). The channel starts converging to the curve the moment it is adopted, the pulse overrides it for 3 s, and the release returns it to the curve rather than to dark. Nothing special to do, but the copy should not promise the channel goes dark afterwards. |
 
 Cost, stated plainly: a confirmed identify is one hardware-io restart and a
-rejected one is two, each pausing sensor telemetry for about 15 s. That is well
-inside the silence deadline (6x cadence), so no alert fires. It is the price of
-the ruling that nothing drives an unadopted channel.
+rejected one is two, each pausing sensor telemetry for about 15 s. No alert
+fires: the silence deadline is `max(cadence x 6, 30 s)`
+(`services/control_engine/bellasreef_control_engine/alerts.py`,
+`SILENCE_FLOOR_S = 30.0`), and the 30 s floor covers a restart at any cadence.
+It is the price of the ruling that nothing drives an unadopted channel.
 
 ## iOS surface
 
