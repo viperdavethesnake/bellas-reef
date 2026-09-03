@@ -256,6 +256,8 @@ class ExportSample(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: Full precision, unlike the CSV rendering's milliseconds: JSON is read
+    #: by programs and a spreadsheet column is read by a person.
     at: datetime
     value: float
 

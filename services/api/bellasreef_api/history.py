@@ -54,6 +54,7 @@ from bellasreef_service import get_logger
 log = get_logger(__name__)
 
 __all__ = [
+    "CSV_CHUNK_ROWS",
     "CSV_HEADER",
     "MAX_EXPORT_WINDOW",
     "Bucket",
@@ -87,6 +88,12 @@ MAX_EXPORT_WINDOW = timedelta(days=31)
 #: release that produced it, and a column that moves between versions makes
 #: every older file the odd one out with nothing in it to say so.
 CSV_HEADER = ("timestamp", "device_id", "metric", "value", "quality")
+
+#: Rows per yielded chunk of the CSV export. Starlette sends each yielded
+#: string through a threadpool hop and uvicorn frames it as its own chunk, so
+#: a row at a time is ~535k of both at the 31-day ceiling — enough to matter on
+#: a Pi 5. A thousand rows is a few hundred hops for the same bytes.
+CSV_CHUNK_ROWS = 1000
 
 #: Labels that say which series a sample came from rather than anything about
 #: the sample. Both are columns of their own in the export, so repeating them
@@ -308,7 +315,13 @@ def _jsonl_samples(body: str, *, tz: tzinfo | None) -> list[RawSample]:
                 continue
             samples.append(
                 RawSample(
-                    at=datetime.fromtimestamp(ts_ms / 1000, tz=tz), value=value, labels=labels
+                    at=datetime.fromtimestamp(ts_ms / 1000, tz=tz),
+                    value=value,
+                    # A copy per sample. `RawSample` is frozen, but one shared
+                    # dict is not: a caller mutating the labels of one sample
+                    # would silently rewrite every other sample from the same
+                    # JSONL entry.
+                    labels=dict(labels),
                 )
             )
     samples.sort(key=lambda sample: sample.at)
@@ -320,23 +333,27 @@ def csv_rows(samples: Iterable[RawSample], *, device_id: str, metric: str) -> It
 
     A generator so the response body is assembled as it is written rather than
     concatenated first; the window cap is what bounds the sample list itself.
+    Yielded in chunks of :data:`CSV_CHUNK_ROWS` rather than a row at a time,
+    because every yield from a streaming response costs a threadpool hop and a
+    chunk on the wire. The bytes are identical either way.
 
     Timestamps are RFC 3339 in UTC with milliseconds, one timezone for the
     whole file. A spreadsheet sorts this column as text, so a file mixing
     offsets would sort wrong and look right.
     """
-    line = io.StringIO()
-    writer = csv.writer(line, lineterminator="\n")
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
 
-    def render(row: tuple[str, ...]) -> str:
-        line.seek(0)
-        line.truncate(0)
-        writer.writerow(row)
-        return line.getvalue()
+    def drain() -> str:
+        text = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return text
 
-    yield render(CSV_HEADER)
+    writer.writerow(CSV_HEADER)
+    pending = 0
     for sample in samples:
-        yield render(
+        writer.writerow(
             (
                 _rfc3339_ms(sample.at),
                 device_id,
@@ -349,6 +366,13 @@ def csv_rows(samples: Iterable[RawSample], *, device_id: str, metric: str) -> It
                 sample.labels.get("quality", ""),
             )
         )
+        pending += 1
+        if pending >= CSV_CHUNK_ROWS:
+            yield drain()
+            pending = 0
+    remainder = drain()
+    if remainder:
+        yield remainder
 
 
 def _rfc3339_ms(at: datetime) -> str:

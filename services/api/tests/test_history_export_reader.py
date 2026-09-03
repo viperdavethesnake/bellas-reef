@@ -22,7 +22,13 @@ from typing import Any
 
 import httpx
 import pytest
-from bellasreef_api.history import MAX_EXPORT_WINDOW, HistoryReader, RawSample, csv_rows
+from bellasreef_api.history import (
+    CSV_CHUNK_ROWS,
+    MAX_EXPORT_WINDOW,
+    HistoryReader,
+    RawSample,
+    csv_rows,
+)
 
 _START = datetime(2026, 9, 3, 20, 0, tzinfo=UTC)
 _END = _START + timedelta(hours=1)
@@ -141,6 +147,23 @@ class TestRawSamples:
         )
         assert [s.value for s in samples_of(reader_returning(body))] == [24.0, 25.0]
 
+    def test_samples_from_one_entry_do_not_share_a_label_map(self) -> None:
+        """One dict per entry would make every sample in it the same object,
+        so mutating one sample's labels would rewrite its siblings."""
+        body = jsonl(
+            {
+                "metric": {"__name__": "bellasreef_sensor_reading", "quality": "ok"},
+                "values": [24.0, 25.0],
+                "timestamps": [
+                    int(_START.timestamp() * 1000),
+                    int((_START + timedelta(minutes=1)).timestamp() * 1000),
+                ],
+            }
+        )
+        first, second = samples_of(reader_returning(body))
+        assert first.labels == second.labels
+        assert first.labels is not second.labels
+
     def test_an_empty_export_is_an_empty_list(self) -> None:
         assert samples_of(reader_returning("")) == []
 
@@ -181,6 +204,20 @@ class TestCsvRendering:
             "2026-09-03T20:15:04.123Z,display-tank,bellasreef_sensor_reading,24.5,ok\n"
             "2026-09-03T20:15:09.000Z,display-tank,bellasreef_sensor_reading,24.5625,\n"
         )
+
+    def test_rows_are_yielded_in_batches(self) -> None:
+        """Every yield is a threadpool hop and a chunk on the wire, and a
+        month of samples is hundreds of thousands of rows. The bytes must not
+        change: the chunk boundaries are the only difference."""
+        samples = [
+            RawSample(at=_START + timedelta(seconds=i), value=float(i), labels={})
+            for i in range(2 * CSV_CHUNK_ROWS + 7)
+        ]
+        chunks = list(csv_rows(samples, device_id="d", metric="m"))
+        assert len(chunks) == 3, "a row per yield, or an unexpected batch size"
+        rendered = "".join(chunks)
+        assert rendered.count("\n") == len(samples) + 1  # every row plus the header
+        assert rendered.startswith("timestamp,device_id,metric,value,quality\n")
 
     def test_no_samples_still_renders_the_header(self) -> None:
         """An empty window is a real answer — "nothing was recorded here" — and
