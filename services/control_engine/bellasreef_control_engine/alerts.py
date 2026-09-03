@@ -375,17 +375,32 @@ class SilenceWatcher:
         self._sensor_types: dict[str, str] = {}
         self._silent: set[str] = set()
 
-    async def prime(self) -> None:
-        """Resume silences already open in Postgres.
+    async def prime(self, *, now: datetime | None = None) -> None:
+        """Resume silences already open in Postgres, and arm the boot grace.
 
-        Without this a restart would find an empty set, try to raise a second
-        episode for a probe already recorded as silent, and lose it to the
-        partial unique index — the alert vanishes rather than duplicating,
-        which is the worse of the two failures.
+        Resuming open silences: without this a restart would find an empty
+        set, try to raise a second episode for a probe already recorded as
+        silent, and lose it to the partial unique index — the alert vanishes
+        rather than duplicating, which is the worse of the two failures.
+
+        Arming the boot grace: a probe that was already dead *before* this
+        process started, with no open episode recorded, used to be
+        indistinguishable from "brand new, give it a grace period" and was
+        exempted from the silence alarm forever — a restart could hide a dead
+        probe with no warning, the exact failure this module exists to catch,
+        just reached by a different door. David's ruling 2026-09-02: seed
+        ``_last_seen`` with ``now`` for every configured cadence, so a probe
+        already dead at boot gets exactly one deadline of grace rather than
+        an unbounded one. ``setdefault`` so a reading that somehow arrived
+        before ``prime()`` is not overwritten by the boot placeholder.
         """
         self._silent = set(await self._store.open_silences())
         if self._silent:
             log.info("resumed open silence episodes", extra={"devices": sorted(self._silent)})
+
+        at = now or datetime.now(UTC)
+        for device_id in await self._store.cadences():
+            self._last_seen.setdefault(device_id, at)
 
     def is_silent(self, device_id: str) -> bool:
         """Whether threshold evaluation should be suspended for this probe.
@@ -441,10 +456,14 @@ class SilenceWatcher:
                 continue
             last = self._last_seen.get(device_id)
             if last is None:
-                # Never seen since this process started. Deliberately not an
-                # alert: the engine may have started before hardware-io, and
-                # accusing a probe of being dead because we have not been
-                # listening long enough is a false alarm on every boot.
+                # prime() seeds _last_seen for every cadence it knows about,
+                # so reaching here means this device's cadence was configured
+                # after boot — adopted while the engine was already running,
+                # not present at prime() time. Deliberately not an alert:
+                # sweep may run before the newly adopted probe has had a
+                # chance to report even once, and accusing it of being dead
+                # before it has been given a chance to speak is a false
+                # alarm.
                 continue
 
             deadline = silence_deadline_s(cadence)
