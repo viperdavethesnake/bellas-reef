@@ -2520,6 +2520,10 @@ def build_app(
                 "expires_at": placed.expires_at.isoformat(),
                 **await actor_fields(actor),
                 "transition": placed.transition,
+                # From the request, not the placed row: ActiveOverride carries
+                # no reason. This is what tells an identify pulse (C4) apart
+                # from a manual hold at the same duty in the trail.
+                "reason": body.reason,
             },
             category="command",
         )

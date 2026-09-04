@@ -382,6 +382,46 @@ class TestOverrideEndpoints:
         assert out["bad_code"] == 422
         assert [d["transition"] for d in out["created_details"]] == ["ramp", "snap"]
 
+    def test_the_request_reason_lands_in_the_created_audit_detail(self) -> None:
+        # An identify pulse (spec 2026-09-03, C4) is an ordinary hold at 50 %;
+        # the only thing that tells it apart from a manual 50 % hold in the
+        # trail is the request's reason, which this endpoint used to drop.
+        async def scenario() -> list[dict[str, Any]]:
+            engine = await fresh_engine()
+            await seed_devices(engine)
+            audit = Audit()
+            app = build_app(engine, audit=audit)
+            headers = await paired(engine, app)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://hub"
+            ) as c:
+                with_reason = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={
+                        "target": "led-blue",
+                        "duty": 0.5,
+                        "duration_s": 5,
+                        "transition": "snap",
+                        "reason": "identify",
+                    },
+                )
+                assert with_reason.status_code == 200, with_reason.text
+                without = await c.post(
+                    "/api/v1/overrides",
+                    headers=headers,
+                    json={"target": "led-blue", "duty": 0.5, "duration_s": 5},
+                )
+                assert without.status_code == 200, without.text
+            await engine.dispose()
+            return [d for e, d, _ in audit.records if e == "override.created"]
+
+        details = run(scenario)
+        assert [d.get("reason") for d in details] == ["identify", None]
+        # The key is always present so the detail shape does not depend on
+        # whether the client sent one.
+        assert all("reason" in d for d in details)
+
 
 class TestAuthFrameParsing:
     def test_a_valid_frame_yields_the_token(self) -> None:
