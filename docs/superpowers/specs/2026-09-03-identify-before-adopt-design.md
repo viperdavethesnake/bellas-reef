@@ -13,8 +13,9 @@ physical fixture ends up wired to a schedule.
 
 What ships is an Identify step inside the existing adopt sheet, one line of API
 change, and nothing in hardware-io or control-engine. The pulse is an ordinary
-manual hold: `POST /api/v1/overrides` at duty 0.30, transition `snap`, duration
-3 s, released by its own expiry.
+manual hold: `POST /api/v1/overrides` at duty 0.50, transition `snap`, duration
+5 s, released by its own expiry. (Amended 2026-09-03 by David's ruling from the
+draft's 0.30 / 3 s; see open question 1.)
 
 ## The flow
 
@@ -78,40 +79,40 @@ adoption to declare.
 
 ## The pulse
 
-`target` the new `device_id`, `duty` 0.30, `transition` `"snap"`, `duration_s`
-3.0, `reason` `"identify"`. Duty 0.30 is clear of the undefined band, modest in
-a lit room, and not a full-power flash. Snap because identify is an operator
-standing at the tank: a ramp at 0.05/s would take six seconds to arrive (spec
-2026-08-17).
+`target` the new `device_id`, `duty` 0.50, `transition` `"snap"`, `duration_s`
+5.0, `reason` `"identify"`. Duty 0.50 is clear of the undefined band, plainly
+visible in a lit room, and not a full-power flash. Snap because identify is an
+operator standing at the tank: a ramp at 0.05/s would take ten seconds to
+arrive (spec 2026-08-17).
 
-**3 s is legal, and there is no minimum to work around.**
+**5 s is legal, and there is no minimum to work around.**
 `OverrideRequest.duration_s` is `Field(gt=0.0, le=86400.0)`
 (`services/api/bellasreef_api/app.py`) and `OverrideStore.create` refuses only
 `duration_s <= 0` (`db/bellasreef_db/overrides.py`). The real floor is the
 engine tick, 1 s (`ControlEngine.__init__`, `loop_interval_s: float = 1.0`), so
-a 3 s hold is two to three ticks: arrival within a tick of creation, release
+a 5 s hold is four to five ticks: arrival within a tick of creation, release
 within a tick of expiry.
 
-**0.30 is above the 8 % floor.** `snap_duty` snaps anything below
+**0.50 is above the 8 % floor.** `snap_duty` snaps anything below
 `MIN_USABLE_DUTY = 0.08` to zero
 (`services/hardware_io/bellasreef_hardware_io/drivers/dimming.py`), so the pulse
-reaches the pin at about 0.99 V of the 3.31 V full scale measured on both
-silicons (CLAUDE.md Stage 1). A duty inside the band would measure dark and read
-as "not this one" on a channel that was right.
+reaches the pin at 1.654 V of the 3.31 V full scale, the 50 % row measured on
+both silicons (CLAUDE.md Stage 1 and Stage 2). A duty inside the band would
+measure dark and read as "not this one" on a channel that was right.
 
 **The server ends it, not the client.** No client timer, no `DELETE` on the
-happy path: the hold expires 3 s after creation and `ControlEngine`
+happy path: the hold expires 5 s after creation and `ControlEngine`
 `_expire_overrides` closes the row against its monotonic deadline. A phone
 backgrounded or killed mid-pulse leaves nothing behind.
 `DELETE /api/v1/overrides/{id}` stays available for a cancel taken inside the
-three seconds, tolerating 404.
+five seconds, tolerating 404.
 
 **Audit.** Two existing rows, both category `command`: `override.created` from
 `create_override`, and `override.released` with reason `expired` from the
 engine's `_audit_override_release`. One backend change, the only one in this
 spec: `create_override`'s `override.created` detail does not include the
 request's `reason` today (`services/api/bellasreef_api/app.py`), so an identify
-pulse is indistinguishable in the trail from a manual 30 % hold. Add
+pulse is indistinguishable in the trail from a manual 50 % hold. Add
 `"reason": body.reason` to that detail dict, taking it from the request because
 `ActiveOverride` (`db/bellasreef_db/overrides.py`) does not carry one.
 `AuditEvent.event` is `dict[str, Any]`, so this is not an OpenAPI change and
@@ -189,9 +190,9 @@ that exist: `bindDevice`, `createOverride`, `renameDevice`, `unbindDevice`,
 | Override refused 503 | The clock is not synchronised (`OverrideStore.create` clock gate). Copy: the hub's clock is still syncing, try Identify again in a moment. The adoption stands. |
 | Override refused 409 or 422 | 409 is an `observe_only` target and 422 comes from the store's `ValueError` on duty, duration or transition. Neither is reachable here (`Store.bind_device` writes `authoritative`; the three values are constants), so both render as the generic failure with Retry rather than being special-cased. |
 | App backgrounded mid-pulse | Nothing to clean up. The hold expires server-side; see "The server ends it". On return the sheet is at the answer step, and Pulse again is one tap. |
-| Duty below the 8 % floor | Not reachable. 0.30 is the constant, not an operator input. |
+| Duty below the 8 % floor | Not reachable. 0.50 is the constant, not an operator input. |
 | Wrong fixture lights | The Not this one path above. Costs a second restart of hardware-io for the tombstone. |
-| Channel already carries a schedule assignment | Legal (schedule-before-adoption is allowed by the engine's gate). The channel starts converging to the curve the moment it is adopted, the pulse overrides it for 3 s, and the release returns it to the curve rather than to dark. Nothing special to do, but the copy should not promise the channel goes dark afterwards. |
+| Channel already carries a schedule assignment | Legal (schedule-before-adoption is allowed by the engine's gate). The channel starts converging to the curve the moment it is adopted, the pulse overrides it for 5 s, and the release returns it to the curve rather than to dark. Nothing special to do, but the copy should not promise the channel goes dark afterwards. |
 
 Cost, stated plainly: a confirmed identify is one hardware-io restart and a
 rejected one is two, each pausing sensor telemetry for about 15 s. No alert
@@ -209,7 +210,7 @@ phase machine rather than a second screen.
 |---|---|
 | Choose | Channel and driver fixed, role picker as today. Primary button **Identify this channel**. Secondary **Adopt without identifying** (today's path, name required). |
 | Adopting | "Adopting the channel. The hub restarts to pick it up, about 15 seconds." Progress, plus **Cancel**, which unadopts and forgets exactly like Not this one. |
-| Pulsing | "Watch your fixtures. PWM ch 3 is at 30 percent for 3 seconds." |
+| Pulsing | "Watch your fixtures. PWM ch 3 is at 50 percent for 5 seconds." |
 | Answer | "Did the right fixture light up?" Buttons **Yes, name it**, **Pulse again**, **Not this one**. |
 | Naming | Name field, Save calls `renameDevice`. Prefilled with the existing name when the bind matched a detached row (`created: false`), empty otherwise. |
 | Failed | The reason, plus **Retry** and **Not this one**. |
@@ -242,10 +243,11 @@ override 503 lands in Failed with the adoption intact; no state frame within
 satisfy the wait.
 
 **Bench acceptance, Stage 2 method** (David's meter, same probe point as that
-leg's Stage 1). One row on `pi-pwm-0`, pin 32: 0 V before Identify, about 0.99 V
-held for about 3 s during the pulse (0.30 x the 3.309 V measured full scale),
-0 V after. Then the deploy gate as always: CI green, `v*` tag, release workflow
-green, `update-hub.sh` on the hub, telemetry verified on the wire.
+leg's Stage 1). One row on `pi-pwm-0`, pin 32: 0 V before Identify, 1.654 V
+held for about 5 s during the pulse (0.50 x the 3.309 V measured full scale,
+the Stage 1 and Stage 2 50 % row), 0 V after. Then the deploy gate as always:
+CI green, `v*` tag, release workflow green, `update-hub.sh` on the hub, telemetry
+verified on the wire.
 
 ## Out of scope, named
 
@@ -265,10 +267,12 @@ green, `update-hub.sh` on the hub, telemetry verified on the wire.
 None block implementation. Two decisions are cheap to overrule, both made
 above:
 
-1. **0.30 and 3 s.** Chosen for a lit room and a fixture in view. If the bench
-   finds 30 % hard to see against ambient light, raise the duty rather than
-   lengthen the hold: brightness is what identifies, and a longer hold only
-   widens the window in which a schedule is being overridden.
+1. **0.50 and 5 s.** RULED 2026-09-03 by David: the draft's 0.30 for 3 s is
+   raised to 0.50 for 5 s. The 50 % point is one both silicons have been
+   metered at (1.654 V), so the bench row needs no new prediction. If the
+   bench still finds it hard to see, raise the duty rather than lengthen the
+   hold: brightness is what identifies, and a longer hold only widens the
+   window in which a schedule is being overridden.
 2. **Not this one forgets the row it created.** The alternative is unbind only,
    which leaves a nameless detached row per rejected channel. Recommended
    answer stands: forget, guarded by `created: true`.
