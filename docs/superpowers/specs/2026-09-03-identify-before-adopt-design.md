@@ -213,7 +213,7 @@ phase machine rather than a second screen.
 | Pulsing | "Watch your fixtures. PWM ch 3 is at 50 percent for 5 seconds." |
 | Answer | "Did the right fixture light up?" Buttons **Yes, name it**, **Pulse again**, **Not this one**. |
 | Naming | Name field, Save calls `renameDevice`. Prefilled with the existing name when the bind matched a detached row (`created: false`), empty otherwise. |
-| Failed | The reason, plus **Retry** and **Not this one**. |
+| Failed | The reason, plus **Retry** and **Not this one**. When the step that failed was the leave itself (unbind or forget refused, hub unreachable), Not this one would only repeat the failure, so the second button is **Leave it adopted** instead: the sheet closes and the nameless row stays visible in the Hardware section, where the operator renames or unadopts it (iOS #31). |
 
 Vocabulary: "PWM ch n", never "LED n", never "dimmer" (David, repeated). The
 channel number shown is the one the row the operator tapped shows.
