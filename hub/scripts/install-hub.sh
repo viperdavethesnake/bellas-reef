@@ -463,6 +463,18 @@ ih_check_clock() {
 ih_avahi_daemon_present() { [[ -f "${IH_ROOT}/etc/avahi/avahi-daemon.conf" ]]; }
 ih_avahi_record_present() { [[ -f "${IH_ROOT}/etc/avahi/services/bellasreef.service" ]]; }
 
+# avahi-daemon reads its service files as its own user, so the record has to
+# carry the other-read bit; without it the daemon logs one line and publishes
+# nothing, and the app cannot find the hub. Presence alone passed on coco
+# (2026-09-28) with a 0600 record: the checkout had been cloned under
+# umask 077 and `cp` carried the source's mode across. `find -perm -o=r`
+# rather than `[[ -r ]]`, which answers for the user running the script.
+ih_avahi_record_readable() {
+    [[ -n "$(find "${IH_ROOT}/etc/avahi/services/bellasreef.service" \
+                  -maxdepth 0 -perm -o=r 2>/dev/null)" ]]
+}
+ih_avahi_record_ok() { ih_avahi_record_present && ih_avahi_record_readable; }
+
 # This machine's LAN interfaces, comma-joined, for the allow-interfaces line
 # the check below prints.
 #
@@ -544,8 +556,11 @@ ih_check_avahi() {
         rc=1
     fi
 
-    if ih_avahi_record_present; then
+    if ih_avahi_record_ok; then
         ih_pass "_bellasreef._tcp service record installed"
+    elif ih_avahi_record_present; then
+        ih_fail "_bellasreef._tcp service record is not readable by avahi-daemon; the app cannot find this hub"
+        rc=1
     else
         ih_fail "_bellasreef._tcp service record missing; the app cannot find this hub"
         rc=1
@@ -736,10 +751,12 @@ ih_phase2_requirements() {
         if ! ih_avahi_daemon_present; then
             ih_offer_install "avahi-daemon" avahi-daemon
         fi
-        if ih_avahi_daemon_present && ! ih_avahi_record_present; then
+        # install -m rather than cp: cp carries the checkout's mode across,
+        # and a 0600 checkout produced a record avahi could not read.
+        if ih_avahi_daemon_present && ! ih_avahi_record_ok; then
             if ih_confirm "install the _bellasreef._tcp service record?"; then
                 ih_run "installing the _bellasreef._tcp record" \
-                    sudo cp "${REPO_DIR}/deploy/avahi/bellasreef.service" \
+                    sudo install -m 0644 "${REPO_DIR}/deploy/avahi/bellasreef.service" \
                             "${IH_ROOT}/etc/avahi/services/bellasreef.service"
                 ih_run "reloading avahi" sudo systemctl reload avahi-daemon
             fi
