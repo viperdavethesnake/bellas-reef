@@ -97,9 +97,11 @@ def write_good_avahi_fixture(root: Path) -> None:
     the allowlisted daemon config and an installed _bellasreef._tcp record."""
     (root / "etc/avahi/services").mkdir(parents=True)
     (root / "etc/avahi/avahi-daemon.conf").write_text("allow-interfaces=eth0,wlan0\n")
-    (root / "etc/avahi/services/bellasreef.service").write_text(
-        "<service-group><name>bellasreef</name></service-group>\n"
-    )
+    record = root / "etc/avahi/services/bellasreef.service"
+    record.write_text("<service-group><name>bellasreef</name></service-group>\n")
+    # avahi-daemon reads the record as its own user, so the check wants the
+    # other-read bit; pin it rather than inherit the runner's umask.
+    record.chmod(0o644)
 
 
 def write_good_docker_daemon_fixture(root: Path) -> None:
@@ -640,7 +642,8 @@ def test_phase2_offers_only_the_record_when_avahi_is_installed(tmp_path: Path) -
     result = run_script("--yes", root=root, stubs=stubs)
     assert "install avahi-daemon?" not in result.stdout, "offered to install an installed daemon"
     assert "service record" in result.stdout
-    assert markers["cp"].exists(), "the service record was never installed"
+    assert markers["install"].exists(), "the service record was never installed"
+    assert not markers["cp"].exists(), "the record was copied, which inherits the source's mode"
     assert not markers["apt-get"].exists(), "an installed avahi-daemon was reinstalled"
 
 
@@ -674,6 +677,39 @@ def test_phase2_fails_when_the_service_record_is_missing(tmp_path: Path) -> None
     result = run_script("--check-only", root=root, stubs=stubs)
     assert "service record" in result.stdout.lower()
     assert result.returncode != 0
+
+
+def test_phase2_fails_when_the_service_record_is_unreadable_by_avahi(tmp_path: Path) -> None:
+    # avahi-daemon runs as its own user. A record it cannot read is a record it
+    # never publishes, and the only symptom is one journal line. On coco
+    # (2026-09-28) a checkout cloned under umask 077 was copied through `cp`
+    # as 0600 root; presence passed phase 2 and the app could not find the hub.
+    # Presence is not the check. Readability by others is.
+    stubs = make_stubs(tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "etc/avahi/services/bellasreef.service").chmod(0o600)
+
+    result = run_script("--check-only", root=root, stubs=stubs)
+    assert "service record" in result.stdout.lower()
+    assert "readable" in result.stdout.lower(), result.stdout
+    assert result.returncode != 0
+
+
+def test_phase2_reinstalls_an_unreadable_service_record(tmp_path: Path) -> None:
+    # The same remediation fixes both findings: `install -m 0644` writes the
+    # record with the mode avahi needs whatever the checkout's mode is.
+    stubs = make_stubs(tmp_path)
+    write_stub(stubs, "sudo", '"$@"')
+    markers = write_mutation_guard_stubs(stubs, tmp_path)
+    root = tmp_path / "root"
+    write_good_avahi_fixture(root)
+    (root / "etc/avahi/services/bellasreef.service").chmod(0o600)
+
+    result = run_script("--yes", root=root, stubs=stubs)
+    assert "install the _bellasreef._tcp service record?" in result.stdout, result.stdout
+    assert markers["install"].exists(), "the unreadable record was left in place"
+    assert not markers["cp"].exists()
 
 
 STOCK_AVAHI_CONF = "[server]\n#host-name=foo\n#allow-interfaces=eth0\n\n[wide-area]\n"

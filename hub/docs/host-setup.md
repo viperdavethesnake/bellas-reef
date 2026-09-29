@@ -216,7 +216,7 @@ cannot learn the API port. `auth.md` step 1 browses for the service type, so
 it has to be registered:
 
 ```bash
-sudo cp deploy/avahi/bellasreef.service /etc/avahi/services/bellasreef.service
+sudo install -m 0644 deploy/avahi/bellasreef.service /etc/avahi/services/bellasreef.service
 sudo systemctl reload avahi-daemon
 ```
 
