@@ -33,12 +33,31 @@ https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
 
 WORKDIR /app
 
+# Third-party dependencies at exactly the versions in uv.lock, which are the
+# versions CI tested. Installing the member directories alone resolves fresh
+# from PyPI on every release build: v0.2.4 picked up SQLAlchemy 2.1.1 (lock:
+# 2.0.51), which no longer pulls greenlet in, and migrations failed on the hub.
+# The export needs every workspace member's pyproject.toml, not its source.
+COPY pyproject.toml uv.lock /lock/
+COPY contracts/python/pyproject.toml /lock/contracts/python/
+COPY db/pyproject.toml /lock/db/
+COPY services/shared/pyproject.toml /lock/services/shared/
+COPY services/hardware_io/pyproject.toml /lock/services/hardware_io/
+COPY services/control_engine/pyproject.toml /lock/services/control_engine/
+COPY services/api/pyproject.toml /lock/services/api/
+RUN cd /lock \
+    && uv export --frozen --no-dev --no-emit-workspace --package bellasreef-api \
+        -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache --require-hashes -r /tmp/requirements.txt \
+    && rm -rf /lock /tmp/requirements.txt
+
 COPY contracts/python /app/contracts/python
 COPY services/shared /app/services/shared
 COPY db /app/db
 COPY services/api /app/services/api
 
-RUN uv pip install --system --no-cache \
+# The workspace members themselves; their dependencies are already installed.
+RUN uv pip install --system --no-cache --no-deps \
         /app/contracts/python \
         /app/services/shared \
         /app/db \

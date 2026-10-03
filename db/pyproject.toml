@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "Bella's Reef PostgreSQL schema and Alembic migrations"
 requires-python = ">=3.13"
 dependencies = [
-    "sqlalchemy>=2.0.36",
+    "sqlalchemy[asyncio]>=2.0.36",
     "alembic>=1.14",
     "asyncpg>=0.30",
     "bellasreef-service",
