@@ -526,6 +526,56 @@ class TestWebSocketStream:
 
         run(engine.dispose)
 
+    def test_host_status_reaches_the_socket_as_a_host_frame(self) -> None:
+        """contracts 4.5.0: the hub's vitals cross the whole pipeline to the
+        client every 30 s, which is what lets a client tell "the API answers"
+        from "the hub is reporting" (coco, 2026-10-02)."""
+        app, token, engine = self._app_and_token()
+        marker = 1234.5  # uptime_s, so this run's frame is recognisable
+
+        async def publish() -> None:
+            from bellasreef_contracts import HostStatus
+            from bellasreef_hardware_io.spine import Spine
+
+            spine = Spine(os.environ[_NATS])
+            await spine.connect()
+            await asyncio.sleep(0.4)  # let the bridge's subscription settle
+            await spine.publish_host_status(
+                HostStatus(
+                    message_id=uuid.uuid4(),
+                    emitted_at=datetime.now(UTC),
+                    source="hardware-io",
+                    load_1m=0.42,
+                    load_5m=0.38,
+                    load_15m=0.33,
+                    cpu_count=4,
+                    mem_total_kb=1014464,
+                    mem_available_kb=445792,
+                    temp_c=46.3,
+                    uptime_s=marker,
+                )
+            )
+            await spine.close()
+
+        with TestClient(app) as client, client.websocket_connect("/api/v1/stream") as ws:
+            ws.send_text(json.dumps({"token": token}))
+            assert json.loads(ws.receive_text())["kind"] == "ready"
+
+            publisher = threading.Thread(target=lambda: asyncio.run(publish()))
+            publisher.start()
+            publisher.join(timeout=30)
+
+            # Retained states from other suites replay first (H3); read past them.
+            frame: dict[str, Any] = {}
+            for _ in range(64):
+                frame = json.loads(ws.receive_text())
+                if frame["kind"] == "host" and frame["payload"]["uptime_s"] == marker:
+                    break
+            assert frame["kind"] == "host"
+            assert frame["payload"]["temp_c"] == pytest.approx(46.3)
+
+        run(engine.dispose)
+
     def test_a_fresh_socket_receives_the_last_known_state_before_anything_changes(self) -> None:
         """H3 (2026-08-18): a client that connected after the last state
         publish saw "no state yet" on every light, indefinitely — the bridge
@@ -654,6 +704,6 @@ class TestWebSocketStream:
             with pytest.raises(Exception):  # noqa: B017
                 for _ in range(64):
                     frame = json.loads(ws.receive_text())
-                    assert frame["kind"] in {"state", "sensor", "alert"}, frame
+                    assert frame["kind"] in {"state", "sensor", "alert", "host"}, frame
 
         run(engine.dispose)

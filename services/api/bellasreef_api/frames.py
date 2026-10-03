@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Annotated, Final, Literal
 from uuid import UUID
 
-from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading
+from bellasreef_contracts import ActuatorState, HostStatus, SensorAlert, SensorReading
 from bellasreef_db import Transition
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -31,6 +31,7 @@ __all__ = [
     "FRAME_SCHEMA_VERSION",
     "AlertFrame",
     "AnyFrame",
+    "HostFrame",
     "OverrideContext",
     "ReadyFrame",
     "SensorFrame",
@@ -116,11 +117,28 @@ class AlertFrame(_Frame):
     payload: SensorAlert
 
 
+class HostFrame(_Frame):
+    """The hub machine's vitals, forwarded unchanged every 30 s (contracts 4.5.0).
+
+    Doubles as the stream's heartbeat. A WebSocket ping proves only that the
+    API answers; this frame starts at hardware-io and crosses NATS, so a
+    client that stops receiving it knows the pipeline behind the API has
+    stalled even while the socket is fine (coco, 2026-10-02). Additive, like
+    `AlertFrame`: older clients skip the unknown kind.
+    """
+
+    kind: Literal["host"] = "host"
+    subject: str
+    payload: HostStatus
+
+
 AnyFrame = Annotated[
-    ReadyFrame | StateFrame | SensorFrame | AlertFrame, Field(discriminator="kind")
+    ReadyFrame | StateFrame | SensorFrame | AlertFrame | HostFrame, Field(discriminator="kind")
 ]
 
-_ADAPTER: TypeAdapter[ReadyFrame | StateFrame | SensorFrame | AlertFrame] = TypeAdapter(AnyFrame)
+_ADAPTER: TypeAdapter[ReadyFrame | StateFrame | SensorFrame | AlertFrame | HostFrame] = TypeAdapter(
+    AnyFrame
+)
 
 
 def frame_json_schema(ref_template: str = "#/$defs/{model}") -> dict[str, object]:

@@ -302,6 +302,17 @@ byte-for-byte 4.3.0. It is an additive OpenAPI path, so MINOR under the table
 above, and the number is what the iOS client re-pins its vendored spec to.
 The share-sheet half ships in the iOS repo.
 
+**contracts 4.5.0 adds the `host` stream frame**: the API forwards
+`bellasreef.host.status` to every `/api/v1/stream` socket as
+`{"kind": "host", "subject", "payload": HostStatus}`, every 30 s. It is the
+clients' end-to-end heartbeat. A WebSocket ping proves only that the API
+answers, while this frame starts at hardware-io and crosses NATS, so a client
+that stops receiving it knows the pipeline behind the API has stalled (found
+on coco 2026-10-02). A new frame kind beside `alert`, with frame schema still
+v1 and no spine payload or subject changed, so MINOR under the table above;
+clients already skip unknown kinds. The iOS client re-pins to this number for
+the "Hub not reporting" state.
+
 ### Pre-release exception (expires at the first tagged release)
 
 **contracts 2.0.0 added the required `role` on `ActuatorRegistration` without
