@@ -128,7 +128,8 @@ def test_ensure_connected_closes_the_stale_client_before_rebuilding(
         subjects.ALL_STATE,
         subjects.ALL_SENSORS,
         subjects.ALL_ALERTS,
-    }, "the rebuilt client must re-register all three core subscriptions"
+        subjects.ALL_HOSTS,
+    }, "the rebuilt client must re-register all four core subscriptions"
 
 
 def test_a_reconnect_blip_must_not_deliver_every_frame_twice(

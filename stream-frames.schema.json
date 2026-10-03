@@ -165,6 +165,131 @@
       "title": "BinaryLevel",
       "type": "object"
     },
+    "HostFrame": {
+      "additionalProperties": false,
+      "description": "The hub machine's vitals, forwarded unchanged every 30 s (contracts 4.5.0).\n\nDoubles as the stream's heartbeat. A WebSocket ping proves only that the\nAPI answers; this frame starts at hardware-io and crosses NATS, so a\nclient that stops receiving it knows the pipeline behind the API has\nstalled even while the socket is fine (coco, 2026-10-02). Additive, like\n`AlertFrame`: older clients skip the unknown kind.",
+      "properties": {
+        "frame_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Frame Version",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "host",
+          "default": "host",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/HostStatus"
+        },
+        "received_at": {
+          "format": "date-time",
+          "title": "Received At",
+          "type": "string"
+        },
+        "subject": {
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "received_at",
+        "subject",
+        "payload"
+      ],
+      "title": "HostFrame",
+      "type": "object"
+    },
+    "HostStatus": {
+      "additionalProperties": false,
+      "description": "The hub machine's own vitals, right now.\n\nPublished on ``bellasreef.host.status`` every 30 s and retained\nlast-value, like a chip state \u2014 a consumer that starts late still gets\nthe most recent snapshot. Snapshot only, deliberately: this is a status\npage's data, not history (contracts 4.3.0 spec,\ndocs/superpowers/specs/2026-08-31-hub-status-design.md).\n\n``/proc`` loadavg/meminfo/uptime are system-wide even inside a\ncontainer, and ``/sys`` is the host's \u2014 measured in\nbellasreef-hardware-io-1 on coco 2026-08-31, which is what makes\nhardware-io able to publish this with no new mounts or privileges.\n\nNo hostname field: in-container the hostname is the container's, and\nclients already get the hub's name from ``/api/v1/info``. A phase-2\nspoke identifies itself in the envelope's ``source``.",
+      "properties": {
+        "cpu_count": {
+          "minimum": 1,
+          "title": "Cpu Count",
+          "type": "integer"
+        },
+        "emitted_at": {
+          "format": "date-time",
+          "title": "Emitted At",
+          "type": "string"
+        },
+        "load_15m": {
+          "minimum": 0,
+          "title": "Load 15M",
+          "type": "number"
+        },
+        "load_1m": {
+          "minimum": 0,
+          "title": "Load 1M",
+          "type": "number"
+        },
+        "load_5m": {
+          "minimum": 0,
+          "title": "Load 5M",
+          "type": "number"
+        },
+        "mem_available_kb": {
+          "minimum": 0,
+          "title": "Mem Available Kb",
+          "type": "integer"
+        },
+        "mem_total_kb": {
+          "minimum": 0,
+          "title": "Mem Total Kb",
+          "type": "integer"
+        },
+        "message_id": {
+          "format": "uuid",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "default": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "temp_c": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Temp C"
+        },
+        "uptime_s": {
+          "minimum": 0,
+          "title": "Uptime S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "message_id",
+        "emitted_at",
+        "source",
+        "load_1m",
+        "load_5m",
+        "load_15m",
+        "cpu_count",
+        "mem_total_kb",
+        "mem_available_kb",
+        "uptime_s"
+      ],
+      "title": "HostStatus",
+      "type": "object"
+    },
     "OverrideContext": {
       "additionalProperties": false,
       "description": "The active manual hold on an actuator, if any.\n\nCarried on every state frame because the time-and-scheduling contract\nrequires override state to be loudly visible: a client showing a channel at\n0% must be able to say whether that is the schedule or a hold, and when the\nhold ends.",
@@ -532,6 +657,7 @@
   "discriminator": {
     "mapping": {
       "alert": "#/$defs/AlertFrame",
+      "host": "#/$defs/HostFrame",
       "ready": "#/$defs/ReadyFrame",
       "sensor": "#/$defs/SensorFrame",
       "state": "#/$defs/StateFrame"
@@ -550,6 +676,9 @@
     },
     {
       "$ref": "#/$defs/AlertFrame"
+    },
+    {
+      "$ref": "#/$defs/HostFrame"
     }
   ],
   "title": "Bella's Reef stream frames",

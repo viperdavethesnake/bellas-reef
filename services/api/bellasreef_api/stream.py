@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Bella's Reef LLC
 """WebSocket bridge from the NATS spine to clients.
 
-Forwards `bellasreef.state.>` and `bellasreef.sensor.>`. The API stays
+Forwards `bellasreef.state.>`, `bellasreef.sensor.>`, `bellasreef.alert.>` and
+`bellasreef.host.>` — the last as the clients' end-to-end heartbeat. The API stays
 stateless — it subscribes, translates, and forwards; it holds no state of its
 own and makes no control decisions.
 
@@ -39,7 +40,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import nats
-from bellasreef_contracts import ActuatorState, SensorAlert, SensorReading, subjects
+from bellasreef_contracts import ActuatorState, HostStatus, SensorAlert, SensorReading, subjects
 from bellasreef_db import OverrideStore
 from bellasreef_service import get_logger
 from nats.aio.client import Client
@@ -47,7 +48,7 @@ from nats.aio.msg import Msg
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import ValidationError
 
-from bellasreef_api.frames import AlertFrame, OverrideContext, SensorFrame, StateFrame
+from bellasreef_api.frames import AlertFrame, HostFrame, OverrideContext, SensorFrame, StateFrame
 
 __all__ = ["AUTH_TIMEOUT_S", "StreamBridge"]
 
@@ -97,6 +98,7 @@ class StreamBridge:
             await self._nc.subscribe(subjects.ALL_STATE, cb=self._on_message)
             await self._nc.subscribe(subjects.ALL_SENSORS, cb=self._on_message)
             await self._nc.subscribe(subjects.ALL_ALERTS, cb=self._on_message)
+            await self._nc.subscribe(subjects.ALL_HOSTS, cb=self._on_message)
             log.info("stream bridge subscribed", extra={"url": self._url})
 
     async def _encode(self, subject: str, data: bytes) -> str | None:
@@ -115,7 +117,7 @@ class StreamBridge:
         try:
             if subject.startswith(f"{subjects.ROOT}.state."):
                 state = ActuatorState.model_validate_json(data)
-                frame: StateFrame | SensorFrame | AlertFrame = StateFrame(
+                frame: StateFrame | SensorFrame | AlertFrame | HostFrame = StateFrame(
                     received_at=received_at,
                     subject=subject,
                     payload=state,
@@ -126,6 +128,12 @@ class StreamBridge:
                     received_at=received_at,
                     subject=subject,
                     payload=SensorAlert.model_validate_json(data),
+                )
+            elif subject.startswith(f"{subjects.ROOT}.host."):
+                frame = HostFrame(
+                    received_at=received_at,
+                    subject=subject,
+                    payload=HostStatus.model_validate_json(data),
                 )
             else:
                 frame = SensorFrame(
