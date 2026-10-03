@@ -170,9 +170,23 @@ jobs:
             stream-frames.schema.json
           if-no-files-found: error
 
+  # Every image, every PR. Until v0.2.5 only the base image was built here, so
+  # an app Dockerfile was first built by `publish` after merge and nothing ever
+  # imported anything inside it — v0.2.4 shipped an api image with no greenlet
+  # and the hub found out at its migration step.
   build:
     name: multi-arch build (dry run)
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: base
+          - service: hardware-io
+            smoke: import bellasreef_hardware_io.app
+          - service: control-engine
+            smoke: import bellasreef_db, bellasreef_control_engine.app
+          - service: api
+            smoke: import bellasreef_db, bellasreef_api.app
     steps:
       - uses: actions/checkout@v4
 
@@ -185,16 +199,37 @@ jobs:
       # type=cacheonly builds for both architectures and pushes nothing. The
       # point is to catch an arm64-incompatible dependency now rather than on
       # the Pi during a deploy.
-      - name: Build base image for amd64 + arm64
+      - name: Build for amd64 + arm64
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: deploy/Dockerfile.base
+          file: deploy/Dockerfile.${{ matrix.service }}
           platforms: linux/amd64,linux/arm64
           push: false
           outputs: type=cacheonly
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # The arm64 image the hub runs, loaded and asked to import its own entry
+      # point. That import reaches sqlalchemy.ext.asyncio through bellasreef_db,
+      # which is where a missing runtime dependency surfaces.
+      - name: Load arm64 image
+        if: matrix.smoke
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.${{ matrix.service }}
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: smoke:${{ matrix.service }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+      - name: Import smoke
+        if: matrix.smoke
+        run: >-
+          docker run --rm --platform linux/arm64 --entrypoint python
+          smoke:${{ matrix.service }} -c "${{ matrix.smoke }}"
 
   # Publishes the three app images the Pi actually pulls. Push-to-main only —
   # a PR from a fork has no ghcr credential and the dry-run job above already
